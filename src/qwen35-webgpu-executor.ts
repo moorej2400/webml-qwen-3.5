@@ -2,6 +2,8 @@ import { diagnosticError, isSafeDiagnosticCode } from "./diagnostics.js";
 
 const GPU_BUFFER_USAGE_COPY_DST = 0x0008;
 const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
+const GPU_BUFFER_USAGE_MAP_READ = 0x0001;
+const GPU_MAP_MODE_READ = 0x0001;
 
 /** Opaque buffer identity accepted for binding without transferring ownership. */
 export type Qwen35WebGpuBuffer = object;
@@ -32,7 +34,7 @@ interface Qwen35ComputePass {
 
 interface Qwen35CommandEncoder {
   beginComputePass(): Qwen35ComputePass;
-  copyBufferToBuffer?(
+  copyBufferToBuffer(
     source: Qwen35WebGpuBuffer,
     sourceOffset: number,
     destination: Qwen35WebGpuBuffer,
@@ -196,6 +198,7 @@ export class Qwen35WebGpuExecutor {
   readonly #kernelSnapshots = new WeakMap<object, Qwen35KernelSnapshot>();
   readonly #uniforms = new WeakSet<object>();
   readonly #ownedBuffers = new Set<Qwen35OwnedWebGpuBuffer>();
+  readonly #operations = new Set<Promise<unknown>>();
   #nextBufferId = 1;
   #nextKernelIdentity = 1;
   #disposed = false;
@@ -221,15 +224,30 @@ export class Qwen35WebGpuExecutor {
         "Qwen3.5 WebGPU uniform slots must be reused",
       );
     }
-    const buffer = this.#device.createBuffer({
-      label,
-      size: values.byteLength,
-      usage: GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_COPY_DST,
-    });
+    let buffer: Qwen35OwnedWebGpuBuffer;
+    try {
+      buffer = this.#device.createBuffer({
+        label,
+        size: values.byteLength,
+        usage: GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_COPY_DST,
+      });
+    } catch {
+      this.#poisoned = true;
+      throw diagnosticError(
+        "webgpu-uniform-allocation-failed",
+        "Qwen3.5 WebGPU uniform allocation failed",
+      );
+    }
     this.#ownedBuffers.add(buffer);
     const uniform = Object.freeze({ buffer, byteLength: values.byteLength });
     this.#uniforms.add(uniform);
-    this.updateUniform(uniform, values);
+    try {
+      this.updateUniform(uniform, values);
+    } catch (error) {
+      this.#uniforms.delete(uniform);
+      this.#releaseOwnedBuffer(buffer);
+      throw error;
+    }
     return uniform;
   }
 
@@ -246,13 +264,21 @@ export class Qwen35WebGpuExecutor {
         "Qwen3.5 WebGPU uniform size changed",
       );
     }
-    this.#device.queue.writeBuffer(
-      uniform.buffer,
-      0,
-      values.buffer,
-      values.byteOffset,
-      values.byteLength,
-    );
+    try {
+      this.#device.queue.writeBuffer(
+        uniform.buffer,
+        0,
+        values.buffer,
+        values.byteOffset,
+        values.byteLength,
+      );
+    } catch {
+      this.#poisoned = true;
+      throw diagnosticError(
+        "webgpu-uniform-upload-failed",
+        "Qwen3.5 WebGPU uniform upload failed",
+      );
+    }
   }
 
   async dispatch(request: Qwen35DispatchRequest): Promise<void> {
@@ -260,7 +286,11 @@ export class Qwen35WebGpuExecutor {
   }
 
   /** Encodes one model step without paying one queue submission per kernel. */
-  async dispatchBatch(requests: readonly Qwen35DispatchRequest[]): Promise<void> {
+  dispatchBatch(requests: readonly Qwen35DispatchRequest[]): Promise<void> {
+    return this.#track(this.#dispatchBatch(requests));
+  }
+
+  async #dispatchBatch(requests: readonly Qwen35DispatchRequest[]): Promise<void> {
     this.#assertUsable();
     if (requests.length === 0) {
       throw diagnosticError(
@@ -326,6 +356,11 @@ export class Qwen35WebGpuExecutor {
 
   async submittedWorkDone(): Promise<void> {
     await this.#device.queue.onSubmittedWorkDone();
+  }
+
+  /** Reads only the GPU-selected token or count, never a vocabulary score tile. */
+  readU32(source: Qwen35WebGpuBuffer, byteOffset: number): Promise<number> {
+    return this.#track(this.#readU32(source, byteOffset));
   }
 
   dispose(): Promise<void> {
@@ -426,6 +461,15 @@ export class Qwen35WebGpuExecutor {
     return created;
   }
 
+  #track<T>(operation: Promise<T>): Promise<T> {
+    this.#operations.add(operation);
+    void operation.then(
+      () => this.#operations.delete(operation),
+      () => this.#operations.delete(operation),
+    );
+    return operation;
+  }
+
   async #retireFailedScope(): Promise<void> {
     this.#poisoned = true;
     try {
@@ -448,8 +492,110 @@ export class Qwen35WebGpuExecutor {
     }
   }
 
+  async #readU32(
+    source: Qwen35WebGpuBuffer,
+    byteOffset: number,
+  ): Promise<number> {
+    this.#assertUsable();
+    if (
+      !Number.isSafeInteger(byteOffset) ||
+      byteOffset < 0 ||
+      byteOffset % 4 !== 0
+    ) {
+      throw diagnosticError(
+        "webgpu-readback-invalid",
+        "Qwen3.5 WebGPU readback range is invalid",
+      );
+    }
+    let readback: Qwen35OwnedWebGpuBuffer | null = null;
+    this.#device.pushErrorScope("validation");
+    try {
+      readback = this.#device.createBuffer({
+        label: "qwen35-selected-u32",
+        size: 4,
+        usage: GPU_BUFFER_USAGE_MAP_READ | GPU_BUFFER_USAGE_COPY_DST,
+      });
+      this.#ownedBuffers.add(readback);
+      const encoder = this.#device.createCommandEncoder({
+        label: "qwen35-selected-u32-copy",
+      });
+      encoder.copyBufferToBuffer(source, byteOffset, readback, 0, 4);
+      this.#device.queue.submit([encoder.finish()]);
+    } catch {
+      await this.#retireFailedScope();
+      this.#releaseOwnedBuffer(readback);
+      throw diagnosticError(
+        "webgpu-readback-failed",
+        "Qwen3.5 WebGPU readback failed",
+      );
+    }
+    let validationError: { readonly message?: string } | null;
+    try {
+      validationError = await this.#device.popErrorScope();
+    } catch {
+      this.#poisoned = true;
+      this.#releaseOwnedBuffer(readback);
+      throw diagnosticError(
+        "webgpu-readback-failed",
+        "Qwen3.5 WebGPU readback failed",
+      );
+    }
+    if (validationError !== null) {
+      this.#poisoned = true;
+      this.#releaseOwnedBuffer(readback);
+      throw diagnosticError(
+        "webgpu-readback-failed",
+        "Qwen3.5 WebGPU readback failed",
+      );
+    }
+    let value: number;
+    try {
+      if (
+        readback.mapAsync === undefined ||
+        readback.getMappedRange === undefined ||
+        readback.unmap === undefined
+      ) {
+        throw new Error("readback methods unavailable");
+      }
+      await readback.mapAsync(GPU_MAP_MODE_READ);
+      const mapped = readback.getMappedRange();
+      if (mapped.byteLength < 4) throw new Error("readback range is short");
+      value = new DataView(mapped).getUint32(0, true);
+      readback.unmap();
+    } catch {
+      this.#poisoned = true;
+      this.#releaseOwnedBuffer(readback);
+      throw diagnosticError(
+        "webgpu-readback-failed",
+        "Qwen3.5 WebGPU readback failed",
+      );
+    }
+    if (!this.#releaseOwnedBuffer(readback)) {
+      throw diagnosticError(
+        "webgpu-readback-cleanup-failed",
+        "Qwen3.5 WebGPU readback cleanup failed",
+      );
+    }
+    return value;
+  }
+
+  #releaseOwnedBuffer(buffer: Qwen35OwnedWebGpuBuffer | null): boolean {
+    if (buffer === null || !this.#ownedBuffers.has(buffer)) return true;
+    try {
+      buffer.destroy();
+      this.#ownedBuffers.delete(buffer);
+      return true;
+    } catch {
+      this.#poisoned = true;
+      return false;
+    }
+  }
+
   async #cleanup(): Promise<void> {
     let failed = false;
+    // Error-scope retirement and other executor work must finish before the
+    // device queue or the origin-wide model lock can transfer ownership.
+    await Promise.allSettled([...this.#operations]);
     // Compilation is device-owned asynchronous work even before a queue
     // submission exists. Retire every cached attempt before lock transfer.
     await Promise.allSettled([...this.#pipelines.values()]);

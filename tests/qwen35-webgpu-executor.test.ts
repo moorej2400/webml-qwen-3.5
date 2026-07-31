@@ -9,13 +9,18 @@ import {
 
 interface FakeBuffer extends Qwen35OwnedWebGpuBuffer {
   readonly id: string;
+  readonly bytes: ArrayBuffer;
   destroyed: boolean;
 }
 
 function fakeDevice(options: {
+  readonly bufferError?: boolean;
   readonly compilationError?: boolean;
+  readonly destroyError?: boolean;
   readonly validationError?: boolean;
   readonly pipelineGate?: Promise<void>;
+  readonly validationGate?: Promise<void>;
+  readonly writeError?: boolean;
 } = {}): {
   readonly device: Qwen35WebGpuDevice;
   readonly events: string[];
@@ -36,6 +41,13 @@ function fakeDevice(options: {
     },
     queue: {
       writeBuffer(_buffer, offset, data, dataOffset, size) {
+        if (options.writeError === true) {
+          throw new Error("private write detail");
+        }
+        const buffer = _buffer as FakeBuffer;
+        new Uint8Array(buffer.bytes, offset, size).set(
+          new Uint8Array(data, dataOffset, size),
+        );
         writes.push({
           offset,
           bytes: Array.from(new Uint8Array(data, dataOffset, size)),
@@ -65,6 +77,7 @@ function fakeDevice(options: {
     },
     async popErrorScope() {
       events.push("pop");
+      await options.validationGate;
       return options.validationError === true ? { message: "private" } : null;
     },
     async createComputePipelineAsync() {
@@ -100,18 +113,42 @@ function fakeDevice(options: {
             },
           };
         },
+        copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size) {
+          new Uint8Array(
+            (destination as FakeBuffer).bytes,
+            destinationOffset,
+            size,
+          ).set(new Uint8Array((source as FakeBuffer).bytes, sourceOffset, size));
+          events.push(`copy:${size}`);
+        },
         finish() {
           events.push("finish");
           return {};
         },
       };
     },
-    createBuffer() {
+    createBuffer(descriptor) {
+      if (options.bufferError === true) {
+        throw new Error("private allocation detail");
+      }
       const buffer: FakeBuffer = {
         id: `buffer-${nextBuffer++}`,
+        bytes: new ArrayBuffer(descriptor.size),
         destroyed: false,
         destroy() {
           this.destroyed = true;
+          if (options.destroyError === true) {
+            throw new Error("private destroy detail");
+          }
+        },
+        async mapAsync() {
+          events.push("map");
+        },
+        getMappedRange() {
+          return this.bytes;
+        },
+        unmap() {
+          events.push("unmap");
         },
       };
       buffers.push(buffer);
@@ -218,6 +255,43 @@ test("uses explicit uniform slots and updates a selected slot in queue order", (
     () => executor.updateUniform(first, Uint32Array.of(1)),
     { code: "webgpu-uniform-size-mismatch" },
   );
+});
+
+test("sanitizes uniform upload failures and fails the executor closed", async () => {
+  const { device, buffers } = fakeDevice({ writeError: true });
+  const executor = new Qwen35WebGpuExecutor(device);
+
+  assert.throws(
+    () => executor.createUniform("qwen35-position", Uint32Array.of(1, 0, 0, 0)),
+    {
+      code: "webgpu-uniform-upload-failed",
+      message: "Qwen3.5 WebGPU uniform upload failed",
+    },
+  );
+  assert.equal(buffers[0]?.destroyed, true);
+  assert.throws(
+    () => executor.createUniform("qwen35-position", Uint32Array.of(2, 0, 0, 0)),
+    { code: "webgpu-executor-poisoned" },
+  );
+  await executor.dispose();
+});
+
+test("sanitizes uniform allocation failures and fails the executor closed", async () => {
+  const { device } = fakeDevice({ bufferError: true });
+  const executor = new Qwen35WebGpuExecutor(device);
+
+  assert.throws(
+    () => executor.createUniform("qwen35-position", Uint32Array.of(1, 0, 0, 0)),
+    {
+      code: "webgpu-uniform-allocation-failed",
+      message: "Qwen3.5 WebGPU uniform allocation failed",
+    },
+  );
+  assert.throws(
+    () => executor.createUniform("qwen35-position", Uint32Array.of(2, 0, 0, 0)),
+    { code: "webgpu-executor-poisoned" },
+  );
+  await executor.dispose();
 });
 
 test("rejects invalid binding ranges before command encoding", async () => {
@@ -355,6 +429,72 @@ test("disposal waits for in-flight pipeline compilation", async () => {
   await assert.rejects(dispatch, { code: "webgpu-executor-disposed" });
   await disposal;
   assert.equal(disposed, true);
+});
+
+test("disposal waits for an in-flight dispatch validation scope", async () => {
+  let releaseValidation!: () => void;
+  const validationGate = new Promise<void>((resolve) => {
+    releaseValidation = resolve;
+  });
+  const { device, events } = fakeDevice({ validationGate });
+  const executor = new Qwen35WebGpuExecutor(device);
+  const dispatch = executor.dispatch({
+    kernel: {
+      id: "qwen35-test-kernel",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [],
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+  while (!events.includes("pop")) await Promise.resolve();
+
+  let disposed = false;
+  const disposal = executor.dispose().then(() => {
+    disposed = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(disposed, false);
+  releaseValidation();
+
+  await dispatch;
+  await disposal;
+  assert.equal(disposed, true);
+});
+
+test("reads back only the selected u32 and destroys its temporary buffer", async () => {
+  const { device, events, buffers } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const source = device.createBuffer({ label: "source", size: 16, usage: 0 });
+  device.queue.writeBuffer(
+    source,
+    4,
+    Uint32Array.of(248_069).buffer,
+    0,
+    4,
+  );
+
+  const value = await executor.readU32(source, 4);
+
+  assert.equal(value, 248_069);
+  assert.equal(events.includes("copy:4"), true);
+  assert.equal(events.includes("map"), true);
+  assert.equal(events.includes("unmap"), true);
+  assert.equal(buffers.at(-1)?.destroyed, true);
+});
+
+test("does not report a selected token when readback cleanup fails", async () => {
+  const { device } = fakeDevice({ destroyError: true });
+  const executor = new Qwen35WebGpuExecutor(device);
+  const source = device.createBuffer({ label: "source", size: 4, usage: 0 });
+
+  await assert.rejects(executor.readU32(source, 0), {
+    code: "webgpu-readback-cleanup-failed",
+    message: "Qwen3.5 WebGPU readback cleanup failed",
+  });
+  await assert.rejects(executor.dispose(), {
+    code: "webgpu-cleanup-failed",
+  });
 });
 
 test("sanitizes shader compiler failures and permanently blocks submissions after dispose", async () => {
