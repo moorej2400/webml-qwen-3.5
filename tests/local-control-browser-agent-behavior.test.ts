@@ -129,7 +129,10 @@ const createAgentHarness = (sessionCapability?: string) => {
       listeners.push(listener);
       lifecycle.set(type, listeners);
     },
-    dispatchEvent() {},
+    dispatchEvent(event: { type: string }) {
+      for (const listener of lifecycle.get(event.type) ?? []) listener();
+      return true;
+    },
   } as Record<string, unknown>;
   context.globalThis = context;
   vm.runInNewContext(createBrowserAgentSource(), context);
@@ -140,6 +143,11 @@ const createAgentHarness = (sessionCapability?: string) => {
     },
     fetches,
     lifecycle,
+    signalRuntimeReady() {
+      context.dispatchEvent(new (context.CustomEvent as new (type: string) => { type: string })(
+        "qwen-local-runtime-ready",
+      ));
+    },
     get reloads() {
       return reloads;
     },
@@ -148,6 +156,13 @@ const createAgentHarness = (sessionCapability?: string) => {
 
 test("generated agent executes pairing, replay, deduplication, reload, and fail-closed behavior", async () => {
   const harness = createAgentHarness();
+  let generations = 0;
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    runPrompt() {
+      generations += 1;
+    },
+  };
+  harness.signalRuntimeReady();
   await harness.context.__QWEN_LOCAL_PAIR__("pairing-code");
   assert.deepEqual(harness.fetches, ["/.local-pair", "/.local-ticket"]);
   const socket = FakeWebSocket.instances[0];
@@ -166,12 +181,6 @@ test("generated agent executes pairing, replay, deduplication, reload, and fail-
     acknowledgedSeq: 1,
     expectedSeq: 2,
   });
-  let generations = 0;
-  harness.context.__QWEN_LOCAL_CONTROL__ = {
-    runPrompt() {
-      generations += 1;
-    },
-  };
   const command = {
     schemaVersion: 1,
     type: "command",
@@ -215,6 +224,7 @@ test("generated agent executes pairing, replay, deduplication, reload, and fail-
 
 test("generated agent prevents overlapping reconnects and inherited handlers", async () => {
   const harness = createAgentHarness("session_0123456789abcdef");
+  let inheritedCalls = 0;
   const pageshow = harness.lifecycle.get("pageshow")?.[0];
   assert.ok(pageshow);
   pageshow();
@@ -228,13 +238,13 @@ test("generated agent prevents overlapping reconnects and inherited handlers", a
   const socket = FakeWebSocket.instances[0];
   assert.ok(socket);
   socket.emit("open");
-  const ready = socket.sent[1] as { documentId: string };
-  let inheritedCalls = 0;
   harness.context.__QWEN_LOCAL_CONTROL__ = Object.create({
     runPrompt() {
       inheritedCalls += 1;
     },
   }) as Record<string, unknown>;
+  harness.signalRuntimeReady();
+  const ready = socket.sent[1] as { documentId: string };
   socket.emit("message", {
     schemaVersion: 1,
     type: "command",
@@ -248,6 +258,86 @@ test("generated agent prevents overlapping reconnects and inherited handlers", a
     "failed",
   );
   assert.ok(ready.documentId);
+});
+
+test("generated agent does not identify or accept queued work before runtime handlers are ready", async () => {
+  const harness = createAgentHarness("session_0123456789abcdef");
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  assert.ok(socket);
+  socket.emit("open");
+  assert.deepEqual(socket.sent, []);
+
+  let generations = 0;
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    runPrompt() { generations += 1; },
+  };
+  harness.signalRuntimeReady();
+  await flush();
+  assert.equal((socket.sent[0] as { type: string }).type, "hello");
+  assert.equal((socket.sent[1] as { type: string }).type, "ready");
+
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt",
+    payload: { prompt: "ready now", maxNewTokens: 1 },
+  });
+  await flush();
+  assert.equal(generations, 1);
+});
+
+test("generated agent classifies an interrupted active prompt as cancelled", async () => {
+  const harness = createAgentHarness("session_0123456789abcdef");
+  let rejectPrompt: ((error: Error) => void) | undefined;
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    runPrompt() {
+      return new Promise<void>((_resolve, reject) => { rejectPrompt = reject; });
+    },
+    async cancelPrompt() {
+      const error = new Error("cancelled");
+      error.name = "AbortError";
+      rejectPrompt?.(error);
+    },
+  };
+  harness.signalRuntimeReady();
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  assert.ok(socket);
+  socket.emit("open");
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_prompt_0123456789",
+    command: "runPrompt",
+    payload: { prompt: "cancel me", maxNewTokens: 8 },
+  });
+  await flush();
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_cancel_0123456789",
+    command: "cancelPrompt",
+  });
+  await flush();
+
+  const commandStates = (socket.sent as { commandId?: string; state?: string }[])
+    .filter((message) => message.commandId !== undefined);
+  assert.equal(
+    commandStates.filter((message) => message.commandId === "command_prompt_0123456789").at(-1)?.state,
+    "cancelled",
+  );
+  assert.equal(
+    commandStates.filter((message) => message.commandId === "command_cancel_0123456789").at(-1)?.state,
+    "completed",
+  );
 });
 
 test("authenticated in-memory server boundary dispatches only after ticket consumption", () => {

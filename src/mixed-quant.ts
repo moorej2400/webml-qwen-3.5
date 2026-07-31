@@ -171,7 +171,7 @@ export function unpackNativeQ6KBlock(bytes: Uint8Array): Q6KBlock {
   return {
     ql: bytes.slice(0, 128),
     qh: bytes.slice(128, 192),
-    scales: new Int8Array(bytes.slice(192, 208).buffer),
+    scales: Int8Array.from(bytes.subarray(192, 208)),
     deltaBits: view(bytes).getUint16(208, true),
   };
 }
@@ -216,7 +216,7 @@ export function unpackNativeQ8_0Block(bytes: Uint8Array): Q8_0Block {
   requireBytes(bytes, NATIVE_Q8_0_BLOCK_BYTES, "native Q8_0 block");
   return {
     deltaBits: view(bytes).getUint16(0, true),
-    qs: new Int8Array(bytes.slice(2, 34).buffer),
+    qs: Int8Array.from(bytes.subarray(2, 34)),
   };
 }
 
@@ -247,7 +247,7 @@ export function unpackWebGpuQ8_0Block(bytes: Uint8Array): Q8_0Block {
   }
   return {
     deltaBits: view(bytes).getUint16(0, true),
-    qs: new Int8Array(bytes.slice(4, 36).buffer),
+    qs: Int8Array.from(bytes.subarray(4, 36)),
   };
 }
 

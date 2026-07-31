@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 
@@ -142,4 +145,92 @@ test("unauthenticated development responses never disclose reusable authenticati
   });
   assert.equal(rejected.status, 401);
   assert.doesNotMatch(rejected.body, /sessionCapability/);
+});
+
+test("development server serves only real JavaScript files under explicit module roots", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "qwen-static-root-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "qwen-static-outside-"));
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await writeFile(path.join(root, "src", "browser.js"), "export const safe = true;\n");
+  await writeFile(path.join(root, "src", "private.txt"), "not served\n");
+  await writeFile(path.join(outside, "outside.js"), "export const escaped = true;\n");
+  await symlink(path.join(outside, "outside.js"), path.join(root, "src", "linked.js"));
+  const authority = new PairingAuthority({
+    pairingCode: randomBytes(32).toString("base64url"),
+    randomToken: () => randomBytes(32).toString("base64url"),
+  });
+  const handler = createDevelopmentRequestHandler({
+    pairingAuthority: authority,
+    html: "<main></main>",
+    staticModuleRoots: [
+      { routePrefix: "/assets/src/", directory: path.join(root, "src") },
+    ],
+  });
+  const invoke = async (url: string): Promise<{ status: number; body: string; headers: Record<string, string> }> => {
+    let status = 0;
+    let responseBody = "";
+    let headers: Record<string, string> = {};
+    await handler(
+      { method: "GET", url, headers: {} } as IncomingMessage,
+      {
+        writeHead(code: number, values?: Record<string, string>) {
+          status = code;
+          headers = values ?? {};
+          return this;
+        },
+        end(chunk?: string | Buffer) {
+          responseBody += chunk?.toString() ?? "";
+          return this;
+        },
+      } as unknown as ServerResponse,
+    );
+    return { status, body: responseBody, headers };
+  };
+
+  const served = await invoke("/assets/src/browser.js");
+  assert.equal(served.status, 200);
+  assert.equal(served.body, "export const safe = true;\n");
+  assert.equal(served.headers["content-type"], "text/javascript; charset=utf-8");
+  assert.equal(served.headers["cache-control"], "no-store");
+  assert.equal((await invoke("/assets/src/private.txt")).status, 404);
+  assert.equal((await invoke("/assets/src/linked.js")).status, 404);
+  assert.equal((await invoke("/assets/src/%2e%2e%2foutside.js")).status, 404);
+});
+
+test("development page exposes no-store credential-free runtime configuration", async () => {
+  const authority = new PairingAuthority({
+    pairingCode: randomBytes(32).toString("base64url"),
+    randomToken: () => randomBytes(32).toString("base64url"),
+  });
+  const runtimeConfiguration = {
+    manifest: { format: "fixture" },
+    packageBaseUrl: `https://huggingface.co/example/package/resolve/${"a".repeat(40)}/`,
+    expectedPackageBaseUrl: `https://huggingface.co/example/package/resolve/${"a".repeat(40)}/`,
+    expectedManifestSha256: "b".repeat(64),
+    compiledTokenizerUrl: `https://huggingface.co/example/package/resolve/${"a".repeat(40)}/tokenizer.bin`,
+  };
+  const handler = createDevelopmentRequestHandler({
+    pairingAuthority: authority,
+    html: "<main></main>",
+    runtimeConfiguration,
+  });
+  let status = 0;
+  let body = "";
+  let headers: Record<string, string> = {};
+  await handler(
+    { method: "GET", url: "/.local-runtime-config.json", headers: {} } as IncomingMessage,
+    {
+      writeHead(code: number, values?: Record<string, string>) {
+        status = code;
+        headers = values ?? {};
+        return this;
+      },
+      end(chunk?: string) { body += chunk ?? ""; return this; },
+    } as unknown as ServerResponse,
+  );
+
+  assert.equal(status, 200);
+  assert.equal(headers["cache-control"], "no-store");
+  assert.deepEqual(JSON.parse(body), runtimeConfiguration);
+  assert.doesNotMatch(body, /pairing|operator|credential|manifestPath/i);
 });

@@ -247,21 +247,101 @@ export interface DevelopmentServerOptions {
   controlPlane: ControlPlane;
   pairingAuthority: PairingAuthority;
   html: string;
+  runtimeConfiguration?: unknown;
+  staticModuleRoots?: readonly DevelopmentStaticModuleRoot[];
 }
 
+export interface DevelopmentStaticModuleRoot {
+  readonly routePrefix: string;
+  readonly directory: string;
+}
+
+const readStaticModule = async (
+  urlPathname: string,
+  roots: readonly DevelopmentStaticModuleRoot[],
+): Promise<Buffer | null> => {
+  const root = roots.find(({ routePrefix }) => urlPathname.startsWith(routePrefix));
+  if (root === undefined) return null;
+  let relativePath: string;
+  try {
+    relativePath = decodeURIComponent(urlPathname.slice(root.routePrefix.length));
+  } catch {
+    return null;
+  }
+  const segments = relativePath.split("/");
+  if (
+    relativePath.length === 0 ||
+    !relativePath.endsWith(".js") ||
+    relativePath.includes("\\") ||
+    relativePath.includes("\0") ||
+    segments.some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    return null;
+  }
+  const directory = path.resolve(root.directory);
+  const requested = path.resolve(directory, ...segments);
+  if (!requested.startsWith(`${directory}${path.sep}`)) return null;
+  try {
+    const [directoryInfo, requestedInfo] = await Promise.all([
+      lstat(directory),
+      lstat(requested),
+    ]);
+    if (
+      !directoryInfo.isDirectory() ||
+      directoryInfo.isSymbolicLink() ||
+      !requestedInfo.isFile() ||
+      requestedInfo.isSymbolicLink()
+    ) {
+      return null;
+    }
+    const [realDirectory, realRequested] = await Promise.all([
+      realpath(directory),
+      realpath(requested),
+    ]);
+    if (!realRequested.startsWith(`${realDirectory}${path.sep}`)) return null;
+    return await readFile(realRequested);
+  } catch {
+    return null;
+  }
+};
+
 export const createDevelopmentRequestHandler = (
-  options: Pick<DevelopmentServerOptions, "pairingAuthority" | "html">,
+  options: Pick<
+    DevelopmentServerOptions,
+    "pairingAuthority" | "html" | "runtimeConfiguration" | "staticModuleRoots"
+  >,
 ): ((request: IncomingMessage, response: ServerResponse) => Promise<void>) => {
   const agentSource = createBrowserAgentSource();
   return async (request, response) => {
     const url = new URL(request.url ?? "/", "https://development.invalid");
-    if (url.pathname === "/.local-agent.js") {
+    if (request.method === "GET" && url.pathname === "/.local-agent.js") {
       response.writeHead(200, {
         "content-type": "text/javascript; charset=utf-8",
         "cache-control": "no-store",
       });
       response.end(agentSource);
       return;
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname === "/.local-runtime-config.json" &&
+      options.runtimeConfiguration !== undefined
+    ) {
+      sendJson(response, 200, options.runtimeConfiguration);
+      return;
+    }
+    if (request.method === "GET" && options.staticModuleRoots !== undefined) {
+      const module = await readStaticModule(url.pathname, options.staticModuleRoots);
+      if (module !== null) {
+        response.writeHead(200, {
+          "content-type": "text/javascript; charset=utf-8",
+          "content-length": String(module.byteLength),
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+        });
+        response.end(module);
+        return;
+      }
     }
     if (request.method === "POST" && url.pathname === "/.local-pair") {
       try {
@@ -294,7 +374,7 @@ export const createDevelopmentRequestHandler = (
       }
       return;
     }
-    if (url.pathname === "/" || url.pathname === "/index.html") {
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
       const injection = '<script src="/.local-agent.js"></script>';
       const html = options.html.includes("</body>")
         ? options.html.replace("</body>", `${injection}</body>`)

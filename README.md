@@ -16,8 +16,8 @@ foundation and mixed-quant compute layer:
 - exact block repacking without full-tensor dequantization;
 - direct packed-weight GEMV kernels with row-aware shard dispatch;
 - an immutable Qwen3.5 4B configuration and exact 32-layer tensor validator;
-- a typed static program with runnable attention and DeltaNet operators while
-  complete weight orchestration remains explicitly blocked;
+- a runnable static 32-layer greedy text program with exact tensor binding,
+  bounded command submission, queue retirement, and fail-closed lifecycle;
 - FP32 CPU and WGSL references for reusable vector math, M-RoPE, and top-k;
 - exact 16K HybridState planning for eight packed FP16 K/V pairs, 24 FP32
   convolution states, and 24 FP32 recurrent states;
@@ -27,10 +27,16 @@ foundation and mixed-quant compute layer:
   gated-normalization, decode, and serial-prefill paths;
 - single-row packed embedding decode and tied row-sharded output projection;
 - deterministic CPU references and a browser WebGPU parity harness; and
-- generated binary fixtures that do not include model data.
+- generated binary fixtures that do not include model data;
+- a repository-owned authenticated streaming converter for the exact pinned
+  mixed-quant GGUF; and
+- a local-only trusted-HTTPS iPhone runtime and command harness that is excluded
+  from public builds.
 
 [`model-sources.json`](model-sources.json) pins the public source revisions,
 artifact hashes, and inspected language tensor inventory used by this runtime.
+See [Model package conversion](docs/model-package-conversion.md) for the
+repository-owned inventory, dry-run, and streaming conversion command.
 
 ## Development
 

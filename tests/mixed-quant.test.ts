@@ -212,6 +212,22 @@ test("repacking is exact and rejects partial native or WebGPU blocks", () => {
   }
 });
 
+test("repacking accepts bounded Node Buffer views with larger backing stores", () => {
+  const cases = [
+    [NATIVE_Q6_K_BLOCK_BYTES, repackNativeQ6K, repackWebGpuQ6K],
+    [NATIVE_Q8_0_BLOCK_BYTES, repackNativeQ8_0, repackWebGpuQ8_0],
+  ] as const;
+  for (const [nativeBytes, toGpu, toNative] of cases) {
+    const expected = deterministicNative(nativeBytes * 2, nativeBytes + 7);
+    const allocation = Buffer.alloc(expected.byteLength + 64, 0xa5);
+    expected.forEach((value, index) => {
+      allocation[index + 31] = value;
+    });
+    const boundedView = allocation.subarray(31, 31 + expected.byteLength);
+    assert.deepEqual(toNative(toGpu(boundedView)), expected);
+  }
+});
+
 test("matches independent Q4_K and Q5_K vectors with scale, min, and high bits", () => {
   const q4 = deterministicNative(NATIVE_Q4_K_BLOCK_BYTES, 43);
   half(new DataView(q4.buffer), 0, 1);

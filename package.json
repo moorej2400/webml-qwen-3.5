@@ -8,11 +8,12 @@
   },
   "scripts": {
     "test": "node --import tsx --test tests/*.test.ts",
-    "test:converter": "node --import tsx --test tests/converter.test.ts tests/q3k.test.ts",
+    "test:converter": "node --import tsx --test tests/converter.test.ts tests/q3k.test.ts tests/qwen35-language-converter-tool.test.ts",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.dev.json --noEmit",
     "build": "tsc",
     "build:public": "node tools/build-public.mjs --out-dir public-dist",
-    "control:dev": "tsx dev/control/cli.ts"
+    "convert:qwen35-language": "node --import tsx tools/convert-qwen35-language.ts",
+    "control:dev": "tsc --project tsconfig.dev.json && node dev-dist/dev/control/cli.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

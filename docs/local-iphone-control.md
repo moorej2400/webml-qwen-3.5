@@ -25,6 +25,36 @@ the iOS certificate trust settings. Never transfer `rootCA-key.pem`.
 Use a development hostname that resolves to the Mac on the local network. Do
 not put that hostname or an address in this repository.
 
+## Immutable runtime inputs
+
+Copy the generated language manifest to a regular file under the ignored
+`.local/` directory. Do not use a symbolic link. The model shards and compiled
+tokenizer must be available from credential-free HTTPS URLs that contain exact
+40-character Hugging Face revisions:
+
+```sh
+mkdir -p .local/model
+cp <generated-manifest-path> .local/model/manifest.json
+export QWEN_RUNTIME_MANIFEST=".local/model/manifest.json"
+export QWEN_RUNTIME_PACKAGE_BASE_URL="https://huggingface.co/<owner>/<repository>/resolve/<40-character-revision>/"
+export QWEN_RUNTIME_MANIFEST_SHA256="<64-character-canonical-manifest-sha256>"
+export QWEN_RUNTIME_TOKENIZER_URL="https://huggingface.co/<owner>/<repository>/resolve/<40-character-revision>/<compiled-tokenizer-file>"
+```
+
+`QWEN_RUNTIME_MANIFEST_SHA256` is the canonical package-manifest digest used by
+the runtime cache. It is not a digest of incidental JSON whitespace. Startup
+loads the local manifest through a realpath boundary, validates the pinned Qwen
+source identities, and requires the exact canonical digest before serving the
+page. Runtime URLs and manifest data are returned from a no-store endpoint.
+Credentials and local file paths are never included in that response.
+
+When the package producer does not report the canonical digest, calculate it
+from the local manifest with the runtime's own canonicalizer:
+
+```sh
+export QWEN_RUNTIME_MANIFEST_SHA256="$(node --import tsx --input-type=module -e 'import { readFileSync } from "node:fs"; import { modelCacheKey } from "./src/opfs-model-cache.ts"; process.stdout.write(modelCacheKey(JSON.parse(readFileSync(process.env.QWEN_RUNTIME_MANIFEST, "utf8"))))')"
+```
+
 ## Process-only credentials
 
 Generate a one-time pairing code and a different operator token in the current
@@ -50,6 +80,29 @@ The service fails closed if TLS material, either credential, or the explicit
 public host is missing. The operator API always binds to the IPv4 loopback
 interface. Only the HTTPS app and authenticated phone WebSocket use the
 configured development host.
+
+## Phone and operator flow
+
+Open `https://<development-hostname>:<public-port>/` in Safari on the iPhone.
+Enter the one-time pairing code in the page dialog. The minimal page has Load,
+Run prompt, Cancel, Dispose, and Get state controls. These controls call the
+same session handlers used by the authenticated operator commands.
+
+The loopback operator API accepts `load`, `runPrompt`, `cancelPrompt`,
+`dispose`, `getState`, `warmReload`, and `coldAppReload`. `load` uses only the
+startup configuration and rejects payload overrides. `runPrompt` accepts only
+this bounded payload shape:
+
+```json
+{
+  "prompt": "<text>",
+  "maxNewTokens": 128
+}
+```
+
+The operator API returns command lifecycle records. `getState` can return only
+model, generation, cache, device, context, and CPU/GPU byte fields. Prompt and
+generated text stay in the phone page and are not returned as telemetry.
 
 ## Recovery order
 
