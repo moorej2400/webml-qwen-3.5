@@ -1,0 +1,2633 @@
+{
+  "source": "Qwen/Qwen3.5-4B",
+  "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "tokenizerSha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+  "runtimeSlice": {
+    "baseVocabSize": 248044,
+    "tokenCount": 248070,
+    "tokens": [
+      {
+        "id": 0,
+        "value": "!"
+      },
+      {
+        "id": 1,
+        "value": "\""
+      },
+      {
+        "id": 2,
+        "value": "#"
+      },
+      {
+        "id": 3,
+        "value": "$"
+      },
+      {
+        "id": 4,
+        "value": "%"
+      },
+      {
+        "id": 5,
+        "value": "&"
+      },
+      {
+        "id": 6,
+        "value": "'"
+      },
+      {
+        "id": 7,
+        "value": "("
+      },
+      {
+        "id": 8,
+        "value": ")"
+      },
+      {
+        "id": 9,
+        "value": "*"
+      },
+      {
+        "id": 10,
+        "value": "+"
+      },
+      {
+        "id": 11,
+        "value": ","
+      },
+      {
+        "id": 12,
+        "value": "-"
+      },
+      {
+        "id": 13,
+        "value": "."
+      },
+      {
+        "id": 14,
+        "value": "/"
+      },
+      {
+        "id": 15,
+        "value": "0"
+      },
+      {
+        "id": 16,
+        "value": "1"
+      },
+      {
+        "id": 17,
+        "value": "2"
+      },
+      {
+        "id": 18,
+        "value": "3"
+      },
+      {
+        "id": 19,
+        "value": "4"
+      },
+      {
+        "id": 20,
+        "value": "5"
+      },
+      {
+        "id": 21,
+        "value": "6"
+      },
+      {
+        "id": 22,
+        "value": "7"
+      },
+      {
+        "id": 23,
+        "value": "8"
+      },
+      {
+        "id": 24,
+        "value": "9"
+      },
+      {
+        "id": 25,
+        "value": ":"
+      },
+      {
+        "id": 26,
+        "value": ";"
+      },
+      {
+        "id": 27,
+        "value": "<"
+      },
+      {
+        "id": 28,
+        "value": "="
+      },
+      {
+        "id": 29,
+        "value": ">"
+      },
+      {
+        "id": 30,
+        "value": "?"
+      },
+      {
+        "id": 31,
+        "value": "@"
+      },
+      {
+        "id": 32,
+        "value": "A"
+      },
+      {
+        "id": 33,
+        "value": "B"
+      },
+      {
+        "id": 34,
+        "value": "C"
+      },
+      {
+        "id": 35,
+        "value": "D"
+      },
+      {
+        "id": 36,
+        "value": "E"
+      },
+      {
+        "id": 37,
+        "value": "F"
+      },
+      {
+        "id": 38,
+        "value": "G"
+      },
+      {
+        "id": 39,
+        "value": "H"
+      },
+      {
+        "id": 40,
+        "value": "I"
+      },
+      {
+        "id": 41,
+        "value": "J"
+      },
+      {
+        "id": 42,
+        "value": "K"
+      },
+      {
+        "id": 43,
+        "value": "L"
+      },
+      {
+        "id": 44,
+        "value": "M"
+      },
+      {
+        "id": 45,
+        "value": "N"
+      },
+      {
+        "id": 46,
+        "value": "O"
+      },
+      {
+        "id": 47,
+        "value": "P"
+      },
+      {
+        "id": 48,
+        "value": "Q"
+      },
+      {
+        "id": 49,
+        "value": "R"
+      },
+      {
+        "id": 50,
+        "value": "S"
+      },
+      {
+        "id": 51,
+        "value": "T"
+      },
+      {
+        "id": 52,
+        "value": "U"
+      },
+      {
+        "id": 53,
+        "value": "V"
+      },
+      {
+        "id": 54,
+        "value": "W"
+      },
+      {
+        "id": 55,
+        "value": "X"
+      },
+      {
+        "id": 56,
+        "value": "Y"
+      },
+      {
+        "id": 57,
+        "value": "Z"
+      },
+      {
+        "id": 58,
+        "value": "["
+      },
+      {
+        "id": 59,
+        "value": "\\"
+      },
+      {
+        "id": 60,
+        "value": "]"
+      },
+      {
+        "id": 61,
+        "value": "^"
+      },
+      {
+        "id": 62,
+        "value": "_"
+      },
+      {
+        "id": 63,
+        "value": "`"
+      },
+      {
+        "id": 64,
+        "value": "a"
+      },
+      {
+        "id": 65,
+        "value": "b"
+      },
+      {
+        "id": 66,
+        "value": "c"
+      },
+      {
+        "id": 67,
+        "value": "d"
+      },
+      {
+        "id": 68,
+        "value": "e"
+      },
+      {
+        "id": 69,
+        "value": "f"
+      },
+      {
+        "id": 70,
+        "value": "g"
+      },
+      {
+        "id": 71,
+        "value": "h"
+      },
+      {
+        "id": 72,
+        "value": "i"
+      },
+      {
+        "id": 73,
+        "value": "j"
+      },
+      {
+        "id": 74,
+        "value": "k"
+      },
+      {
+        "id": 75,
+        "value": "l"
+      },
+      {
+        "id": 76,
+        "value": "m"
+      },
+      {
+        "id": 77,
+        "value": "n"
+      },
+      {
+        "id": 78,
+        "value": "o"
+      },
+      {
+        "id": 79,
+        "value": "p"
+      },
+      {
+        "id": 80,
+        "value": "q"
+      },
+      {
+        "id": 81,
+        "value": "r"
+      },
+      {
+        "id": 82,
+        "value": "s"
+      },
+      {
+        "id": 83,
+        "value": "t"
+      },
+      {
+        "id": 84,
+        "value": "u"
+      },
+      {
+        "id": 85,
+        "value": "v"
+      },
+      {
+        "id": 86,
+        "value": "w"
+      },
+      {
+        "id": 87,
+        "value": "x"
+      },
+      {
+        "id": 88,
+        "value": "y"
+      },
+      {
+        "id": 89,
+        "value": "z"
+      },
+      {
+        "id": 90,
+        "value": "{"
+      },
+      {
+        "id": 91,
+        "value": "|"
+      },
+      {
+        "id": 92,
+        "value": "}"
+      },
+      {
+        "id": 93,
+        "value": "~"
+      },
+      {
+        "id": 94,
+        "value": "¡"
+      },
+      {
+        "id": 95,
+        "value": "¢"
+      },
+      {
+        "id": 96,
+        "value": "£"
+      },
+      {
+        "id": 97,
+        "value": "¤"
+      },
+      {
+        "id": 98,
+        "value": "¥"
+      },
+      {
+        "id": 99,
+        "value": "¦"
+      },
+      {
+        "id": 100,
+        "value": "§"
+      },
+      {
+        "id": 101,
+        "value": "¨"
+      },
+      {
+        "id": 102,
+        "value": "©"
+      },
+      {
+        "id": 103,
+        "value": "ª"
+      },
+      {
+        "id": 104,
+        "value": "«"
+      },
+      {
+        "id": 105,
+        "value": "¬"
+      },
+      {
+        "id": 106,
+        "value": "®"
+      },
+      {
+        "id": 107,
+        "value": "¯"
+      },
+      {
+        "id": 108,
+        "value": "°"
+      },
+      {
+        "id": 109,
+        "value": "±"
+      },
+      {
+        "id": 110,
+        "value": "²"
+      },
+      {
+        "id": 111,
+        "value": "³"
+      },
+      {
+        "id": 112,
+        "value": "´"
+      },
+      {
+        "id": 113,
+        "value": "µ"
+      },
+      {
+        "id": 114,
+        "value": "¶"
+      },
+      {
+        "id": 115,
+        "value": "·"
+      },
+      {
+        "id": 116,
+        "value": "¸"
+      },
+      {
+        "id": 117,
+        "value": "¹"
+      },
+      {
+        "id": 118,
+        "value": "º"
+      },
+      {
+        "id": 119,
+        "value": "»"
+      },
+      {
+        "id": 120,
+        "value": "¼"
+      },
+      {
+        "id": 121,
+        "value": "½"
+      },
+      {
+        "id": 122,
+        "value": "¾"
+      },
+      {
+        "id": 123,
+        "value": "¿"
+      },
+      {
+        "id": 124,
+        "value": "À"
+      },
+      {
+        "id": 125,
+        "value": "Á"
+      },
+      {
+        "id": 126,
+        "value": "Â"
+      },
+      {
+        "id": 127,
+        "value": "Ã"
+      },
+      {
+        "id": 128,
+        "value": "Ä"
+      },
+      {
+        "id": 129,
+        "value": "Å"
+      },
+      {
+        "id": 130,
+        "value": "Æ"
+      },
+      {
+        "id": 131,
+        "value": "Ç"
+      },
+      {
+        "id": 132,
+        "value": "È"
+      },
+      {
+        "id": 133,
+        "value": "É"
+      },
+      {
+        "id": 134,
+        "value": "Ê"
+      },
+      {
+        "id": 135,
+        "value": "Ë"
+      },
+      {
+        "id": 136,
+        "value": "Ì"
+      },
+      {
+        "id": 137,
+        "value": "Í"
+      },
+      {
+        "id": 138,
+        "value": "Î"
+      },
+      {
+        "id": 139,
+        "value": "Ï"
+      },
+      {
+        "id": 140,
+        "value": "Ð"
+      },
+      {
+        "id": 141,
+        "value": "Ñ"
+      },
+      {
+        "id": 142,
+        "value": "Ò"
+      },
+      {
+        "id": 143,
+        "value": "Ó"
+      },
+      {
+        "id": 144,
+        "value": "Ô"
+      },
+      {
+        "id": 145,
+        "value": "Õ"
+      },
+      {
+        "id": 146,
+        "value": "Ö"
+      },
+      {
+        "id": 147,
+        "value": "×"
+      },
+      {
+        "id": 148,
+        "value": "Ø"
+      },
+      {
+        "id": 149,
+        "value": "Ù"
+      },
+      {
+        "id": 150,
+        "value": "Ú"
+      },
+      {
+        "id": 151,
+        "value": "Û"
+      },
+      {
+        "id": 152,
+        "value": "Ü"
+      },
+      {
+        "id": 153,
+        "value": "Ý"
+      },
+      {
+        "id": 154,
+        "value": "Þ"
+      },
+      {
+        "id": 155,
+        "value": "ß"
+      },
+      {
+        "id": 156,
+        "value": "à"
+      },
+      {
+        "id": 157,
+        "value": "á"
+      },
+      {
+        "id": 158,
+        "value": "â"
+      },
+      {
+        "id": 159,
+        "value": "ã"
+      },
+      {
+        "id": 160,
+        "value": "ä"
+      },
+      {
+        "id": 161,
+        "value": "å"
+      },
+      {
+        "id": 162,
+        "value": "æ"
+      },
+      {
+        "id": 163,
+        "value": "ç"
+      },
+      {
+        "id": 164,
+        "value": "è"
+      },
+      {
+        "id": 165,
+        "value": "é"
+      },
+      {
+        "id": 166,
+        "value": "ê"
+      },
+      {
+        "id": 167,
+        "value": "ë"
+      },
+      {
+        "id": 168,
+        "value": "ì"
+      },
+      {
+        "id": 169,
+        "value": "í"
+      },
+      {
+        "id": 170,
+        "value": "î"
+      },
+      {
+        "id": 171,
+        "value": "ï"
+      },
+      {
+        "id": 172,
+        "value": "ð"
+      },
+      {
+        "id": 173,
+        "value": "ñ"
+      },
+      {
+        "id": 174,
+        "value": "ò"
+      },
+      {
+        "id": 175,
+        "value": "ó"
+      },
+      {
+        "id": 176,
+        "value": "ô"
+      },
+      {
+        "id": 177,
+        "value": "õ"
+      },
+      {
+        "id": 178,
+        "value": "ö"
+      },
+      {
+        "id": 179,
+        "value": "÷"
+      },
+      {
+        "id": 180,
+        "value": "ø"
+      },
+      {
+        "id": 181,
+        "value": "ù"
+      },
+      {
+        "id": 182,
+        "value": "ú"
+      },
+      {
+        "id": 183,
+        "value": "û"
+      },
+      {
+        "id": 184,
+        "value": "ü"
+      },
+      {
+        "id": 185,
+        "value": "ý"
+      },
+      {
+        "id": 186,
+        "value": "þ"
+      },
+      {
+        "id": 187,
+        "value": "ÿ"
+      },
+      {
+        "id": 188,
+        "value": "Ā"
+      },
+      {
+        "id": 189,
+        "value": "ā"
+      },
+      {
+        "id": 190,
+        "value": "Ă"
+      },
+      {
+        "id": 191,
+        "value": "ă"
+      },
+      {
+        "id": 192,
+        "value": "Ą"
+      },
+      {
+        "id": 193,
+        "value": "ą"
+      },
+      {
+        "id": 194,
+        "value": "Ć"
+      },
+      {
+        "id": 195,
+        "value": "ć"
+      },
+      {
+        "id": 196,
+        "value": "Ĉ"
+      },
+      {
+        "id": 197,
+        "value": "ĉ"
+      },
+      {
+        "id": 198,
+        "value": "Ċ"
+      },
+      {
+        "id": 199,
+        "value": "ċ"
+      },
+      {
+        "id": 200,
+        "value": "Č"
+      },
+      {
+        "id": 201,
+        "value": "č"
+      },
+      {
+        "id": 202,
+        "value": "Ď"
+      },
+      {
+        "id": 203,
+        "value": "ď"
+      },
+      {
+        "id": 204,
+        "value": "Đ"
+      },
+      {
+        "id": 205,
+        "value": "đ"
+      },
+      {
+        "id": 206,
+        "value": "Ē"
+      },
+      {
+        "id": 207,
+        "value": "ē"
+      },
+      {
+        "id": 208,
+        "value": "Ĕ"
+      },
+      {
+        "id": 209,
+        "value": "ĕ"
+      },
+      {
+        "id": 210,
+        "value": "Ė"
+      },
+      {
+        "id": 211,
+        "value": "ė"
+      },
+      {
+        "id": 212,
+        "value": "Ę"
+      },
+      {
+        "id": 213,
+        "value": "ę"
+      },
+      {
+        "id": 214,
+        "value": "Ě"
+      },
+      {
+        "id": 215,
+        "value": "ě"
+      },
+      {
+        "id": 216,
+        "value": "Ĝ"
+      },
+      {
+        "id": 217,
+        "value": "ĝ"
+      },
+      {
+        "id": 218,
+        "value": "Ğ"
+      },
+      {
+        "id": 219,
+        "value": "ğ"
+      },
+      {
+        "id": 220,
+        "value": "Ġ"
+      },
+      {
+        "id": 221,
+        "value": "ġ"
+      },
+      {
+        "id": 222,
+        "value": "Ģ"
+      },
+      {
+        "id": 223,
+        "value": "ģ"
+      },
+      {
+        "id": 224,
+        "value": "Ĥ"
+      },
+      {
+        "id": 225,
+        "value": "ĥ"
+      },
+      {
+        "id": 226,
+        "value": "Ħ"
+      },
+      {
+        "id": 227,
+        "value": "ħ"
+      },
+      {
+        "id": 228,
+        "value": "Ĩ"
+      },
+      {
+        "id": 229,
+        "value": "ĩ"
+      },
+      {
+        "id": 230,
+        "value": "Ī"
+      },
+      {
+        "id": 231,
+        "value": "ī"
+      },
+      {
+        "id": 232,
+        "value": "Ĭ"
+      },
+      {
+        "id": 233,
+        "value": "ĭ"
+      },
+      {
+        "id": 234,
+        "value": "Į"
+      },
+      {
+        "id": 235,
+        "value": "į"
+      },
+      {
+        "id": 236,
+        "value": "İ"
+      },
+      {
+        "id": 237,
+        "value": "ı"
+      },
+      {
+        "id": 238,
+        "value": "Ĳ"
+      },
+      {
+        "id": 239,
+        "value": "ĳ"
+      },
+      {
+        "id": 240,
+        "value": "Ĵ"
+      },
+      {
+        "id": 241,
+        "value": "ĵ"
+      },
+      {
+        "id": 242,
+        "value": "Ķ"
+      },
+      {
+        "id": 243,
+        "value": "ķ"
+      },
+      {
+        "id": 244,
+        "value": "ĸ"
+      },
+      {
+        "id": 245,
+        "value": "Ĺ"
+      },
+      {
+        "id": 246,
+        "value": "ĺ"
+      },
+      {
+        "id": 247,
+        "value": "Ļ"
+      },
+      {
+        "id": 248,
+        "value": "ļ"
+      },
+      {
+        "id": 249,
+        "value": "Ľ"
+      },
+      {
+        "id": 250,
+        "value": "ľ"
+      },
+      {
+        "id": 251,
+        "value": "Ŀ"
+      },
+      {
+        "id": 252,
+        "value": "ŀ"
+      },
+      {
+        "id": 253,
+        "value": "Ł"
+      },
+      {
+        "id": 254,
+        "value": "ł"
+      },
+      {
+        "id": 255,
+        "value": "Ń"
+      },
+      {
+        "id": 256,
+        "value": "ĠĠ"
+      },
+      {
+        "id": 258,
+        "value": "in"
+      },
+      {
+        "id": 259,
+        "value": "Ġt"
+      },
+      {
+        "id": 261,
+        "value": "er"
+      },
+      {
+        "id": 263,
+        "value": "on"
+      },
+      {
+        "id": 264,
+        "value": "Ġa"
+      },
+      {
+        "id": 266,
+        "value": "at"
+      },
+      {
+        "id": 267,
+        "value": "st"
+      },
+      {
+        "id": 268,
+        "value": "en"
+      },
+      {
+        "id": 271,
+        "value": "ĊĊ"
+      },
+      {
+        "id": 272,
+        "value": "Ġc"
+      },
+      {
+        "id": 275,
+        "value": "it"
+      },
+      {
+        "id": 276,
+        "value": "an"
+      },
+      {
+        "id": 280,
+        "value": "Ġp"
+      },
+      {
+        "id": 281,
+        "value": "Ġf"
+      },
+      {
+        "id": 283,
+        "value": "Ġ="
+      },
+      {
+        "id": 284,
+        "value": "is"
+      },
+      {
+        "id": 287,
+        "value": "es"
+      },
+      {
+        "id": 288,
+        "value": "Ġw"
+      },
+      {
+        "id": 294,
+        "value": "et"
+      },
+      {
+        "id": 299,
+        "value": "as"
+      },
+      {
+        "id": 300,
+        "value": "el"
+      },
+      {
+        "id": 301,
+        "value": "ct"
+      },
+      {
+        "id": 307,
+        "value": "Ġn"
+      },
+      {
+        "id": 310,
+        "value": "Ġto"
+      },
+      {
+        "id": 315,
+        "value": "om"
+      },
+      {
+        "id": 318,
+        "value": "Ġ("
+      },
+      {
+        "id": 323,
+        "value": "se"
+      },
+      {
+        "id": 325,
+        "value": "ex"
+      },
+      {
+        "id": 334,
+        "value": "em"
+      },
+      {
+        "id": 340,
+        "value": "iv"
+      },
+      {
+        "id": 343,
+        "value": "Ġv"
+      },
+      {
+        "id": 350,
+        "value": "us"
+      },
+      {
+        "id": 367,
+        "value": "um"
+      },
+      {
+        "id": 373,
+        "value": "âĢ"
+      },
+      {
+        "id": 375,
+        "value": "ist"
+      },
+      {
+        "id": 379,
+        "value": "lo"
+      },
+      {
+        "id": 383,
+        "value": "Ġon"
+      },
+      {
+        "id": 384,
+        "value": "Ġcon"
+      },
+      {
+        "id": 389,
+        "value": "ass"
+      },
+      {
+        "id": 396,
+        "value": "ir"
+      },
+      {
+        "id": 412,
+        "value": "Ġwh"
+      },
+      {
+        "id": 419,
+        "value": "ext"
+      },
+      {
+        "id": 424,
+        "value": "Ġit"
+      },
+      {
+        "id": 435,
+        "value": "con"
+      },
+      {
+        "id": 441,
+        "value": "iz"
+      },
+      {
+        "id": 444,
+        "value": "Ġal"
+      },
+      {
+        "id": 452,
+        "value": "ri"
+      },
+      {
+        "id": 456,
+        "value": "ain"
+      },
+      {
+        "id": 478,
+        "value": "Ġ+"
+      },
+      {
+        "id": 486,
+        "value": ".."
+      },
+      {
+        "id": 505,
+        "value": "ant"
+      },
+      {
+        "id": 519,
+        "value": "act"
+      },
+      {
+        "id": 520,
+        "value": "ive"
+      },
+      {
+        "id": 558,
+        "value": "ip"
+      },
+      {
+        "id": 571,
+        "value": "ve"
+      },
+      {
+        "id": 574,
+        "value": "Ġ=>"
+      },
+      {
+        "id": 582,
+        "value": "yst"
+      },
+      {
+        "id": 597,
+        "value": "ystem"
+      },
+      {
+        "id": 609,
+        "value": "Ġpl"
+      },
+      {
+        "id": 617,
+        "value": "ome"
+      },
+      {
+        "id": 618,
+        "value": "ĠâĢ"
+      },
+      {
+        "id": 634,
+        "value": "ber"
+      },
+      {
+        "id": 718,
+        "value": "cri"
+      },
+      {
+        "id": 734,
+        "value": "ph"
+      },
+      {
+        "id": 785,
+        "value": "ne"
+      },
+      {
+        "id": 799,
+        "value": "Ġone"
+      },
+      {
+        "id": 830,
+        "value": "Ġx"
+      },
+      {
+        "id": 838,
+        "value": "irst"
+      },
+      {
+        "id": 846,
+        "value": "user"
+      },
+      {
+        "id": 862,
+        "value": "umber"
+      },
+      {
+        "id": 933,
+        "value": "Ã©"
+      },
+      {
+        "id": 989,
+        "value": "const"
+      },
+      {
+        "id": 1029,
+        "value": "ise"
+      },
+      {
+        "id": 1076,
+        "value": "..."
+      },
+      {
+        "id": 1092,
+        "value": "Ġwhat"
+      },
+      {
+        "id": 1252,
+        "value": "cond"
+      },
+      {
+        "id": 1269,
+        "value": "ait"
+      },
+      {
+        "id": 1323,
+        "value": "be"
+      },
+      {
+        "id": 1324,
+        "value": "Ġnumber"
+      },
+      {
+        "id": 1414,
+        "value": "Ġtext"
+      },
+      {
+        "id": 1460,
+        "value": "Se"
+      },
+      {
+        "id": 1850,
+        "value": "eta"
+      },
+      {
+        "id": 1892,
+        "value": "ĠâĢĶ"
+      },
+      {
+        "id": 1948,
+        "value": "Sh"
+      },
+      {
+        "id": 2029,
+        "value": "Ġfact"
+      },
+      {
+        "id": 2083,
+        "value": "no"
+      },
+      {
+        "id": 2093,
+        "value": "Ġca"
+      },
+      {
+        "id": 2161,
+        "value": "ĉb"
+      },
+      {
+        "id": 2492,
+        "value": "af"
+      },
+      {
+        "id": 2625,
+        "value": "ken"
+      },
+      {
+        "id": 3014,
+        "value": "cribe"
+      },
+      {
+        "id": 3035,
+        "value": "izer"
+      },
+      {
+        "id": 3267,
+        "value": "na"
+      },
+      {
+        "id": 3320,
+        "value": "Be"
+      },
+      {
+        "id": 3413,
+        "value": "Ġconc"
+      },
+      {
+        "id": 3817,
+        "value": "Ġtoken"
+      },
+      {
+        "id": 3833,
+        "value": "One"
+      },
+      {
+        "id": 3834,
+        "value": "pha"
+      },
+      {
+        "id": 4638,
+        "value": "ello"
+      },
+      {
+        "id": 4737,
+        "value": "Des"
+      },
+      {
+        "id": 5170,
+        "value": "First"
+      },
+      {
+        "id": 5389,
+        "value": "ï¿"
+      },
+      {
+        "id": 5513,
+        "value": "ï¿½"
+      },
+      {
+        "id": 5972,
+        "value": "Ġvs"
+      },
+      {
+        "id": 6531,
+        "value": "ga"
+      },
+      {
+        "id": 8029,
+        "value": "Ġalpha"
+      },
+      {
+        "id": 8678,
+        "value": "system"
+      },
+      {
+        "id": 9008,
+        "value": "ðŁ"
+      },
+      {
+        "id": 9405,
+        "value": "yes"
+      },
+      {
+        "id": 9419,
+        "value": "Hello"
+      },
+      {
+        "id": 9947,
+        "value": "Use"
+      },
+      {
+        "id": 10838,
+        "value": "ĠðŁ"
+      },
+      {
+        "id": 10876,
+        "value": "istant"
+      },
+      {
+        "id": 13784,
+        "value": "Wait"
+      },
+      {
+        "id": 13983,
+        "value": "Ġplain"
+      },
+      {
+        "id": 15207,
+        "value": "Second"
+      },
+      {
+        "id": 17980,
+        "value": "ĻĤ"
+      },
+      {
+        "id": 25153,
+        "value": "?!"
+      },
+      {
+        "id": 28152,
+        "value": "Ġcaf"
+      },
+      {
+        "id": 28657,
+        "value": "Ship"
+      },
+      {
+        "id": 31611,
+        "value": "omega"
+      },
+      {
+        "id": 32002,
+        "value": "/no"
+      },
+      {
+        "id": 33963,
+        "value": "Give"
+      },
+      {
+        "id": 36328,
+        "value": "Ã¯"
+      },
+      {
+        "id": 44424,
+        "value": "Ġtokenizer"
+      },
+      {
+        "id": 50203,
+        "value": "ĠcafÃ©"
+      },
+      {
+        "id": 61446,
+        "value": "Ġconcise"
+      },
+      {
+        "id": 72240,
+        "value": "Describe"
+      },
+      {
+        "id": 74455,
+        "value": "assistant"
+      },
+      {
+        "id": 95727,
+        "value": "äº"
+      },
+      {
+        "id": 95756,
+        "value": "æĿ"
+      },
+      {
+        "id": 96911,
+        "value": "äº¬"
+      },
+      {
+        "id": 97959,
+        "value": "æĿ±"
+      },
+      {
+        "id": 115197,
+        "value": "æĿ±äº¬"
+      },
+      {
+        "id": 169171,
+        "value": "ðŁĻĤ"
+      }
+    ],
+    "merges": [
+      {
+        "rank": 0,
+        "left": 220,
+        "right": 220,
+        "result": 256
+      },
+      {
+        "rank": 2,
+        "left": 72,
+        "right": 77,
+        "result": 258
+      },
+      {
+        "rank": 3,
+        "left": 220,
+        "right": 83,
+        "result": 259
+      },
+      {
+        "rank": 5,
+        "left": 68,
+        "right": 81,
+        "result": 261
+      },
+      {
+        "rank": 7,
+        "left": 78,
+        "right": 77,
+        "result": 263
+      },
+      {
+        "rank": 8,
+        "left": 220,
+        "right": 64,
+        "result": 264
+      },
+      {
+        "rank": 10,
+        "left": 64,
+        "right": 83,
+        "result": 266
+      },
+      {
+        "rank": 11,
+        "left": 82,
+        "right": 83,
+        "result": 267
+      },
+      {
+        "rank": 12,
+        "left": 68,
+        "right": 77,
+        "result": 268
+      },
+      {
+        "rank": 15,
+        "left": 198,
+        "right": 198,
+        "result": 271
+      },
+      {
+        "rank": 16,
+        "left": 220,
+        "right": 66,
+        "result": 272
+      },
+      {
+        "rank": 19,
+        "left": 72,
+        "right": 83,
+        "result": 275
+      },
+      {
+        "rank": 20,
+        "left": 64,
+        "right": 77,
+        "result": 276
+      },
+      {
+        "rank": 24,
+        "left": 220,
+        "right": 79,
+        "result": 280
+      },
+      {
+        "rank": 25,
+        "left": 220,
+        "right": 69,
+        "result": 281
+      },
+      {
+        "rank": 27,
+        "left": 220,
+        "right": 28,
+        "result": 283
+      },
+      {
+        "rank": 28,
+        "left": 72,
+        "right": 82,
+        "result": 284
+      },
+      {
+        "rank": 31,
+        "left": 68,
+        "right": 82,
+        "result": 287
+      },
+      {
+        "rank": 32,
+        "left": 220,
+        "right": 86,
+        "result": 288
+      },
+      {
+        "rank": 38,
+        "left": 68,
+        "right": 83,
+        "result": 294
+      },
+      {
+        "rank": 43,
+        "left": 64,
+        "right": 82,
+        "result": 299
+      },
+      {
+        "rank": 44,
+        "left": 68,
+        "right": 75,
+        "result": 300
+      },
+      {
+        "rank": 45,
+        "left": 66,
+        "right": 83,
+        "result": 301
+      },
+      {
+        "rank": 51,
+        "left": 220,
+        "right": 77,
+        "result": 307
+      },
+      {
+        "rank": 54,
+        "left": 259,
+        "right": 78,
+        "result": 310
+      },
+      {
+        "rank": 59,
+        "left": 78,
+        "right": 76,
+        "result": 315
+      },
+      {
+        "rank": 62,
+        "left": 220,
+        "right": 7,
+        "result": 318
+      },
+      {
+        "rank": 67,
+        "left": 82,
+        "right": 68,
+        "result": 323
+      },
+      {
+        "rank": 69,
+        "left": 68,
+        "right": 87,
+        "result": 325
+      },
+      {
+        "rank": 78,
+        "left": 68,
+        "right": 76,
+        "result": 334
+      },
+      {
+        "rank": 84,
+        "left": 72,
+        "right": 85,
+        "result": 340
+      },
+      {
+        "rank": 87,
+        "left": 220,
+        "right": 85,
+        "result": 343
+      },
+      {
+        "rank": 94,
+        "left": 84,
+        "right": 82,
+        "result": 350
+      },
+      {
+        "rank": 111,
+        "left": 84,
+        "right": 76,
+        "result": 367
+      },
+      {
+        "rank": 117,
+        "left": 158,
+        "right": 222,
+        "result": 373
+      },
+      {
+        "rank": 119,
+        "left": 72,
+        "right": 267,
+        "result": 375
+      },
+      {
+        "rank": 123,
+        "left": 75,
+        "right": 78,
+        "result": 379
+      },
+      {
+        "rank": 127,
+        "left": 220,
+        "right": 263,
+        "result": 383
+      },
+      {
+        "rank": 128,
+        "left": 272,
+        "right": 263,
+        "result": 384
+      },
+      {
+        "rank": 133,
+        "left": 299,
+        "right": 82,
+        "result": 389
+      },
+      {
+        "rank": 140,
+        "left": 72,
+        "right": 81,
+        "result": 396
+      },
+      {
+        "rank": 156,
+        "left": 288,
+        "right": 71,
+        "result": 412
+      },
+      {
+        "rank": 163,
+        "left": 325,
+        "right": 83,
+        "result": 419
+      },
+      {
+        "rank": 168,
+        "left": 220,
+        "right": 275,
+        "result": 424
+      },
+      {
+        "rank": 179,
+        "left": 66,
+        "right": 263,
+        "result": 435
+      },
+      {
+        "rank": 185,
+        "left": 72,
+        "right": 89,
+        "result": 441
+      },
+      {
+        "rank": 188,
+        "left": 264,
+        "right": 75,
+        "result": 444
+      },
+      {
+        "rank": 196,
+        "left": 81,
+        "right": 72,
+        "result": 452
+      },
+      {
+        "rank": 200,
+        "left": 64,
+        "right": 258,
+        "result": 456
+      },
+      {
+        "rank": 222,
+        "left": 220,
+        "right": 10,
+        "result": 478
+      },
+      {
+        "rank": 230,
+        "left": 13,
+        "right": 13,
+        "result": 486
+      },
+      {
+        "rank": 249,
+        "left": 276,
+        "right": 83,
+        "result": 505
+      },
+      {
+        "rank": 263,
+        "left": 64,
+        "right": 301,
+        "result": 519
+      },
+      {
+        "rank": 264,
+        "left": 340,
+        "right": 68,
+        "result": 520
+      },
+      {
+        "rank": 302,
+        "left": 72,
+        "right": 79,
+        "result": 558
+      },
+      {
+        "rank": 315,
+        "left": 85,
+        "right": 68,
+        "result": 571
+      },
+      {
+        "rank": 318,
+        "left": 283,
+        "right": 29,
+        "result": 574
+      },
+      {
+        "rank": 326,
+        "left": 88,
+        "right": 267,
+        "result": 582
+      },
+      {
+        "rank": 341,
+        "left": 582,
+        "right": 334,
+        "result": 597
+      },
+      {
+        "rank": 353,
+        "left": 280,
+        "right": 75,
+        "result": 609
+      },
+      {
+        "rank": 361,
+        "left": 315,
+        "right": 68,
+        "result": 617
+      },
+      {
+        "rank": 362,
+        "left": 220,
+        "right": 373,
+        "result": 618
+      },
+      {
+        "rank": 378,
+        "left": 65,
+        "right": 261,
+        "result": 634
+      },
+      {
+        "rank": 462,
+        "left": 66,
+        "right": 452,
+        "result": 718
+      },
+      {
+        "rank": 478,
+        "left": 79,
+        "right": 71,
+        "result": 734
+      },
+      {
+        "rank": 529,
+        "left": 77,
+        "right": 68,
+        "result": 785
+      },
+      {
+        "rank": 543,
+        "left": 383,
+        "right": 68,
+        "result": 799
+      },
+      {
+        "rank": 574,
+        "left": 220,
+        "right": 87,
+        "result": 830
+      },
+      {
+        "rank": 582,
+        "left": 396,
+        "right": 267,
+        "result": 838
+      },
+      {
+        "rank": 590,
+        "left": 350,
+        "right": 261,
+        "result": 846
+      },
+      {
+        "rank": 606,
+        "left": 367,
+        "right": 634,
+        "result": 862
+      },
+      {
+        "rank": 677,
+        "left": 127,
+        "right": 102,
+        "result": 933
+      },
+      {
+        "rank": 733,
+        "left": 435,
+        "right": 267,
+        "result": 989
+      },
+      {
+        "rank": 773,
+        "left": 284,
+        "right": 68,
+        "result": 1029
+      },
+      {
+        "rank": 820,
+        "left": 486,
+        "right": 13,
+        "result": 1076
+      },
+      {
+        "rank": 836,
+        "left": 412,
+        "right": 266,
+        "result": 1092
+      },
+      {
+        "rank": 996,
+        "left": 435,
+        "right": 67,
+        "result": 1252
+      },
+      {
+        "rank": 1013,
+        "left": 64,
+        "right": 275,
+        "result": 1269
+      },
+      {
+        "rank": 1067,
+        "left": 65,
+        "right": 68,
+        "result": 1323
+      },
+      {
+        "rank": 1068,
+        "left": 307,
+        "right": 862,
+        "result": 1324
+      },
+      {
+        "rank": 1158,
+        "left": 259,
+        "right": 419,
+        "result": 1414
+      },
+      {
+        "rank": 1204,
+        "left": 50,
+        "right": 68,
+        "result": 1460
+      },
+      {
+        "rank": 1594,
+        "left": 294,
+        "right": 64,
+        "result": 1850
+      },
+      {
+        "rank": 1636,
+        "left": 618,
+        "right": 242,
+        "result": 1892
+      },
+      {
+        "rank": 1692,
+        "left": 50,
+        "right": 71,
+        "result": 1948
+      },
+      {
+        "rank": 1773,
+        "left": 281,
+        "right": 519,
+        "result": 2029
+      },
+      {
+        "rank": 1827,
+        "left": 77,
+        "right": 78,
+        "result": 2083
+      },
+      {
+        "rank": 1837,
+        "left": 272,
+        "right": 64,
+        "result": 2093
+      },
+      {
+        "rank": 1905,
+        "left": 197,
+        "right": 65,
+        "result": 2161
+      },
+      {
+        "rank": 2236,
+        "left": 64,
+        "right": 69,
+        "result": 2492
+      },
+      {
+        "rank": 2369,
+        "left": 74,
+        "right": 268,
+        "result": 2625
+      },
+      {
+        "rank": 2758,
+        "left": 718,
+        "right": 1323,
+        "result": 3014
+      },
+      {
+        "rank": 2779,
+        "left": 441,
+        "right": 261,
+        "result": 3035
+      },
+      {
+        "rank": 3011,
+        "left": 77,
+        "right": 64,
+        "result": 3267
+      },
+      {
+        "rank": 3064,
+        "left": 33,
+        "right": 68,
+        "result": 3320
+      },
+      {
+        "rank": 3157,
+        "left": 384,
+        "right": 66,
+        "result": 3413
+      },
+      {
+        "rank": 3561,
+        "left": 310,
+        "right": 2625,
+        "result": 3817
+      },
+      {
+        "rank": 3577,
+        "left": 46,
+        "right": 785,
+        "result": 3833
+      },
+      {
+        "rank": 3578,
+        "left": 734,
+        "right": 64,
+        "result": 3834
+      },
+      {
+        "rank": 4382,
+        "left": 300,
+        "right": 379,
+        "result": 4638
+      },
+      {
+        "rank": 4481,
+        "left": 35,
+        "right": 287,
+        "result": 4737
+      },
+      {
+        "rank": 4914,
+        "left": 37,
+        "right": 838,
+        "result": 5170
+      },
+      {
+        "rank": 5133,
+        "left": 171,
+        "right": 123,
+        "result": 5389
+      },
+      {
+        "rank": 5257,
+        "left": 5389,
+        "right": 121,
+        "result": 5513
+      },
+      {
+        "rank": 5716,
+        "left": 343,
+        "right": 82,
+        "result": 5972
+      },
+      {
+        "rank": 6275,
+        "left": 70,
+        "right": 64,
+        "result": 6531
+      },
+      {
+        "rank": 7773,
+        "left": 444,
+        "right": 3834,
+        "result": 8029
+      },
+      {
+        "rank": 8422,
+        "left": 82,
+        "right": 597,
+        "result": 8678
+      },
+      {
+        "rank": 8752,
+        "left": 172,
+        "right": 253,
+        "result": 9008
+      },
+      {
+        "rank": 9149,
+        "left": 88,
+        "right": 287,
+        "result": 9405
+      },
+      {
+        "rank": 9163,
+        "left": 39,
+        "right": 4638,
+        "result": 9419
+      },
+      {
+        "rank": 9691,
+        "left": 52,
+        "right": 323,
+        "result": 9947
+      },
+      {
+        "rank": 10582,
+        "left": 220,
+        "right": 9008,
+        "result": 10838
+      },
+      {
+        "rank": 10620,
+        "left": 375,
+        "right": 505,
+        "result": 10876
+      },
+      {
+        "rank": 13528,
+        "left": 54,
+        "right": 1269,
+        "result": 13784
+      },
+      {
+        "rank": 13727,
+        "left": 609,
+        "right": 456,
+        "result": 13983
+      },
+      {
+        "rank": 14951,
+        "left": 1460,
+        "right": 1252,
+        "result": 15207
+      },
+      {
+        "rank": 17724,
+        "left": 247,
+        "right": 224,
+        "result": 17980
+      },
+      {
+        "rank": 24897,
+        "left": 30,
+        "right": 0,
+        "result": 25153
+      },
+      {
+        "rank": 27896,
+        "left": 2093,
+        "right": 69,
+        "result": 28152
+      },
+      {
+        "rank": 28401,
+        "left": 1948,
+        "right": 558,
+        "result": 28657
+      },
+      {
+        "rank": 31355,
+        "left": 617,
+        "right": 6531,
+        "result": 31611
+      },
+      {
+        "rank": 31746,
+        "left": 14,
+        "right": 2083,
+        "result": 32002
+      },
+      {
+        "rank": 33707,
+        "left": 38,
+        "right": 520,
+        "result": 33963
+      },
+      {
+        "rank": 36072,
+        "left": 127,
+        "right": 107,
+        "result": 36328
+      },
+      {
+        "rank": 44168,
+        "left": 3817,
+        "right": 3035,
+        "result": 44424
+      },
+      {
+        "rank": 49947,
+        "left": 28152,
+        "right": 933,
+        "result": 50203
+      },
+      {
+        "rank": 61190,
+        "left": 3413,
+        "right": 1029,
+        "result": 61446
+      },
+      {
+        "rank": 71984,
+        "left": 4737,
+        "right": 3014,
+        "result": 72240
+      },
+      {
+        "rank": 74199,
+        "left": 389,
+        "right": 10876,
+        "result": 74455
+      },
+      {
+        "rank": 95471,
+        "left": 160,
+        "right": 118,
+        "result": 95727
+      },
+      {
+        "rank": 95500,
+        "left": 162,
+        "right": 251,
+        "result": 95756
+      },
+      {
+        "rank": 96655,
+        "left": 95727,
+        "right": 105,
+        "result": 96911
+      },
+      {
+        "rank": 97703,
+        "left": 95756,
+        "right": 109,
+        "result": 97959
+      },
+      {
+        "rank": 114932,
+        "left": 97959,
+        "right": 96911,
+        "result": 115197
+      },
+      {
+        "rank": 168859,
+        "left": 9008,
+        "right": 17980,
+        "result": 169171
+      }
+    ],
+    "addedTokens": [
+      {
+        "id": 248044,
+        "content": "<|endoftext|>",
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true
+      },
+      {
+        "id": 248045,
+        "content": "<|im_start|>",
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true
+      },
+      {
+        "id": 248046,
+        "content": "<|im_end|>",
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": true
+      },
+      {
+        "id": 248047,
+        "content": "<|object_ref_start|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248048,
+        "content": "<|object_ref_end|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248049,
+        "content": "<|box_start|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248050,
+        "content": "<|box_end|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248051,
+        "content": "<|quad_start|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248052,
+        "content": "<|quad_end|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248053,
+        "content": "<|vision_start|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248054,
+        "content": "<|vision_end|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248055,
+        "content": "<|vision_pad|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248056,
+        "content": "<|image_pad|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248057,
+        "content": "<|video_pad|>",
+        "normalized": false,
+        "lstrip": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": true
+      },
+      {
+        "id": 248058,
+        "content": "<tool_call>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248059,
+        "content": "</tool_call>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248060,
+        "content": "<|fim_prefix|>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248061,
+        "content": "<|fim_middle|>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248062,
+        "content": "<|fim_suffix|>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248063,
+        "content": "<|fim_pad|>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248064,
+        "content": "<|repo_name|>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248065,
+        "content": "<|file_sep|>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248066,
+        "content": "<tool_response>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248067,
+        "content": "</tool_response>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248068,
+        "content": "<think>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      },
+      {
+        "id": 248069,
+        "content": "</think>",
+        "lstrip": false,
+        "normalized": false,
+        "rstrip": false,
+        "single_word": false,
+        "special": false
+      }
+    ]
+  }
+}

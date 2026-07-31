@@ -48,7 +48,7 @@ function tables(): CompiledTokenizerTables {
 }
 
 function tokenizer(limits?: Partial<Qwen35TokenizerLimits>): Qwen35Tokenizer {
-  return Qwen35Tokenizer.fromTables(tables(), limits);
+  return Qwen35Tokenizer.fromUnsafeTablesForTests(tables(), limits);
 }
 
 test("runs model-specific ByteLevel BPE and decodes raw token bytes", () => {
@@ -134,7 +134,7 @@ test("enforces input, piece, and merge-work resource bounds with safe diagnostic
 
 test("copies mutable binary tables at the trust boundary", () => {
   const source = tables();
-  const instance = Qwen35Tokenizer.fromTables(source);
+  const instance = Qwen35Tokenizer.fromUnsafeTablesForTests(source);
 
   source.tokenBytes.fill(120);
   source.tokenOffsets.fill(0);
@@ -185,7 +185,7 @@ test("rejects tokenizer tables that would expose unmapped rows as decodable", ()
 
   assert.throws(
     () =>
-      Qwen35Tokenizer.fromTables({
+      Qwen35Tokenizer.fromUnsafeTablesForTests({
         baseVocabSize: tokenCount,
         tokenCount,
         tokenOffsets: new Uint32Array(tokenCount + 1),
@@ -207,4 +207,62 @@ test("bounds reserved-token inspection as part of the public input contract", ()
       error instanceof RuntimeDiagnosticError &&
       error.code === "tokenizer-input-limit",
   );
+});
+
+test("handles adversarial prefix merges within incremental work bounds", () => {
+  const suffixLength = 1_000;
+  const tokens: number[][] = [[97], [98]];
+  const merges = new Uint32Array(suffixLength * 3);
+  for (let index = 0; index < suffixLength; index += 1) {
+    const resultId = index + 2;
+    tokens.push([98, ...new Array(index + 1).fill(97)]);
+    merges[index * 3] = index === 0 ? 1 : resultId - 1;
+    merges[index * 3 + 1] = 0;
+    merges[index * 3 + 2] = resultId;
+  }
+  const offsets = new Uint32Array(tokens.length + 1);
+  const bytes: number[] = [];
+  for (const [id, tokenBytes] of tokens.entries()) {
+    offsets[id] = bytes.length;
+    bytes.push(...tokenBytes);
+  }
+  offsets[tokens.length] = bytes.length;
+  const instance = Qwen35Tokenizer.fromUnsafeTablesForTests(
+    {
+      baseVocabSize: tokens.length,
+      tokenCount: tokens.length,
+      tokenOffsets: offsets,
+      tokenBytes: Uint8Array.from(bytes),
+      merges,
+      addedTokenIds: new Uint32Array(),
+      addedTokenFlags: new Uint8Array(),
+    },
+    { maxMergeWork: 8_000, maxPieceBytes: 2_000 },
+  );
+
+  assert.deepEqual(
+    instance.encode(`b${"a".repeat(suffixLength)}`),
+    [suffixLength + 1],
+  );
+});
+
+test("preserves left-to-right overlapping merge parity", () => {
+  const instance = Qwen35Tokenizer.fromUnsafeTablesForTests({
+    baseVocabSize: 3,
+    tokenCount: 3,
+    tokenOffsets: Uint32Array.from([0, 1, 3, 7]),
+    tokenBytes: Uint8Array.from([
+      97,
+      97, 97,
+      97, 97, 97, 97,
+    ]),
+    merges: Uint32Array.from([
+      0, 0, 1,
+      1, 1, 2,
+    ]),
+    addedTokenIds: new Uint32Array(),
+    addedTokenFlags: new Uint8Array(),
+  });
+
+  assert.deepEqual(instance.encode("aaaa"), [2]);
 });

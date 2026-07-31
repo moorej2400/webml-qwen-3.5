@@ -53,7 +53,7 @@ function byteCompleteTokenizer(): Qwen35Tokenizer {
     ),
     addedTokenFlags: Uint8Array.from([1, 1, 1, 1, 1, 1, 0, 0]),
   };
-  return Qwen35Tokenizer.fromTables(tables);
+  return Qwen35Tokenizer.fromUnsafeTablesForTests(tables);
 }
 
 test("renders all pinned official system, user, assistant, and image fixtures", async () => {
@@ -254,5 +254,29 @@ test("rejects malformed message objects with a safe diagnostic", () => {
     (error: unknown) =>
       error instanceof RuntimeDiagnosticError &&
       error.code === "chat-message-invalid",
+  );
+});
+
+test("matches Python and Jinja strip whitespace instead of JavaScript trim", () => {
+  assert.equal(
+    renderQwen35Chat(
+      [{ role: "user", content: "\u001c\u0085Hello\u001d" }],
+      { addGenerationPrompt: false },
+    ),
+    "<|im_start|>user\nHello<|im_end|>\n",
+  );
+  assert.equal(
+    renderQwen35Chat(
+      [{ role: "user", content: "\ufeffHello\ufeff" }],
+      { addGenerationPrompt: false },
+    ),
+    "<|im_start|>user\n\ufeffHello\ufeff<|im_end|>\n",
+  );
+  assert.equal(
+    renderQwen35Chat(
+      [{ role: "user", content: "\u200bHello\u200b" }],
+      { addGenerationPrompt: false },
+    ),
+    "<|im_start|>user\n\u200bHello\u200b<|im_end|>\n",
   );
 });

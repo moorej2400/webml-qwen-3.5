@@ -13,4 +13,8 @@ test("exports mixed tensor conversion and GEMV APIs from the package entrypoint"
   assert.equal(typeof runtime.fullAttentionDecodeCpu, "function");
   assert.equal(typeof runtime.gatedDeltaNetDecodeCpu, "function");
   assert.equal(runtime.QWEN35_HYBRID_KERNELS.length, 6);
+  assert.equal(typeof runtime.Qwen35Tokenizer, "function");
+  assert.equal(typeof runtime.loadPinnedQwen35Tokenizer, "function");
+  assert.equal(typeof runtime.renderQwen35Chat, "function");
+  assert.equal("compileTokenizerSource" in runtime, false);
 });

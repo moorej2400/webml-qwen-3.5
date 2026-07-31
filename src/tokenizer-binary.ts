@@ -1,3 +1,5 @@
+import { IncrementalSha256 } from "./incremental-sha256.js";
+
 export const TOKENIZER_ARTIFACT_VERSION = 1;
 export const TOKENIZER_BINARY_MAGIC = "Q35TOK01";
 export const TOKENIZER_BINARY_HEADER_BYTES = 32;
@@ -5,6 +7,13 @@ export const MAX_COMPILED_TOKEN_COUNT = 300_000;
 export const MAX_COMPILED_MERGE_COUNT = 300_000;
 export const MAX_COMPILED_ADDED_TOKENS = 1_024;
 export const QWEN35_MODEL_LOGIT_ROWS = 248_320;
+export const MAX_COMPILED_TOKENIZER_BYTES = 8 * 1024 * 1024;
+const SHA256 = /^[a-f0-9]{64}$/;
+
+export interface BrowserTokenizerArtifactIdentity {
+  readonly byteLength: number;
+  readonly sha256: string;
+}
 
 export interface CompiledTokenizerTables {
   readonly baseVocabSize: number;
@@ -19,6 +28,59 @@ export interface CompiledTokenizerTables {
 }
 
 /**
+ * Authenticates a bounded browser byte stream before a parser sees its header.
+ *
+ * `declaredByteLength` must come from trusted package metadata or a validated
+ * response header. A mismatch fails before allocating the artifact buffer or
+ * asking the iterable for its first chunk.
+ */
+export async function readAuthenticatedTokenizerArtifact(
+  chunks: AsyncIterable<Uint8Array>,
+  identity: BrowserTokenizerArtifactIdentity,
+  declaredByteLength: number,
+): Promise<Uint8Array> {
+  if (
+    !Number.isSafeInteger(identity.byteLength) ||
+    identity.byteLength <= 0 ||
+    identity.byteLength > MAX_COMPILED_TOKENIZER_BYTES ||
+    !SHA256.test(identity.sha256)
+  ) {
+    throw new Error("Tokenizer artifact identity is invalid");
+  }
+  if (declaredByteLength !== identity.byteLength) {
+    throw new Error(
+      "Tokenizer artifact declared byte length does not match its identity",
+    );
+  }
+
+  const output = new Uint8Array(identity.byteLength);
+  const hash = new IncrementalSha256();
+  let offset = 0;
+  for await (const chunk of chunks) {
+    if (!(chunk instanceof Uint8Array)) {
+      throw new Error("Tokenizer artifact stream must contain bytes");
+    }
+    if (offset + chunk.byteLength > identity.byteLength) {
+      throw new Error(
+        "Tokenizer artifact stream exceeds its authenticated byte length",
+      );
+    }
+    output.set(chunk, offset);
+    hash.update(chunk);
+    offset += chunk.byteLength;
+  }
+  if (offset !== identity.byteLength) {
+    throw new Error(
+      "Tokenizer artifact stream ended before its authenticated byte length",
+    );
+  }
+  if (hash.digestHex() !== identity.sha256) {
+    throw new Error("Tokenizer artifact SHA-256 does not match its identity");
+  }
+  return output;
+}
+
+/**
  * Validates every byte range before exposing tokenizer tables to WebGPU code.
  *
  * This module is browser-safe by design. Node hashing and file conversion stay
@@ -29,7 +91,8 @@ export function deserializeCompiledTokenizer(
 ): CompiledTokenizerTables {
   if (
     !(binary instanceof Uint8Array) ||
-    binary.byteLength < TOKENIZER_BINARY_HEADER_BYTES
+    binary.byteLength < TOKENIZER_BINARY_HEADER_BYTES ||
+    binary.byteLength > MAX_COMPILED_TOKENIZER_BYTES
   ) {
     throw new Error("Compiled tokenizer artifact is truncated");
   }
@@ -90,7 +153,7 @@ export function deserializeCompiledTokenizer(
   if (tokenOffsets[tokenCount] !== tokenDataLength) {
     throw new Error("Compiled tokenizer token data is incomplete");
   }
-  const tokenBytes = binary.slice(cursor, cursor + tokenDataLength);
+  const tokenBytes = binary.subarray(cursor, cursor + tokenDataLength);
   cursor += tokenDataLength;
 
   const merges = new Uint32Array(mergeCount * 3);
@@ -115,7 +178,7 @@ export function deserializeCompiledTokenizer(
     addedTokenFlags[index] = flags;
     cursor += 8;
   }
-  return Object.freeze({
+  return {
     baseVocabSize,
     tokenCount,
     tokenOffsets,
@@ -123,5 +186,5 @@ export function deserializeCompiledTokenizer(
     merges,
     addedTokenIds,
     addedTokenFlags,
-  });
+  };
 }

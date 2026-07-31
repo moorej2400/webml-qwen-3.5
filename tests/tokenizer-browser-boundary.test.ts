@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { builtinModules } from "node:module";
 import test from "node:test";
+import ts from "typescript";
+import * as browser from "../src/browser.js";
 
 const BROWSER_ENTRYPOINTS = [
-  "../src/qwen-tokenizer.ts",
-  "../src/qwen-chat-template.ts",
+  "../src/browser.ts",
 ];
+const NODE_BUILTINS = new Set(
+  builtinModules.flatMap((name) => [name, `node:${name}`]),
+);
 
 test("browser tokenizer modules have no transitive Node imports", async () => {
   const visited = new Set<string>();
@@ -20,14 +25,36 @@ test("browser tokenizer modules have no transitive Node imports", async () => {
     }
     visited.add(url.href);
     const source = await readFile(url, "utf8");
-    const imports = [
-      ...source.matchAll(
-        /(?:from\s+|import\s*\()\s*["']([^"']+)["']/g,
-      ),
-    ].map((match) => match[1]!);
+    const sourceFile = ts.createSourceFile(
+      url.pathname,
+      source,
+      ts.ScriptTarget.ESNext,
+      true,
+      ts.ScriptKind.TS,
+    );
+    const imports: string[] = [];
+    const visit = (node: ts.Node): void => {
+      if (
+        (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+        node.moduleSpecifier !== undefined &&
+        ts.isStringLiteral(node.moduleSpecifier)
+      ) {
+        imports.push(node.moduleSpecifier.text);
+      }
+      if (
+        ts.isCallExpression(node) &&
+        node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+        node.arguments.length === 1 &&
+        ts.isStringLiteral(node.arguments[0]!)
+      ) {
+        imports.push(node.arguments[0].text);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
     for (const specifier of imports) {
       assert.equal(
-        specifier.startsWith("node:"),
+        NODE_BUILTINS.has(specifier),
         false,
         `${url.pathname} imports ${specifier}`,
       );
@@ -38,4 +65,12 @@ test("browser tokenizer modules have no transitive Node imports", async () => {
       pending.push(new URL(typescriptSpecifier, url));
     }
   }
+});
+
+test("the browser entrypoint exports authenticated runtime APIs but not Node compiler APIs", () => {
+  assert.equal(typeof browser.Qwen35Tokenizer, "function");
+  assert.equal(typeof browser.loadPinnedQwen35Tokenizer, "function");
+  assert.equal(typeof browser.renderQwen35Chat, "function");
+  assert.equal("compileTokenizerSource" in browser, false);
+  assert.equal("compileQwen35TokenizerSource" in browser, false);
 });

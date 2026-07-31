@@ -13,6 +13,8 @@ const VISION_END = "<|vision_end|>";
 const IMAGE_PAD = "<|image_pad|>";
 const THINK_START = "<think>";
 const THINK_END = "</think>";
+const PYTHON_STRIP =
+  /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/gu;
 
 const RESERVED_TOKENS: readonly string[] = Object.freeze([
   "<|endoftext|>",
@@ -42,6 +44,12 @@ const RESERVED_TOKENS: readonly string[] = Object.freeze([
   THINK_START,
   THINK_END,
 ]);
+
+// Jinja's `trim` delegates to Python `str.strip()`. ECMAScript `trim()` both
+// misses Python controls such as U+0085 and incorrectly removes U+FEFF.
+function pythonStrip(value: string): string {
+  return value.replace(PYTHON_STRIP, "");
+}
 
 export type Qwen35ChatRole = "system" | "user" | "assistant";
 
@@ -232,8 +240,9 @@ function renderDetailed(
       0,
       state,
       addVisionId,
-    ).trim();
-    output += `${IM_START}system\n${systemContent}${IM_END}\n`;
+    );
+    const strippedSystemContent = pythonStrip(systemContent);
+    output += `${IM_START}system\n${strippedSystemContent}${IM_END}\n`;
   }
 
   for (const [index, message] of messages.entries()) {
@@ -254,12 +263,9 @@ function renderDetailed(
       continue;
     }
 
-    let content = renderContent(
-      message,
-      index,
-      state,
-      addVisionId,
-    ).trim();
+    let content = pythonStrip(
+      renderContent(message, index, state, addVisionId),
+    );
     if (message.role === "user") {
       output += `${IM_START}user\n${content}${IM_END}\n`;
       continue;
@@ -270,7 +276,7 @@ function renderDetailed(
       requireSafeContent(message.reasoningContent, state);
       reasoning = message.reasoningContent;
     }
-    reasoning = reasoning.trim();
+    reasoning = pythonStrip(reasoning);
     if (index > lastUserIndex) {
       output +=
         `${IM_START}assistant\n${THINK_START}\n${reasoning}\n` +
