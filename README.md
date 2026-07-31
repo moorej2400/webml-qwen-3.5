@@ -50,6 +50,8 @@ Qwen primitives, packed embeddings, and six hybrid attention/DeltaNet kernels.
 The harness executes the full-attention preparation stage at position 16,383
 and verifies its packed cache row and suffix against CPU references.
 
-See [Architecture](docs/architecture.md) for the artifact and feasibility
-rules. See [Third-party notices](THIRD_PARTY_NOTICES.md) for quantization
-algorithm attribution.
+See [Product requirements](docs/product-requirements.md) for the complete
+release plan and adaptive implementation contract. See
+[Architecture](docs/architecture.md) for the current runtime design and
+feasibility rules. See [Third-party notices](THIRD_PARTY_NOTICES.md) for
+quantization algorithm attribution.
