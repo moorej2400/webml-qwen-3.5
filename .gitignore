@@ -13,6 +13,8 @@ node_modules/
 dist/
 build/
 coverage/
+.local/
+.worktrees/
 .cache/
 .parcel-cache/
 .vite/

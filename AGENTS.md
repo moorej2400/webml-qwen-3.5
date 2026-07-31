@@ -36,3 +36,15 @@ Never commit:
 
 If public suitability is uncertain, leave the file untracked until it has been
 reviewed and sanitized.
+
+## Experimental Feasibility
+
+- Treat an early device failure as evidence about the tested implementation,
+  not proof that the browser target is impossible.
+- Do not impose an assumed model-size or browser-memory ceiling. Test materially
+  different allocation, packing, streaming, kernel, and scheduling designs.
+- Report a limit only after repeated physical-device evidence across different
+  approaches, and describe it as the tested boundary rather than a universal
+  browser rule.
+- Preserve the selected model, quantization, multimodal support, and context
+  target unless the user explicitly changes those product requirements.
