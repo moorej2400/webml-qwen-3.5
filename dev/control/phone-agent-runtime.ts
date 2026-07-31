@@ -64,10 +64,7 @@ export class PhoneAgentRuntime {
       return;
     }
     if (message.type === "sequenceSync") {
-      if (message.documentId !== this.#identity.documentId) {
-        throw new Error("sequence sync document mismatch");
-      }
-      for (const replay of this.#outbox.replayFrom(message.expectedSeq)) {
+      for (const replay of this.#outbox.synchronize(message)) {
         this.#platform.send(replay);
       }
       return;

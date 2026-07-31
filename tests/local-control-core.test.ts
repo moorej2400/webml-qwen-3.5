@@ -191,6 +191,35 @@ test("timed-out undispatched command is not sent by a later connection", () => {
   assert.equal(deliveries, 0);
 });
 
+test("terminal command is not dispatched by a later connection", () => {
+  const plane = new ControlPlane({ clock: new FakeClock() });
+  const first = connect(plane, identity("document_0123456789abcdef"));
+  plane.issueCommand({
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt",
+  });
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+    [3, "completed"],
+  ] as const) {
+    plane.receive(first.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...identity("document_0123456789abcdef"),
+      eventSeq,
+      commandId: "command_0123456789abcdef",
+      state,
+    });
+  }
+  plane.disconnect(first.connectionId, { kind: "socket_loss" });
+  const replacement = connect(plane, identity("document_0123456789abcdef"));
+
+  assert.equal(replacement.sent.some((message) => message.type === "command"), false);
+});
+
 test("successful reentrant acknowledgement sees command ownership", () => {
   const plane = new ControlPlane({ clock: new FakeClock() });
   let connectionId = "";

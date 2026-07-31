@@ -61,6 +61,7 @@ interface StoredCommand {
   target: Pick<PhoneIdentity, "deviceId" | "tabId">;
   message: Extract<ServerToPhoneMessage, { type: "command" }>;
   dispatched: boolean;
+  phoneReceived: boolean;
   originalDocumentId?: string;
   timer?: number | NodeJS.Timeout;
 }
@@ -161,8 +162,14 @@ export class ControlPlane {
     this.#tryQueue(connection, { schemaVersion: CONTROL_SCHEMA_VERSION, type: "reconcile", commands });
 
     for (const stored of this.#commands.values()) {
-      if (tabKey(stored.target) === key && !stored.dispatched) {
-        this.#attemptDispatch(stored, connection);
+      // A successful socket queue does not prove that the phone parsed the frame.
+      // Reconnect retries remain safe because the phone deduplicates commandId.
+      if (
+        tabKey(stored.target) === key &&
+        !stored.phoneReceived &&
+        !isTerminal(stored.tracker.snapshot().state)
+      ) {
+        this.#attemptDispatch(stored, connection, true);
       }
     }
     return connectionId;
@@ -235,6 +242,7 @@ export class ControlPlane {
       target,
       message,
       dispatched: false,
+      phoneReceived: false,
     };
     // Publish tracker ownership before transport delivery because in-memory
     // tests and future local transports can synchronously acknowledge a send.
@@ -265,8 +273,8 @@ export class ControlPlane {
     }
   }
 
-  #attemptDispatch(stored: StoredCommand, connection?: Connection): boolean {
-    if (stored.dispatched) return true;
+  #attemptDispatch(stored: StoredCommand, connection?: Connection, force = false): boolean {
+    if (stored.dispatched && !force) return true;
     if (isTerminal(stored.tracker.snapshot().state)) return false;
     const selected = connection ?? (() => {
       const connectionId = this.#connectionByTab.get(tabKey(stored.target));
@@ -345,6 +353,7 @@ export class ControlPlane {
       throw new Error(`phone cannot report server-owned reload state ${message.state}`);
     }
     stored.tracker.transition(message.state, this.#clock.now(), message.reason, message.result);
+    stored.phoneReceived = true;
     if (isTerminal(stored.tracker.snapshot().state) && stored.timer !== undefined) {
       this.#clock.clearTimeout(stored.timer);
     }

@@ -100,6 +100,24 @@ export const createBrowserAgentSource = (): string => `(() => {
       if (eventSeq >= expectedSeq) sendFrame(frame);
     }
   };
+  const synchronize = (message) => {
+    if (
+      message.documentId !== documentId ||
+      !Number.isSafeInteger(message.expectedSeq) ||
+      message.expectedSeq < 1
+    ) throw new Error("control_sync_invalid");
+    const acknowledgedSeq = message.expectedSeq - 1;
+    if (acknowledgedSeq < highestAcknowledged) {
+      throw new Error("control_sync_regression");
+    }
+    if (acknowledgedSeq > sequence) throw new Error("control_sync_bounds_invalid");
+    // expectedSeq proves that every lower event reached the authenticated server.
+    highestAcknowledged = acknowledgedSeq;
+    for (const eventSeq of outbox.keys()) {
+      if (eventSeq <= highestAcknowledged) outbox.delete(eventSeq);
+    }
+    replayFrom(message.expectedSeq);
+  };
   const acknowledge = (message) => {
     if (
       message.documentId !== documentId ||
@@ -262,8 +280,7 @@ export const createBrowserAgentSource = (): string => `(() => {
         }
         if (message.type === "sequenceSync") {
           try {
-            if (message.documentId !== documentId) throw new Error("control_sync_document_invalid");
-            replayFrom(message.expectedSeq);
+            synchronize(message);
           } catch {
             socket.close(1008, "protocol_error");
           }

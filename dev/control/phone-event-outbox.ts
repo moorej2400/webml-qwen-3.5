@@ -3,6 +3,7 @@ import {
   validateProtocolId,
   type EventAckMessage,
   type PhoneToServerMessage,
+  type SequenceSyncMessage,
 } from "./protocol.js";
 
 export interface PhoneEventOutboxOptions {
@@ -68,6 +69,29 @@ export class PhoneEventOutbox {
     for (const sequence of this.#events.keys()) {
       if (sequence <= message.acknowledgedSeq) this.#events.delete(sequence);
     }
+  }
+
+  /** Applies the server's cumulative receipt proof before replaying its missing suffix. */
+  synchronize(message: SequenceSyncMessage): PhoneToServerMessage[] {
+    if (message.schemaVersion !== CONTROL_SCHEMA_VERSION || message.type !== "sequenceSync") {
+      throw new Error("invalid sequence sync");
+    }
+    if (message.documentId !== this.#documentId) throw new Error("sequence sync document mismatch");
+    if (!Number.isSafeInteger(message.expectedSeq) || message.expectedSeq < 1) {
+      throw new Error("invalid sequence sync bounds");
+    }
+    const acknowledgedSeq = message.expectedSeq - 1;
+    if (acknowledgedSeq < this.#highestAcknowledged) {
+      throw new Error("sequence sync acknowledgement regression rejected");
+    }
+    if (acknowledgedSeq > this.#lastEnqueued) {
+      throw new Error("sequence sync exceeds the emitted event sequence");
+    }
+    this.#highestAcknowledged = acknowledgedSeq;
+    for (const sequence of this.#events.keys()) {
+      if (sequence <= acknowledgedSeq) this.#events.delete(sequence);
+    }
+    return this.replayFrom(message.expectedSeq);
   }
 
   replayFrom(expectedSeq: number): PhoneToServerMessage[] {

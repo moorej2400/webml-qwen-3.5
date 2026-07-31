@@ -65,6 +65,88 @@ test("terminal state completed while disconnected is reconciled without rerunnin
   assert.equal((delivered.at(-1) as { state: string }).state, "completed");
 });
 
+test("sequence sync prunes an accepted frame whose acknowledgement was lost", async () => {
+  const delivered: unknown[] = [];
+  const agent = new PhoneAgentRuntime({
+    identity: phoneIdentity,
+    platform: {
+      send(message) {
+        delivered.push(message);
+      },
+      reload() {},
+      setTimer() {
+        return 1;
+      },
+      clearTimer() {},
+    },
+    handlers: {},
+  });
+
+  agent.reportReady();
+  await agent.receive({
+    schemaVersion: 1,
+    type: "sequenceSync",
+    documentId: phoneIdentity.documentId,
+    expectedSeq: 2,
+  });
+  agent.reportTelemetry({ name: "after_sync" });
+
+  assert.deepEqual(
+    delivered.map((message) => (message as { eventSeq: number }).eventSeq),
+    [1, 2],
+  );
+});
+
+test("sequence sync rejects spoofed, future, and regressed proof", async () => {
+  const agent = new PhoneAgentRuntime({
+    identity: phoneIdentity,
+    platform: {
+      send() {},
+      reload() {},
+      setTimer() {
+        return 1;
+      },
+      clearTimer() {},
+    },
+    handlers: {},
+  });
+  agent.reportReady();
+
+  await assert.rejects(
+    agent.receive({
+      schemaVersion: 1,
+      type: "sequenceSync",
+      documentId: "document_spoofed_0123456789",
+      expectedSeq: 2,
+    }),
+    /document/i,
+  );
+  await assert.rejects(
+    agent.receive({
+      schemaVersion: 1,
+      type: "sequenceSync",
+      documentId: phoneIdentity.documentId,
+      expectedSeq: 3,
+    }),
+    /bounds|future|emitted/i,
+  );
+  await agent.receive({
+    schemaVersion: 1,
+    type: "sequenceSync",
+    documentId: phoneIdentity.documentId,
+    expectedSeq: 2,
+  });
+  await assert.rejects(
+    agent.receive({
+      schemaVersion: 1,
+      type: "sequenceSync",
+      documentId: phoneIdentity.documentId,
+      expectedSeq: 1,
+    }),
+    /regression/i,
+  );
+});
+
 test("lost state frame is replayed after reconnect and prompt runs exactly once", async () => {
   const plane = new ControlPlane();
   let agent: PhoneAgentRuntime | undefined;
@@ -134,6 +216,101 @@ test("lost state frame is replayed after reconnect and prompt runs exactly once"
   connecting = false;
   for (const message of queuedServerMessages.splice(0)) await agent.receive(message);
 
+  assert.equal(generations, 1);
+  assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "completed");
+});
+
+test("queued command dropped before phone receipt is dispatched on reconnect", async () => {
+  const plane = new ControlPlane();
+  const first = plane.connect(phoneIdentity, () => true);
+  plane.issueCommand({
+    deviceId: phoneIdentity.deviceId,
+    tabId: phoneIdentity.tabId,
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt",
+  });
+  plane.disconnect(first, { kind: "socket_loss" });
+
+  let connectionId = "";
+  let generations = 0;
+  const queued: ServerToPhoneMessage[] = [];
+  const agent = new PhoneAgentRuntime({
+    identity: phoneIdentity,
+    platform: {
+      send(message) {
+        plane.receive(connectionId, message);
+      },
+      reload() {},
+      setTimer() {
+        return 1;
+      },
+      clearTimer() {},
+    },
+    handlers: {
+      runPrompt() {
+        generations += 1;
+      },
+    },
+  });
+  connectionId = plane.connect(phoneIdentity, (message) => {
+    queued.push(message);
+    return true;
+  });
+  const resent = queued.filter((message) => message.type === "command");
+  for (const message of queued.splice(0)) await agent.receive(message);
+
+  assert.equal(resent.length, 1);
+  assert.equal(generations, 1);
+  assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "completed");
+});
+
+test("delivered command is safely resent and deduplicated when receipt evidence is lost", async () => {
+  const plane = new ControlPlane();
+  let forwardPhoneEvents = false;
+  let connectionId = "";
+  let generations = 0;
+  const agent = new PhoneAgentRuntime({
+    identity: phoneIdentity,
+    platform: {
+      send(message) {
+        if (forwardPhoneEvents) plane.receive(connectionId, message);
+      },
+      reload() {},
+      setTimer() {
+        return 1;
+      },
+      clearTimer() {},
+    },
+    handlers: {
+      runPrompt() {
+        generations += 1;
+      },
+    },
+  });
+  let firstRun: Promise<void> | undefined;
+  connectionId = plane.connect(phoneIdentity, (message) => {
+    if (message.type === "command") firstRun = agent.receive(message);
+    return true;
+  });
+  plane.issueCommand({
+    deviceId: phoneIdentity.deviceId,
+    tabId: phoneIdentity.tabId,
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt",
+  });
+  await firstRun;
+  plane.disconnect(connectionId, { kind: "socket_loss" });
+
+  const queued: ServerToPhoneMessage[] = [];
+  forwardPhoneEvents = true;
+  connectionId = plane.connect(phoneIdentity, (message) => {
+    queued.push(message);
+    return true;
+  });
+  const resent = queued.filter((message) => message.type === "command");
+  for (const message of queued.splice(0)) await agent.receive(message);
+
+  assert.equal(resent.length, 1);
   assert.equal(generations, 1);
   assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "completed");
 });
