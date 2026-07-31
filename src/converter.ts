@@ -13,8 +13,14 @@ import {
   type PackageKind,
 } from "./manifest.js";
 import { repackNativeQ3K } from "./q3k.js";
+import {
+  MTP_EXCLUSION_REASON,
+  isMtpTensorName,
+} from "./tensor-policy.js";
 
-export const MTP_EXCLUSION_REASON = "excluded-by-mtp-name-policy-v1";
+export { MTP_EXCLUSION_REASON } from "./tensor-policy.js";
+
+export const MAX_STREAM_READ_BYTES = 8 * 1024 * 1024;
 
 export interface ConverterOptions {
   readonly maxShardBytes: bigint;
@@ -128,12 +134,6 @@ function align(value: bigint, alignment: number): bigint {
   return ((value + boundary - 1n) / boundary) * boundary;
 }
 
-// Policy v1 matches only complete MTP/nextn name segments; substring matches
-// would incorrectly exclude ordinary names such as `attempt.weight`.
-function isMtpTensor(name: string): boolean {
-  return /(?:^|\.)(?:mtp|nextn)(?:\.|$)/i.test(name);
-}
-
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -184,7 +184,7 @@ export function planConversion(
     inventory.sourceBytes += sourceBytes;
     inventoryByType.set(tensor.type, inventory);
 
-    if (isMtpTensor(tensor.name)) {
+    if (isMtpTensorName(tensor.name)) {
       excludedTensors.push({
         name: tensor.name,
         reason: MTP_EXCLUSION_REASON,
@@ -299,6 +299,16 @@ export async function executeConversionPlan(
   const writtenThrough = new Array<bigint>(writers.length).fill(0n);
 
   for (const segment of plan.segments) {
+    // Division proves the multiplication is bounded without first overflowing
+    // a caller-controlled Number.
+    if (
+      maxBlocksPerRead >
+      Math.floor(MAX_STREAM_READ_BYTES / segment.sourceBlockBytes)
+    ) {
+      throw new Error(
+        `maxBlocksPerRead exceeds the streaming read ceiling for ${segment.tensorName}`,
+      );
+    }
     const writer = writers[segment.shard]!;
     if (segment.shardOffset > writtenThrough[segment.shard]!) {
       const paddingLength = segment.shardOffset - writtenThrough[segment.shard]!;

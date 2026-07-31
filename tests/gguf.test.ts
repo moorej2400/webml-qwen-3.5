@@ -339,3 +339,26 @@ test("rejects quantized tensors whose contiguous row is a partial block", async 
     /contiguous row dimension.*complete.*block/i,
   );
 });
+
+test("bounds cumulative string bytes across nested metadata arrays", async () => {
+  const fixture = new BinaryWriter()
+    .bytesFrom([0x47, 0x47, 0x55, 0x46])
+    .u32(3)
+    .u64(0)
+    .u64(1)
+    .string("fixture.strings")
+    .u32(GgufMetadataType.Array)
+    .u32(GgufMetadataType.Array)
+    .u64(1)
+    .u32(GgufMetadataType.String)
+    .u64(2)
+    .string("abcd")
+    .string("efgh")
+    .pad(32)
+    .build();
+
+  await assert.rejects(
+    parseGguf(memoryReader(fixture), { maxAggregateStringBytes: 22 }),
+    /aggregate string byte.*bound/i,
+  );
+});

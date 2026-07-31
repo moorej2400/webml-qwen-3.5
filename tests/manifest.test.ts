@@ -264,3 +264,104 @@ test("rejects quantized tensors whose contiguous row is a partial block", () => 
     /contiguous row dimension.*complete.*block/i,
   );
 });
+
+test("bounds decimal digits before parsing byte counts", () => {
+  const manifest = validManifest();
+  manifest.source.size = "1".repeat(21);
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /size.*decimal digit bound/i,
+  );
+});
+
+test("requires a non-empty tensor layout with rank from one through four", () => {
+  const empty = validManifest();
+  empty.tensorLayout = [];
+  assert.throws(
+    () => validateModelPackageManifest(empty),
+    /tensorLayout.*non-empty/i,
+  );
+
+  const excessiveRank = validManifest();
+  excessiveRank.tensorLayout[0]!.shape = ["256", "1", "1", "1", "1"];
+  assert.throws(
+    () => validateModelPackageManifest(excessiveRank),
+    /tensor rank.*1.*4/i,
+  );
+});
+
+test("bounds manifest array counts before walking their entries", () => {
+  const manifest = validManifest();
+  manifest.shards = Array.from({ length: 4_097 }, () => ({
+    ...manifest.shards[0]!,
+  }));
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /shard count.*bound/i,
+  );
+});
+
+test("bounds manifest string byte lengths", () => {
+  const manifest = validManifest();
+  manifest.runtime.abi = "a".repeat(65_536);
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /runtime ABI.*byte length/i,
+  );
+});
+
+test("rejects malformed HTTPS shard URLs with WHATWG parsing", () => {
+  const manifest = validManifest();
+  manifest.shards[0]!.url = "https://[invalid";
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /shard URL.*valid WHATWG URL/i,
+  );
+});
+
+test("rejects encoded traversal in relative and HTTPS shard paths", () => {
+  const relative = validManifest();
+  relative.shards[0]!.url = "shards/%2e%2e/secret.bin";
+  assert.throws(
+    () => validateModelPackageManifest(relative),
+    /shard URL.*encoded traversal/i,
+  );
+
+  const absolute = validManifest();
+  absolute.shards[0]!.url = "https://example.invalid/%2e%2e/secret.bin";
+  assert.throws(
+    () => validateModelPackageManifest(absolute),
+    /shard URL.*encoded traversal/i,
+  );
+});
+
+test("enforces the version-one MTP exclusion name and reason policy", () => {
+  const invalidName = validManifest();
+  invalidName.excludedTensors[0]!.name = "attempt.weight";
+  assert.throws(
+    () => validateModelPackageManifest(invalidName),
+    /excluded tensor.*MTP.*name policy/i,
+  );
+
+  const invalidReason = validManifest();
+  invalidReason.excludedTensors[0]!.reason = "manual exclusion";
+  assert.throws(
+    () => validateModelPackageManifest(invalidReason),
+    /excluded tensor.*reason.*version 1/i,
+  );
+});
+
+test("requires included and excluded tensor names to be disjoint", () => {
+  const manifest = validManifest();
+  manifest.tensorLayout[0]!.name = "model.mtp.output.weight";
+  manifest.excludedTensors[0]!.name = "model.mtp.output.weight";
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /included and excluded.*disjoint/i,
+  );
+});

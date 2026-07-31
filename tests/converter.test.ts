@@ -3,10 +3,12 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
+  MAX_STREAM_READ_BYTES,
   MTP_EXCLUSION_REASON,
   createManifestFromPlan,
   executeConversionPlan,
   planConversion,
+  type ConversionPlan,
   type RandomAccessWriter,
 } from "../src/converter.js";
 import { GgmlType, type ParsedGguf } from "../src/gguf.js";
@@ -303,4 +305,71 @@ test("rejects quantized tensors whose contiguous row is a partial block", () => 
       }),
     /contiguous row dimension.*complete.*block/i,
   );
+});
+
+test("rejects huge maxBlocksPerRead before calling the source reader", async () => {
+  const plan = planConversion(fixtureGguf([mixedTensors()[0]!]), {
+    maxShardBytes: 224n,
+    tensorAlignment: 16,
+  });
+  let reads = 0;
+
+  await assert.rejects(
+    executeConversionPlan(
+      plan,
+      {
+        size: 2_000n,
+        async read() {
+          reads += 1;
+          return new Uint8Array();
+        },
+      },
+      [{ async write() {} }],
+      { maxBlocksPerRead: Number.MAX_SAFE_INTEGER },
+    ),
+    /maxBlocksPerRead.*streaming read ceiling/i,
+  );
+  assert.equal(reads, 0);
+});
+
+test("accepts a chunk exactly at the streaming read ceiling", async () => {
+  const blockCount = BigInt(MAX_STREAM_READ_BYTES);
+  const plan: ConversionPlan = {
+    inventory: [],
+    excludedTensors: [],
+    shards: [{ index: 0, length: blockCount }],
+    segments: [
+      {
+        tensorName: "fixture.bytes",
+        dimensions: [blockCount],
+        ggmlType: GgmlType.I8,
+        transform: "copy",
+        shard: 0,
+        shardOffset: 0n,
+        tensorOffset: 0n,
+        sourceOffset: 0n,
+        sourceLength: blockCount,
+        outputLength: blockCount,
+        blockCount,
+        sourceBlockBytes: 1,
+        outputBlockBytes: 1,
+      },
+    ],
+  };
+  let requested = 0;
+
+  await executeConversionPlan(
+    plan,
+    {
+      size: blockCount,
+      async read(_offset, length) {
+        requested = length;
+        return new Uint8Array(length);
+      },
+    },
+    [{ async write() {} }],
+    { maxBlocksPerRead: MAX_STREAM_READ_BYTES },
+  );
+
+  assert.equal(requested, MAX_STREAM_READ_BYTES);
 });

@@ -106,3 +106,58 @@ test("dequantization applies the packed high-bit sign plane", () => {
     [-4, -3, -2, -1].flatMap((value) => Array(32).fill(value)),
   );
 });
+
+test("matches an independent decode for all distinct packed scale positions", () => {
+  // Encode the 6-bit scale fields directly so this fixture does not share the
+  // production unpacker's indexing logic.
+  const signedScales = [
+    -32, -28, -24, -20, -16, -12, -8, -4,
+    1, 5, 9, 13, 17, 21, 25, 31,
+  ];
+  const packedScales = new Uint8Array(12);
+  for (let index = 0; index < signedScales.length; index += 1) {
+    const encoded = signedScales[index]! + 32;
+    if (index < 8) {
+      packedScales[index] = encoded & 0x0f;
+    } else {
+      packedScales[index - 8] |= (encoded & 0x0f) << 4;
+    }
+    packedScales[8 + (index % 4)]! |=
+      (encoded >>> 4) << (2 * Math.floor(index / 4));
+  }
+
+  const native = new Uint8Array(NATIVE_Q3_K_BLOCK_BYTES);
+  const hmask = Uint8Array.from(
+    { length: 32 },
+    (_, index) => (index * 19 + 7) & 0xff,
+  );
+  const qs = Uint8Array.from(
+    { length: 64 },
+    (_, index) => (index * 37 + 11) & 0xff,
+  );
+  native.set(hmask, 0);
+  native.set(qs, 32);
+  native.set(packedScales, 96);
+  native[108] = 0;
+  native[109] = 0x3c;
+
+  const expected = new Float32Array(Q3_K_ELEMENTS_PER_BLOCK);
+  for (let index = 0; index < expected.length; index += 1) {
+    const group = Math.floor(index / 128);
+    const withinGroup = index % 128;
+    const subgroup = Math.floor(withinGroup / 16);
+    const plane = Math.floor(subgroup / 2);
+    const half = subgroup % 2;
+    const lane = index % 16;
+    const qIndex = group * 32 + half * 16 + lane;
+    const low = (qs[qIndex]! >>> (plane * 2)) & 0x03;
+    const highMask = 1 << (group * 4 + plane);
+    const high = (hmask[half * 16 + lane]! & highMask) === 0 ? 4 : 0;
+    expected[index] = signedScales[Math.floor(index / 16)]! * (low - high);
+  }
+
+  assert.deepEqual(
+    dequantizeQ3KBlock(unpackNativeQ3KBlock(native)),
+    expected,
+  );
+});

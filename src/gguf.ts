@@ -83,6 +83,8 @@ export interface GgufParseLimits {
   readonly maxTensorCount?: number;
   readonly maxMetadataCount?: number;
   readonly maxStringBytes?: number;
+  /** Shared by metadata keys/values and tensor names before payload reads. */
+  readonly maxAggregateStringBytes?: number;
   readonly maxArrayLength?: number;
   readonly maxMetadataArrayDepth?: number;
   readonly maxMetadataArrayElements?: number;
@@ -93,6 +95,7 @@ const DEFAULT_LIMITS = {
   maxTensorCount: 1_000_000,
   maxMetadataCount: 1_000_000,
   maxStringBytes: 16 * 1024 * 1024,
+  maxAggregateStringBytes: 64 * 1024 * 1024,
   maxArrayLength: 1_000_000,
   maxMetadataArrayDepth: 8,
   maxMetadataArrayElements: 1_000_000,
@@ -192,6 +195,7 @@ class Cursor {
   constructor(
     private readonly reader: RandomAccessReader,
     private readonly maxStringBytes: number,
+    private remainingStringBytes: number,
   ) {}
 
   async bytes(length: number): Promise<Uint8Array> {
@@ -259,6 +263,12 @@ class Cursor {
         `GGUF ${label} length ${length} exceeds ${maxBytes} bytes`,
       );
     }
+    if (length > BigInt(this.remainingStringBytes)) {
+      throw new Error(
+        "GGUF aggregate string byte count exceeds the configured bound",
+      );
+    }
+    this.remainingStringBytes -= Number(length);
     try {
       return new TextDecoder("utf-8", { fatal: true }).decode(
         await this.bytes(Number(length)),
@@ -402,10 +412,22 @@ export async function parseGguf(
   limits: GgufParseLimits = {},
 ): Promise<ParsedGguf> {
   const resolved = { ...DEFAULT_LIMITS, ...limits };
+  if (
+    !Number.isSafeInteger(resolved.maxAggregateStringBytes) ||
+    resolved.maxAggregateStringBytes < 0
+  ) {
+    throw new Error(
+      "maxAggregateStringBytes must be a non-negative safe integer",
+    );
+  }
   if (reader.size < 24n) {
     throw new Error("Truncated GGUF input");
   }
-  const cursor = new Cursor(reader, resolved.maxStringBytes);
+  const cursor = new Cursor(
+    reader,
+    resolved.maxStringBytes,
+    resolved.maxAggregateStringBytes,
+  );
   const magic = await cursor.bytes(4);
   if (
     magic[0] !== 0x47 ||

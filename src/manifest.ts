@@ -3,6 +3,10 @@ import {
   ggmlTensorByteLength,
   ggmlTypeLayout,
 } from "./gguf.js";
+import {
+  MTP_EXCLUSION_REASON,
+  isMtpTensorName,
+} from "./tensor-policy.js";
 
 export interface ImmutableArtifactIdentity {
   repository: string;
@@ -65,18 +69,45 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const COMMIT_REVISION = /^[a-f0-9]{40}$/;
 const UNSIGNED_DECIMAL = /^(?:0|[1-9][0-9]*)$/;
 const SAFE_NAME = /^[^\u0000-\u001f\u007f]+$/;
+const MAX_UINT64 = (1n << 64n) - 1n;
+const MAX_DECIMAL_DIGITS = 20;
+const MAX_MANIFEST_STRING_BYTES = 65_535;
+const MAX_SHARDS = 4_096;
+const MAX_TENSOR_SEGMENTS = 100_000;
+const MAX_EXCLUDED_TENSORS = 100_000;
+const textEncoder = new TextEncoder();
 
-function requireString(value: unknown, label: string): asserts value is string {
+function requireString(
+  value: unknown,
+  label: string,
+  maxBytes = MAX_MANIFEST_STRING_BYTES,
+): asserts value is string {
   if (typeof value !== "string" || value.length === 0 || !SAFE_NAME.test(value)) {
     throw new Error(`${label} must be a non-empty printable string`);
+  }
+  if (
+    value.length > maxBytes ||
+    textEncoder.encode(value).byteLength > maxBytes
+  ) {
+    throw new Error(`${label} exceeds its byte length bound`);
   }
 }
 
 function decimal(value: unknown, label: string, allowZero = true): bigint {
-  if (typeof value !== "string" || !UNSIGNED_DECIMAL.test(value)) {
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be a canonical unsigned decimal byte count`);
+  }
+  // Reject attacker-controlled digit runs before BigInt allocates their value.
+  if (value.length > MAX_DECIMAL_DIGITS) {
+    throw new Error(`${label} exceeds the decimal digit bound`);
+  }
+  if (!UNSIGNED_DECIMAL.test(value)) {
     throw new Error(`${label} must be a canonical unsigned decimal byte count`);
   }
   const parsed = BigInt(value);
+  if (parsed > MAX_UINT64) {
+    throw new Error(`${label} exceeds the unsigned 64-bit bound`);
+  }
   if (!allowZero && parsed === 0n) {
     throw new Error(`${label} must be greater than zero`);
   }
@@ -90,8 +121,8 @@ function validateArtifact(
   if (typeof artifact !== "object" || artifact === null) {
     throw new Error(`${label} identity is required`);
   }
-  requireString(artifact.repository, `${label} repository`);
-  requireString(artifact.file, `${label} file`);
+  requireString(artifact.repository, `${label} repository`, 1_024);
+  requireString(artifact.file, `${label} file`, 1_024);
   if (!COMMIT_REVISION.test(artifact.revision)) {
     throw new Error(`${label} must use an immutable 40-character commit revision`);
   }
@@ -102,16 +133,47 @@ function validateArtifact(
 }
 
 function validateShardUrl(value: string): void {
-  requireString(value, "shard URL");
-  if (
-    value.startsWith("/") ||
-    value.includes("\\") ||
-    value.split("/").includes("..")
-  ) {
-    throw new Error("shard URL must be a safe relative URL or HTTPS URL");
+  requireString(value, "shard URL", 2_048);
+  if (/%(?:2e|2f|5c)/i.test(value)) {
+    throw new Error("shard URL contains encoded traversal syntax");
   }
-  if (value.includes(":") && !value.startsWith("https://")) {
-    throw new Error("shard URL must use HTTPS");
+  if (/%(?![a-f0-9]{2})/i.test(value)) {
+    throw new Error("shard URL contains malformed percent encoding");
+  }
+  const rawPath = value.split(/[?#]/, 1)[0]!;
+  if (
+    rawPath.includes("\\") ||
+    rawPath.split("/").some((segment) => segment === "." || segment === "..")
+  ) {
+    throw new Error("shard URL contains path traversal syntax");
+  }
+
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(value);
+  let parsed: URL;
+  try {
+    // The synthetic base lets WHATWG normalization prove that a relative path
+    // stays inside its package directory.
+    parsed = hasScheme
+      ? new URL(value)
+      : new URL(value, "https://package.invalid/package/");
+  } catch {
+    throw new Error("shard URL must be a valid WHATWG URL");
+  }
+
+  if (hasScheme) {
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username !== "" ||
+      parsed.password !== ""
+    ) {
+      throw new Error("absolute shard URL must use credential-free HTTPS");
+    }
+  } else if (
+    value.startsWith("//") ||
+    parsed.origin !== "https://package.invalid" ||
+    !parsed.pathname.startsWith("/package/")
+  ) {
+    throw new Error("relative shard URL must remain inside the package directory");
   }
 }
 
@@ -143,10 +205,13 @@ export function validateModelPackageManifest(
   if (manifest.packageKind === "vision" && manifest.processor === undefined) {
     throw new Error("processor identity is required for a vision package");
   }
-  requireString(manifest.runtime?.abi, "runtime ABI");
+  requireString(manifest.runtime?.abi, "runtime ABI", 256);
 
   if (!Array.isArray(manifest.shards) || manifest.shards.length === 0) {
     throw new Error("Model package requires at least one shard");
+  }
+  if (manifest.shards.length > MAX_SHARDS) {
+    throw new Error("Model package shard count exceeds the configured bound");
   }
   let expectedShardOffset = 0n;
   for (const [index, shard] of manifest.shards.entries()) {
@@ -165,8 +230,14 @@ export function validateModelPackageManifest(
     expectedShardOffset += length;
   }
 
-  if (!Array.isArray(manifest.tensorLayout)) {
-    throw new Error("tensorLayout must be an array");
+  if (
+    !Array.isArray(manifest.tensorLayout) ||
+    manifest.tensorLayout.length === 0
+  ) {
+    throw new Error("tensorLayout must be a non-empty array");
+  }
+  if (manifest.tensorLayout.length > MAX_TENSOR_SEGMENTS) {
+    throw new Error("tensorLayout count exceeds the configured bound");
   }
   const segments = new Set<string>();
   const tensorGroups = new Map<
@@ -180,9 +251,13 @@ export function validateModelPackageManifest(
   const shardMappings: Array<Array<{ offset: bigint; end: bigint }>> =
     manifest.shards.map(() => []);
   for (const tensor of manifest.tensorLayout) {
-    requireString(tensor.name, "tensor name");
-    if (!Array.isArray(tensor.shape) || tensor.shape.length === 0) {
-      throw new Error(`tensor ${tensor.name} has an invalid shape`);
+    requireString(tensor.name, "tensor name", 64);
+    if (
+      !Array.isArray(tensor.shape) ||
+      tensor.shape.length < 1 ||
+      tensor.shape.length > 4
+    ) {
+      throw new Error(`tensor rank for ${tensor.name} must be from 1 through 4`);
     }
     const shape = tensor.shape.map((dimension) =>
       decimal(dimension, "tensor dimension", false),
@@ -336,10 +411,28 @@ export function validateModelPackageManifest(
   if (!Array.isArray(manifest.excludedTensors)) {
     throw new Error("excludedTensors must be an array");
   }
+  if (manifest.excludedTensors.length > MAX_EXCLUDED_TENSORS) {
+    throw new Error("excludedTensors count exceeds the configured bound");
+  }
   const excludedNames = new Set<string>();
   for (const excluded of manifest.excludedTensors) {
-    requireString(excluded.name, "excluded tensor name");
-    requireString(excluded.reason, "excluded tensor reason");
+    requireString(excluded.name, "excluded tensor name", 64);
+    requireString(excluded.reason, "excluded tensor reason", 128);
+    if (!isMtpTensorName(excluded.name)) {
+      throw new Error(
+        `excluded tensor ${excluded.name} does not match the MTP version-1 name policy`,
+      );
+    }
+    if (excluded.reason !== MTP_EXCLUSION_REASON) {
+      throw new Error(
+        `excluded tensor ${excluded.name} reason is invalid for manifest version 1`,
+      );
+    }
+    if (tensorGroups.has(excluded.name)) {
+      throw new Error(
+        "included and excluded tensor names must remain disjoint",
+      );
+    }
     if (excludedNames.has(excluded.name)) {
       throw new Error(`duplicate excluded tensor: ${excluded.name}`);
     }
