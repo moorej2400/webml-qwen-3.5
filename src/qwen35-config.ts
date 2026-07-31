@@ -6,6 +6,7 @@ export interface Qwen35Config {
   readonly architecture: "qwen35";
   readonly baseBlockCount: 32;
   readonly sourceBlockCount: 33;
+  readonly nextnPredictLayers: 1;
   readonly mtpBlock: 32;
   readonly mtpPolicy: Qwen35MtpPolicy;
   readonly embeddingLength: 2_560;
@@ -20,7 +21,7 @@ export interface Qwen35Config {
   readonly headDimension: 256;
   readonly keyLength: 256;
   readonly valueLength: 256;
-  readonly rmsNormEpsilon: 0.000_001;
+  readonly rmsNormEpsilon: number;
   readonly fullAttentionInterval: 4;
   readonly fullAttentionLayers: readonly [3, 7, 11, 15, 19, 23, 27, 31];
   readonly linearAttentionLayerCount: 24;
@@ -40,12 +41,14 @@ const FULL_ATTENTION_LAYERS =
 const MROPE_SECTIONS =
   Object.freeze([11, 11, 10, 0]) as Qwen35Config["mropeSections"];
 export const QWEN35_PRODUCT_CONTEXT_CAP = 16_384;
+export const QWEN35_RMS_NORM_EPSILON = Math.fround(1e-6);
 
 function createConfig(productContextLength: number): Qwen35Config {
   return Object.freeze({
     architecture: "qwen35",
     baseBlockCount: 32,
     sourceBlockCount: 33,
+    nextnPredictLayers: 1,
     mtpBlock: 32,
     mtpPolicy: "exclude-block-32",
     embeddingLength: 2_560,
@@ -58,7 +61,7 @@ function createConfig(productContextLength: number): Qwen35Config {
     headDimension: 256,
     keyLength: 256,
     valueLength: 256,
-    rmsNormEpsilon: 0.000_001,
+    rmsNormEpsilon: QWEN35_RMS_NORM_EPSILON,
     fullAttentionInterval: 4,
     fullAttentionLayers: FULL_ATTENTION_LAYERS,
     linearAttentionLayerCount: 24,
@@ -78,7 +81,7 @@ export const QWEN35_4B_CONFIG = createConfig(QWEN35_PRODUCT_CONTEXT_CAP);
 
 const REQUIRED_METADATA = Object.freeze({
   "general.architecture": "qwen35",
-  "qwen35.block_count": 32,
+  "qwen35.block_count": 33,
   "qwen35.context_length": 262_144,
   "qwen35.embedding_length": 2_560,
   "qwen35.feed_forward_length": 9_216,
@@ -86,7 +89,7 @@ const REQUIRED_METADATA = Object.freeze({
   "qwen35.attention.head_count_kv": 4,
   "qwen35.attention.key_length": 256,
   "qwen35.attention.value_length": 256,
-  "qwen35.attention.layer_norm_rms_epsilon": 0.000_001,
+  "qwen35.attention.layer_norm_rms_epsilon": QWEN35_RMS_NORM_EPSILON,
   "qwen35.full_attention_interval": 4,
   "qwen35.rope.dimension_count": 64,
   "qwen35.rope.dimension_sections": MROPE_SECTIONS,
@@ -96,6 +99,7 @@ const REQUIRED_METADATA = Object.freeze({
   "qwen35.ssm.group_count": 16,
   "qwen35.ssm.time_step_rank": 32,
   "qwen35.ssm.inner_size": 4_096,
+  "qwen35.nextn_predict_layers": 1,
 } satisfies Readonly<Record<string, GgufMetadataValue>>);
 
 function metadataEqual(actual: GgufMetadataValue | undefined, expected: GgufMetadataValue): boolean {

@@ -18,6 +18,8 @@ export interface QwenPrimitiveAbi {
   readonly workgroupSize: 1 | 256;
   readonly bindings: Readonly<Record<string, number>>;
   readonly uniformWords: number;
+  readonly outputCoverage?: "all-elements";
+  readonly coordinateCount?: 3;
 }
 
 export interface QwenPrimitiveKernel {
@@ -158,9 +160,9 @@ export interface PartialMropeOptions {
   readonly headCount: number;
   readonly headDimension: number;
   readonly rotaryDimension: number;
-  /** Pair counts assigned to each explicit text/image/video position. */
-  readonly sections: readonly [number, number, number, number];
-  readonly positions: readonly [number, number, number, number];
+  /** Frequency counts assigned to the temporal, height, and width positions. */
+  readonly sections: readonly [number, number, number];
+  readonly positions: readonly [number, number, number];
   readonly theta: number;
 }
 
@@ -197,22 +199,33 @@ function requireMropeShape(
   }
 }
 
-function positionForPair(
-  pair: number,
-  sections: readonly [number, number, number, number],
-  positions: readonly [number, number, number, number],
-): number {
-  let boundary = 0;
-  for (let section = 0; section < sections.length; section += 1) {
-    boundary += sections[section]!;
-    if (pair < boundary) return positions[section]!;
+export function mropeFrequencyOwners(
+  sections: readonly [number, number, number],
+): readonly number[] {
+  if (
+    sections.some(
+      (section) => !Number.isSafeInteger(section) || section < 0,
+    )
+  ) {
+    throw new Error("M-RoPE sections must be non-negative safe integers");
   }
-  throw new Error("M-RoPE pair is outside section coverage");
+  const frequencyCount = sections.reduce((sum, section) => sum + section, 0);
+  const owners = new Array<number>(frequencyCount).fill(0);
+  for (let coordinate = 1; coordinate < 3; coordinate += 1) {
+    for (
+      let frequency = coordinate;
+      frequency < sections[coordinate]! * 3 && frequency < frequencyCount;
+      frequency += 3
+    ) {
+      owners[frequency] = coordinate;
+    }
+  }
+  return Object.freeze(owners);
 }
 
 /**
- * Rotates adjacent pairs only inside rotaryDimension. The explicit four-way
- * position contract prevents text and multimodal positions from collapsing.
+ * Applies Qwen3.5's interleaved temporal-height-width frequency schedule and
+ * split-half rotate_half layout. Lanes outside rotaryDimension are copied.
  */
 export function partialMropeCpu(
   input: Float32Array,
@@ -220,19 +233,23 @@ export function partialMropeCpu(
 ): Float32Array {
   requireMropeShape(input, options);
   const output = new Float32Array(input);
-  const pairs = options.rotaryDimension / 2;
+  const frequencyCount = options.rotaryDimension / 2;
+  const owners = mropeFrequencyOwners(options.sections);
   for (let head = 0; head < options.headCount; head += 1) {
     const base = head * options.headDimension;
-    for (let pair = 0; pair < pairs; pair += 1) {
-      const position = positionForPair(pair, options.sections, options.positions);
+    for (let frequency = 0; frequency < frequencyCount; frequency += 1) {
+      const position = options.positions[owners[frequency]!]!;
       const angle =
-        position / options.theta ** ((2 * pair) / options.rotaryDimension);
+        position /
+        options.theta ** ((2 * frequency) / options.rotaryDimension);
       const cosine = Math.cos(angle);
       const sine = Math.sin(angle);
-      const first = input[base + pair * 2]!;
-      const second = input[base + pair * 2 + 1]!;
-      output[base + pair * 2] = Math.fround(first * cosine - second * sine);
-      output[base + pair * 2 + 1] = Math.fround(
+      const firstIndex = base + frequency;
+      const secondIndex = firstIndex + frequencyCount;
+      const first = input[firstIndex]!;
+      const second = input[secondIndex]!;
+      output[firstIndex] = Math.fround(first * cosine - second * sine);
+      output[secondIndex] = Math.fround(
         first * sine + second * cosine,
       );
     }
@@ -298,6 +315,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     sum += value * value;
   }
   let inverse_rms = inverseSqrt(sum / f32(params.width) + params.epsilon);
+  // GGUF conversion makes normal Qwen3.5 norm weights multiplicative.
   output_values[index] = input_values[index] * inverse_rms * weights[index % params.width];
 }`;
 
@@ -383,7 +401,7 @@ struct Params {
   element_count: u32,
   head_dimension: u32,
   rotary_dimension: u32,
-  pair_count: u32,
+  frequency_count: u32,
   theta: f32,
   pad0: u32,
   pad1: u32,
@@ -394,30 +412,41 @@ struct Params {
 @group(0) @binding(2) var<storage, read> sections: array<u32>;
 @group(0) @binding(3) var<storage, read> positions: array<u32>;
 @group(0) @binding(4) var<uniform> params: Params;
-fn pair_position(pair: u32) -> u32 {
-  var boundary = 0u;
-  for (var section = 0u; section < 4u; section += 1u) {
-    boundary += sections[section];
-    if (pair < boundary) { return positions[section]; }
+fn frequency_owner(frequency: u32) -> u32 {
+  let coordinate = frequency % 3u;
+  if (coordinate > 0u && frequency < sections[coordinate] * 3u) {
+    return coordinate;
   }
   return 0u;
 }
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  let pair_index = invocation.x;
-  let pairs_per_head = params.rotary_dimension / 2u;
-  let head = pair_index / pairs_per_head;
-  let pair = pair_index % pairs_per_head;
-  let first_index = head * params.head_dimension + pair * 2u;
-  if (pair_index >= params.pair_count || first_index + 1u >= params.element_count) {
+  let index = invocation.x;
+  if (index >= params.element_count) { return; }
+  let lane = index % params.head_dimension;
+  if (lane >= params.rotary_dimension) {
+    output_values[index] = input_values[index];
     return;
   }
-  let angle = f32(pair_position(pair)) /
-    pow(params.theta, f32(pair * 2u) / f32(params.rotary_dimension));
-  let rotation = vec2<f32>(cos(angle), sin(angle));
-  let value = vec2<f32>(input_values[first_index], input_values[first_index + 1u]);
-  output_values[first_index] = value.x * rotation.x - value.y * rotation.y;
-  output_values[first_index + 1u] = value.x * rotation.y + value.y * rotation.x;
+  let half = params.frequency_count;
+  let frequency = lane % half;
+  let head_base = index - lane;
+  let partner_index = select(
+    head_base + lane - half,
+    head_base + lane + half,
+    lane < half,
+  );
+  let angle = f32(positions[frequency_owner(frequency)]) /
+    pow(params.theta, f32(frequency * 2u) / f32(params.rotary_dimension));
+  let cosine = cos(angle);
+  let sine = sin(angle);
+  let value = input_values[index];
+  let partner = input_values[partner_index];
+  output_values[index] = select(
+    value * cosine + partner * sine,
+    value * cosine - partner * sine,
+    lane < half,
+  );
 }`;
 
 const TOP_K_WGSL = /* wgsl */ `
@@ -459,6 +488,7 @@ function primitive(
   workgroupSize: 1 | 256,
   bindings: Readonly<Record<string, number>>,
   uniformWords: number,
+  extras: Pick<QwenPrimitiveAbi, "outputCoverage" | "coordinateCount"> = {},
 ): QwenPrimitiveKernel {
   return Object.freeze({
     id: `${operation}-shared-portable-f32`,
@@ -475,6 +505,7 @@ function primitive(
       workgroupSize,
       bindings: Object.freeze({ ...bindings }),
       uniformWords,
+      ...extras,
     }),
   });
 }
@@ -487,7 +518,14 @@ export const QWEN_PRIMITIVE_KERNELS: readonly QwenPrimitiveKernel[] =
     primitive("swiglu", SWIGLU_WGSL, 256, { gate: 0, up: 1, output: 2, uniforms: 3 }, 4),
     primitive("attention-output-gate", ATTENTION_GATE_WGSL, 256, { attention: 0, gate: 1, output: 2, uniforms: 3 }, 4),
     primitive("qk-rms-norm", QK_NORM_WGSL, 256, { input: 0, weight: 1, output: 2, uniforms: 3 }, 4),
-    primitive("partial-mrope", MROPE_WGSL, 256, { input: 0, output: 1, sections: 2, positions: 3, uniforms: 4 }, 8),
+    primitive(
+      "partial-mrope",
+      MROPE_WGSL,
+      256,
+      { input: 0, output: 1, sections: 2, positions: 3, uniforms: 4 },
+      8,
+      { outputCoverage: "all-elements", coordinateCount: 3 },
+    ),
     primitive("top-k-merge", TOP_K_WGSL, 1, { scores: 0, outputScores: 1, outputIndices: 2, uniforms: 3 }, 4),
   ]);
 
@@ -529,12 +567,14 @@ export interface PrimitiveDispatchPlan {
   readonly workgroups: { readonly x: number; readonly y: 1; readonly z: 1 };
   readonly elementCount: number;
   readonly headDimension?: number;
+  readonly rotaryDimension?: number;
 }
 
 export function planPrimitiveDispatch(input: {
   readonly operation: QwenPrimitiveOperation;
   readonly elementCount: number;
   readonly headDimension?: number;
+  readonly rotaryDimension?: number;
 }): PrimitiveDispatchPlan {
   if (
     !Number.isSafeInteger(input.elementCount) ||
@@ -559,14 +599,27 @@ export function planPrimitiveDispatch(input: {
       throw new Error("Q/K RMSNorm element count must contain complete heads");
     }
   }
-  const dispatchedElements =
-    input.operation === "partial-mrope"
-      ? Math.ceil(input.elementCount / 2)
-      : input.elementCount;
+  if (input.operation === "partial-mrope") {
+    if (
+      input.headDimension === undefined ||
+      input.rotaryDimension === undefined ||
+      !Number.isSafeInteger(input.headDimension) ||
+      input.headDimension < 1 ||
+      input.elementCount % input.headDimension !== 0 ||
+      !Number.isSafeInteger(input.rotaryDimension) ||
+      input.rotaryDimension < 2 ||
+      input.rotaryDimension > input.headDimension ||
+      input.rotaryDimension % 2 !== 0
+    ) {
+      throw new Error(
+        "M-RoPE dispatch must contain complete heads and an even rotary dimension",
+      );
+    }
+  }
   const x =
     input.operation === "top-k-merge"
       ? 1
-      : Math.ceil(dispatchedElements / kernel.abi.workgroupSize);
+      : Math.ceil(input.elementCount / kernel.abi.workgroupSize);
   return Object.freeze({
     operation: input.operation,
     workgroups: Object.freeze({ x, y: 1, z: 1 }),
@@ -574,5 +627,8 @@ export function planPrimitiveDispatch(input: {
     ...(input.headDimension === undefined
       ? {}
       : { headDimension: input.headDimension }),
+    ...(input.rotaryDimension === undefined
+      ? {}
+      : { rotaryDimension: input.rotaryDimension }),
   });
 }

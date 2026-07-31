@@ -5,6 +5,7 @@ import {
   QWEN_PRIMITIVE_KERNELS,
   attentionOutputGateCpu,
   fusedSwiGluCpu,
+  mropeFrequencyOwners,
   partialMropeCpu,
   planPrimitiveDispatch,
   qkRmsNormPerHeadCpu,
@@ -15,6 +16,7 @@ import {
   qwenPrimitiveRegistryDefinitions,
 } from "../src/qwen-primitives.js";
 import { KernelRegistry } from "../src/kernel-registry.js";
+import { PINNED_QWEN35_GGUF_FIXTURE } from "./fixtures/qwen35-4b-q3-k-l-sanitized.js";
 
 function close(actual: ArrayLike<number>, expected: ArrayLike<number>, tolerance = 1e-5): void {
   assert.equal(actual.length, expected.length);
@@ -47,6 +49,26 @@ test("computes deterministic CPU references for zero and large finite values", (
   );
 });
 
+test("uses multiplicative GGUF norm weights after llama.cpp adds one", () => {
+  assert.deepEqual(
+    PINNED_QWEN35_GGUF_FIXTURE.normOracle.ggufSemantics,
+    "multiplicative",
+  );
+  close(
+    rmsNormCpu(
+      Float32Array.of(3, 4),
+      Float32Array.from(PINNED_QWEN35_GGUF_FIXTURE.normOracle.ggufWeight),
+      0,
+    ),
+    [3 / Math.sqrt(12.5), 3 / Math.sqrt(12.5)],
+  );
+  const source = QWEN_PRIMITIVE_KERNELS.find(
+    (kernel) => kernel.operation === "rms-norm",
+  )!.source;
+  assert.match(source, /inverse_rms \* weights/);
+  assert.doesNotMatch(source, /1\\.0f?\\s*\\+\\s*weights/);
+});
+
 test("normalizes Q and K independently per head with FP32 accumulation", () => {
   close(
     qkRmsNormPerHeadCpu(
@@ -72,29 +94,49 @@ test("normalizes Q and K independently per head with FP32 accumulation", () => {
   );
 });
 
-test("applies explicit M-RoPE position sections and preserves non-rotary values", () => {
-  const input = Float32Array.from({ length: 10 }, (_, index) => index + 1);
+test("uses the exact interleaved M-RoPE owners and split-half rotation", () => {
+  assert.deepEqual(
+    mropeFrequencyOwners([11, 11, 10]),
+    [
+      0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0,
+      1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1,
+    ],
+  );
+  const input = Float32Array.from({ length: 256 }, (_, index) => index + 1);
   const output = partialMropeCpu(input, {
     headCount: 1,
-    headDimension: 10,
-    rotaryDimension: 8,
-    sections: [1, 1, 2, 0],
-    positions: [0, 1, 2, 99],
-    theta: 10_000,
+    headDimension: 256,
+    rotaryDimension: 64,
+    sections: [11, 11, 10],
+    positions: [0, 1, 2],
+    theta: 1,
   });
 
-  close(output.slice(0, 2), input.slice(0, 2));
-  assert.notDeepEqual(output.slice(2, 4), input.slice(2, 4));
-  assert.notDeepEqual(output.slice(4, 8), input.slice(4, 8));
-  assert.deepEqual(output.slice(8), input.slice(8));
+  assert.equal(output[0], input[0]);
+  assert.equal(output[32], input[32]);
+  close(
+    [output[1]!, output[33]!],
+    [
+      input[1]! * Math.cos(1) - input[33]! * Math.sin(1),
+      input[33]! * Math.cos(1) + input[1]! * Math.sin(1),
+    ],
+  );
+  close(
+    [output[2]!, output[34]!],
+    [
+      input[2]! * Math.cos(2) - input[34]! * Math.sin(2),
+      input[34]! * Math.cos(2) + input[2]! * Math.sin(2),
+    ],
+  );
+  assert.deepEqual(output.slice(64), input.slice(64));
   assert.throws(
     () =>
       partialMropeCpu(input, {
         headCount: 1,
-        headDimension: 10,
-        rotaryDimension: 8,
-        sections: [1, 1, 1, 0],
-        positions: [0, 1, 2, 3],
+        headDimension: 256,
+        rotaryDimension: 64,
+        sections: [11, 10, 10],
+        positions: [0, 1, 2],
         theta: 10_000,
       }),
     /sections.*rotary/i,
@@ -147,10 +189,17 @@ test("defines typed WGSL ABIs, dispatches, and phase-profile registry entries", 
     QWEN_PRIMITIVE_KERNELS.find((kernel) => kernel.operation === "rms-norm")!.source,
     /sum.*f32/,
   );
+  const mropeKernel = QWEN_PRIMITIVE_KERNELS.find(
+    (kernel) => kernel.operation === "partial-mrope",
+  )!;
+  assert.match(mropeKernel.source, /sections|positions/);
+  assert.match(mropeKernel.source, /lane >= params\.rotary_dimension/);
   assert.match(
-    QWEN_PRIMITIVE_KERNELS.find((kernel) => kernel.operation === "partial-mrope")!.source,
-    /sections|positions/,
+    mropeKernel.source,
+    /output_values\[index\] = input_values\[index\]/,
   );
+  assert.equal(mropeKernel.abi.outputCoverage, "all-elements");
+  assert.equal(mropeKernel.abi.coordinateCount, 3);
   assert.match(
     QWEN_PRIMITIVE_KERNELS.find((kernel) => kernel.operation === "top-k-merge")!.source,
     /bitcast<u32>.*0x7f800000u/,
@@ -163,6 +212,15 @@ test("defines typed WGSL ABIs, dispatches, and phase-profile registry entries", 
   assert.throws(
     () => planPrimitiveDispatch({ operation: "qk-rms-norm", elementCount: 3, headDimension: 2 }),
     /head/i,
+  );
+  assert.deepEqual(
+    planPrimitiveDispatch({
+      operation: "partial-mrope",
+      elementCount: 256,
+      headDimension: 256,
+      rotaryDimension: 64,
+    }).workgroups,
+    { x: 1, y: 1, z: 1 },
   );
 
   const registry = new KernelRegistry();

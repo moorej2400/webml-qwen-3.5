@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { GgmlType, type GgufMetadataValue } from "../src/gguf.js";
+import { GgmlType } from "../src/gguf.js";
 import {
   QWEN35_4B_CONFIG,
   validateQwen35Config,
@@ -10,30 +10,7 @@ import {
   buildQwen35Program,
   type Qwen35TensorDirectoryEntry,
 } from "../src/qwen35-program.js";
-
-function metadata(): Record<string, GgufMetadataValue> {
-  return {
-    "general.architecture": "qwen35",
-    "qwen35.block_count": 32,
-    "qwen35.context_length": 262_144,
-    "qwen35.embedding_length": 2_560,
-    "qwen35.feed_forward_length": 9_216,
-    "qwen35.attention.head_count": 16,
-    "qwen35.attention.head_count_kv": 4,
-    "qwen35.attention.key_length": 256,
-    "qwen35.attention.value_length": 256,
-    "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
-    "qwen35.full_attention_interval": 4,
-    "qwen35.rope.dimension_count": 64,
-    "qwen35.rope.dimension_sections": [11, 11, 10, 0],
-    "qwen35.rope.freq_base": 10_000_000,
-    "qwen35.ssm.conv_kernel": 4,
-    "qwen35.ssm.state_size": 128,
-    "qwen35.ssm.group_count": 16,
-    "qwen35.ssm.time_step_rank": 32,
-    "qwen35.ssm.inner_size": 4_096,
-  };
-}
+import { PINNED_QWEN35_GGUF_FIXTURE } from "./fixtures/qwen35-4b-q3-k-l-sanitized.js";
 
 function tensor(
   name: string,
@@ -86,7 +63,7 @@ function directory(): Qwen35TensorDirectoryEntry[] {
           ["ssm_a", [32]],
           ["ssm_alpha.weight", [2_560, 32]],
           ["ssm_beta.weight", [2_560, 32]],
-          ["ssm_conv1d.weight", [4, 6_144]],
+          ["ssm_conv1d.weight", [4, 8_192]],
           ["ssm_dt.bias", [32]],
           ["ssm_norm.weight", [128]],
           ["ssm_out.weight", [4_096, 2_560]],
@@ -110,13 +87,16 @@ function directory(): Qwen35TensorDirectoryEntry[] {
 }
 
 test("validates and freezes the exact Qwen3.5 4B GGUF configuration", () => {
-  const config = validateQwen35Config(metadata(), {
+  const config = validateQwen35Config(PINNED_QWEN35_GGUF_FIXTURE.metadata, {
     productContextLength: 16_384,
     mtpPolicy: "exclude-block-32",
   });
 
   assert.deepEqual(config, QWEN35_4B_CONFIG);
   assert.equal(config.sourceMaxContextLength, 262_144);
+  assert.equal(config.sourceBlockCount, 33);
+  assert.equal(config.nextnPredictLayers, 1);
+  assert.equal(config.rmsNormEpsilon, Math.fround(1e-6));
   assert.equal(config.productContextLength, 16_384);
   assert.deepEqual(config.fullAttentionLayers, [3, 7, 11, 15, 19, 23, 27, 31]);
   assert.ok(Object.isFrozen(config));
@@ -126,21 +106,47 @@ test("validates and freezes the exact Qwen3.5 4B GGUF configuration", () => {
 test("rejects architecture, shape metadata, MTP policy, and product context drift", () => {
   for (const [key, value] of [
     ["general.architecture", "qwen3"],
-    ["qwen35.block_count", 33],
+    ["qwen35.block_count", 32],
+    ["qwen35.nextn_predict_layers", 0],
     ["qwen35.embedding_length", 4_096],
     ["qwen35.ssm.inner_size", 8_192],
   ] as const) {
-    const candidate = metadata();
+    const candidate = { ...PINNED_QWEN35_GGUF_FIXTURE.metadata };
     candidate[key] = value;
     assert.throws(() => validateQwen35Config(candidate), new RegExp(key.replaceAll(".", "\\.")));
   }
   assert.throws(
-    () => validateQwen35Config(metadata(), { mtpPolicy: "include-block-32" as never }),
+    () =>
+      validateQwen35Config(PINNED_QWEN35_GGUF_FIXTURE.metadata, {
+        mtpPolicy: "include-block-32" as never,
+      }),
     /MTP policy/i,
   );
   assert.throws(
-    () => validateQwen35Config(metadata(), { productContextLength: 16_385 }),
+    () =>
+      validateQwen35Config(PINNED_QWEN35_GGUF_FIXTURE.metadata, {
+        productContextLength: 16_385,
+      }),
     /product context.*16384/i,
+  );
+});
+
+test("uses provenance-pinned parsed GGUF metadata and tensor facts", () => {
+  assert.equal(PINNED_QWEN35_GGUF_FIXTURE.provenance.revision.length, 40);
+  assert.equal(PINNED_QWEN35_GGUF_FIXTURE.provenance.sha256.length, 64);
+  assert.deepEqual(
+    PINNED_QWEN35_GGUF_FIXTURE.tensors.find(
+      (tensor) => tensor.name === "blk.0.ssm_conv1d.weight",
+    )?.dimensions,
+    [4n, 8_192n],
+  );
+  assert.equal(
+    PINNED_QWEN35_GGUF_FIXTURE.metadata["qwen35.block_count"],
+    33,
+  );
+  assert.equal(
+    PINNED_QWEN35_GGUF_FIXTURE.metadata["qwen35.nextn_predict_layers"],
+    1,
   );
 });
 

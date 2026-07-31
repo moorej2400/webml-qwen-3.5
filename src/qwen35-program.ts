@@ -150,7 +150,7 @@ function layerContracts(layer: number, full: boolean): readonly TensorContract[]
     contract(`${prefix}.ssm_a`, 32),
     contract(`${prefix}.ssm_alpha.weight`, 2_560, 32),
     contract(`${prefix}.ssm_beta.weight`, 2_560, 32),
-    contract(`${prefix}.ssm_conv1d.weight`, 4, 6_144),
+    contract(`${prefix}.ssm_conv1d.weight`, 4, 8_192),
     contract(`${prefix}.ssm_dt.bias`, 32),
     contract(`${prefix}.ssm_norm.weight`, 128),
     contract(`${prefix}.ssm_out.weight`, 4_096, 2_560),

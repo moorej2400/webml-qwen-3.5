@@ -42,10 +42,12 @@ numeric tolerance.
 ## Qwen3.5 4B program
 
 The language program is static and model-specific. Its immutable configuration
-validates the parsed GGUF metadata for 32 base layers, hidden width 2,560, FFN
-width 9,216, vocabulary 248,320, 16 query heads, four KV heads, and 256-value
-query/key/value heads. It also validates the Gated DeltaNet dimensions, RMSNorm
-epsilon, partial rotary dimensions, and four M-RoPE position sections.
+validates the parsed GGUF metadata for 33 source blocks and one next-token
+prediction layer. The program keeps 32 base layers and excludes `blk.32.*`. It
+also validates hidden width 2,560, FFN width 9,216, vocabulary 248,320, 16 query
+heads, four KV heads, 256-value query/key/value heads, Gated DeltaNet
+dimensions, the exact parsed F32 RMSNorm epsilon, partial rotary dimensions,
+and GGUF M-RoPE sections `[11, 11, 10, 0]`.
 
 Layers 3, 7, 11, 15, 19, 23, 27, and 31 use full attention. The remaining 24
 layers use typed Gated DeltaNet placeholders. Each layer has a fixed invocation
@@ -55,7 +57,8 @@ residual add. Full attention and DeltaNet recurrence remain explicit
 non-runnable operators until their own runtime phases are implemented.
 
 The tensor-directory validator requires all 32 base layers with exact names and
-shapes. It rejects unknown base tensors and the `blk.32.*` MTP block. Tensor
+shapes, including linear-attention convolution weights shaped `[4, 8192]`. It
+rejects unknown base tensors and the `blk.32.*` MTP block. Tensor
 storage is selected independently from the six manifest layouts; quantization
 does not change a logical tensor shape.
 
@@ -68,9 +71,14 @@ only the selected row.
 
 Reusable correctness kernels cover FP32-accumulating RMSNorm, residual add,
 SiLU, fused SwiGLU, attention output gating, per-head Q/K RMSNorm, partial
-M-RoPE, and stable tiled top-k. Partial M-RoPE rotates only the first 64 values
-of each 256-value head and preserves the non-rotary suffix. Top-k rejects
-non-finite candidates and breaks equal-score ties by vocabulary index.
+M-RoPE, and stable tiled top-k. GGUF RMSNorm weights are already
+multiplicative: the conversion adds one to zero-centered source weights except
+for the linear-attention gated norm, whose stored weight is directly
+multiplicative. Partial M-RoPE rotates only the first 64 values of each
+256-value head. It uses interleaved temporal-height-width frequency ownership
+for `[11, 11, 10]` and split-half `rotate_half` lanes, then copies lanes 64
+through 255 to the output. Top-k rejects non-finite candidates and breaks
+equal-score ties by vocabulary index.
 
 The source GGUF advertises a native maximum context of 262,144 tokens. The
 current product contract selects 16,384 tokens and stores the native maximum
