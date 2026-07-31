@@ -134,6 +134,10 @@ model-size or browser-memory ceiling. Test materially different allocation,
 packing, streaming, kernel, and scheduling strategies before reporting a
 boundary.
 
+Conventional browser guidance, reported limits, adapter limits, and failed
+allocations are inputs to the next experiment. They are not stop conditions.
+Change the design and measure the result on the physical target.
+
 Document physical-device results with the exact strategy and environment.
 Describe repeated limits as tested boundaries, not universal browser rules.
 Do not reduce the selected model, quantization, multimodal support, or context

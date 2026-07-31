@@ -41,6 +41,9 @@ reviewed and sanitized.
 
 - Treat an early device failure as evidence about the tested implementation,
   not proof that the browser target is impossible.
+- Do not turn conventional browser guidance, reported limits, adapter limits,
+  or a failed allocation into a stop condition. Change the design and measure
+  the result on the physical target.
 - Do not impose an assumed model-size or browser-memory ceiling. Test materially
   different allocation, packing, streaming, kernel, and scheduling designs.
 - Report a limit only after repeated physical-device evidence across different
