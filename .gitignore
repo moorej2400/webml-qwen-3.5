@@ -11,6 +11,8 @@
 # Dependencies, builds, caches, and generated output
 node_modules/
 dist/
+dev-dist/
+public-dist/
 build/
 coverage/
 .local/

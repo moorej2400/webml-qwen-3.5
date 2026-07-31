@@ -9,12 +9,16 @@
   "scripts": {
     "test": "node --import tsx --test tests/*.test.ts",
     "test:converter": "node --import tsx --test tests/converter.test.ts tests/q3k.test.ts",
-    "typecheck": "tsc --noEmit",
-    "build": "tsc"
+    "typecheck": "tsc --noEmit && tsc --project tsconfig.dev.json --noEmit",
+    "build": "tsc",
+    "build:public": "node tools/build-public.mjs --out-dir public-dist",
+    "control:dev": "tsx dev/control/cli.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.20.0",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "ws": "^8.21.1"
   }
 }
