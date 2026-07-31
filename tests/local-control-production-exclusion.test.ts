@@ -26,10 +26,32 @@ test("public build contains no local control agent or private connection materia
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 
   const files = await collectFiles(output);
+  const relativeFiles = files
+    .map((file) => path.relative(output, file))
+    .sort();
+  assert.deepEqual(relativeFiles, [
+    "browser.d.ts",
+    "browser.js",
+    "byte-level.d.ts",
+    "byte-level.js",
+    "diagnostics.d.ts",
+    "diagnostics.js",
+    "incremental-sha256.d.ts",
+    "incremental-sha256.js",
+    "qwen-chat-template.d.ts",
+    "qwen-chat-template.js",
+    "qwen-tokenizer.d.ts",
+    "qwen-tokenizer.js",
+    "tokenizer-binary.d.ts",
+    "tokenizer-binary.js",
+  ]);
   const content = (
     await Promise.all(files.map(async (file) => `${file}\n${await readFile(file, "utf8")}`))
   ).join("\n");
   for (const forbidden of [
+    "node:",
+    "tokenizer-compiler",
+    "compileTokenizerSource",
     "dev/control",
     "qwen-control.v1",
     "LOCAL_CONTROL",

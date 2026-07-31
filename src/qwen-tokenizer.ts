@@ -1,9 +1,9 @@
 import { byteLevelStringToBytes } from "./byte-level.js";
 import { diagnosticError } from "./diagnostics.js";
 import {
+  deserializeAuthenticatedTokenizerArtifact,
   deserializeCompiledTokenizer,
   QWEN35_MODEL_LOGIT_ROWS,
-  readAuthenticatedTokenizerArtifact,
   type CompiledTokenizerTables,
 } from "./tokenizer-binary.js";
 
@@ -334,12 +334,11 @@ export class Qwen35Tokenizer {
     declaredByteLength: number,
     limits?: Partial<Qwen35TokenizerLimits>,
   ): Promise<Qwen35Tokenizer> {
-    const binary = await readAuthenticatedTokenizerArtifact(
+    const tables = await deserializeAuthenticatedTokenizerArtifact(
       chunks,
       PINNED_QWEN35_COMPILED_TOKENIZER,
       declaredByteLength,
     );
-    const tables = deserializeCompiledTokenizer(binary);
     requirePinnedTables(tables);
     return new Qwen35Tokenizer(tables, limits, false);
   }

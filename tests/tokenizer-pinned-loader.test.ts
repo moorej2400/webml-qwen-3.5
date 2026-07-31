@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import {
+  deserializeAuthenticatedTokenizerArtifact,
   readAuthenticatedTokenizerArtifact,
+  TOKENIZER_ARTIFACT_VERSION,
+  TOKENIZER_BINARY_HEADER_BYTES,
+  TOKENIZER_BINARY_MAGIC,
   type BrowserTokenizerArtifactIdentity,
 } from "../src/tokenizer-binary.js";
 import {
@@ -103,3 +107,62 @@ test("exposes unauthenticated construction only through explicit unsafe paths", 
   );
   assert.equal(typeof Qwen35Tokenizer.fromUnsafeTablesForTests, "function");
 });
+
+test("authenticates and deserializes deterministic exact-count package bytes", async () => {
+  const binary = exactCountBinaryFixture();
+  const identity = {
+    byteLength: binary.byteLength,
+    sha256: "04057210f184b1e82039a66942b544048f6cf7f6e71c0816d4b2fcca0f1d81b1",
+  };
+  assert.equal(
+    createHash("sha256").update(binary).digest("hex"),
+    identity.sha256,
+  );
+
+  const tables = await deserializeAuthenticatedTokenizerArtifact(
+    chunks(
+      binary.subarray(0, 31),
+      binary.subarray(31, 1_048_607),
+      binary.subarray(1_048_607),
+    ),
+    identity,
+    identity.byteLength,
+  );
+
+  assert.equal(tables.baseVocabSize, 248_044);
+  assert.equal(tables.tokenCount, 248_070);
+  assert.equal(tables.merges.length / 3, 247_587);
+  assert.equal(tables.addedTokenIds.length, 26);
+});
+
+function exactCountBinaryFixture(): Uint8Array {
+  const tokenCount = 248_070;
+  const baseVocabSize = 248_044;
+  const mergeCount = 247_587;
+  const addedCount = 26;
+  const totalBytes =
+    TOKENIZER_BINARY_HEADER_BYTES +
+    (tokenCount + 1) * 4 +
+    mergeCount * 12 +
+    addedCount * 8;
+  const binary = new Uint8Array(totalBytes);
+  binary.set(new TextEncoder().encode(TOKENIZER_BINARY_MAGIC));
+  const view = new DataView(binary.buffer);
+  view.setUint32(8, TOKENIZER_ARTIFACT_VERSION, true);
+  view.setUint32(12, tokenCount, true);
+  view.setUint32(16, baseVocabSize, true);
+  view.setUint32(20, mergeCount, true);
+  view.setUint32(24, addedCount, true);
+  view.setUint32(28, 0, true);
+
+  let cursor =
+    TOKENIZER_BINARY_HEADER_BYTES +
+    (tokenCount + 1) * 4 +
+    mergeCount * 12;
+  for (let index = 0; index < addedCount; index += 1) {
+    view.setUint32(cursor, baseVocabSize + index, true);
+    view.setUint32(cursor + 4, index % 2, true);
+    cursor += 8;
+  }
+  return binary;
+}

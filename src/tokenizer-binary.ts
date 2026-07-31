@@ -81,10 +81,28 @@ export async function readAuthenticatedTokenizerArtifact(
 }
 
 /**
+ * Uses the same authenticate-then-parse boundary as the pinned production
+ * loader while allowing deterministic exact-count fixtures to exercise it.
+ */
+export async function deserializeAuthenticatedTokenizerArtifact(
+  chunks: AsyncIterable<Uint8Array>,
+  identity: BrowserTokenizerArtifactIdentity,
+  declaredByteLength: number,
+): Promise<CompiledTokenizerTables> {
+  return deserializeCompiledTokenizer(
+    await readAuthenticatedTokenizerArtifact(
+      chunks,
+      identity,
+      declaredByteLength,
+    ),
+  );
+}
+
+/**
  * Validates every byte range before exposing tokenizer tables to WebGPU code.
  *
  * This module is browser-safe by design. Node hashing and file conversion stay
- * in `tokenizer-compiler.ts`, outside the production module graph.
+ * in the offline conversion graph, outside the production module graph.
  */
 export function deserializeCompiledTokenizer(
   binary: Uint8Array,
