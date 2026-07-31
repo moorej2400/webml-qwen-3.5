@@ -1,0 +1,99 @@
+{
+  "source": "Qwen/Qwen3.5-4B",
+  "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "tokenizerSha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+  "text": [
+    {
+      "name": "ascii",
+      "input": "Hello, tokenizer!",
+      "ids": [9419, 11, 44424, 0]
+    },
+    {
+      "name": "unicode",
+      "input": "naïve café — 東京",
+      "ids": [3267, 36328, 571, 50203, 1892, 220, 115197]
+    },
+    {
+      "name": "emoji",
+      "input": "Ship it 🚀🙂",
+      "ids": [28657, 424, 10838, 248, 222, 169171]
+    },
+    {
+      "name": "combining",
+      "input": "Café vs café",
+      "ids": [34, 2492, 933, 5972, 50203]
+    },
+    {
+      "name": "whitespace",
+      "input": "  alpha\tbeta\n\nomega  ",
+      "ids": [220, 8029, 2161, 1850, 271, 31611, 256]
+    },
+    {
+      "name": "punctuation",
+      "input": "Wait... what?! (yes/no)",
+      "ids": [13784, 1076, 1092, 25153, 318, 9405, 32002, 8]
+    },
+    {
+      "name": "code",
+      "input": "const x = (n: number) => n + 1;\n",
+      "ids": [989, 830, 283, 318, 77, 25, 1324, 8, 574, 307, 478, 220, 16, 26, 198]
+    },
+    {
+      "name": "replacement-byte-path",
+      "input": "A\u0000B�C",
+      "ids": [32, 188, 33, 5513, 34]
+    }
+  ],
+  "chat": [
+    {
+      "name": "user-generation",
+      "messages": [
+        {"role": "user", "content": "Hello"}
+      ],
+      "addGenerationPrompt": true,
+      "enableThinking": true,
+      "rendered": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "ids": [248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198, 248068, 198]
+    },
+    {
+      "name": "system-user-generation-no-thinking",
+      "messages": [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Give one fact."}
+      ],
+      "addGenerationPrompt": true,
+      "enableThinking": false,
+      "rendered": "<|im_start|>system\nBe concise.<|im_end|>\n<|im_start|>user\nGive one fact.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "ids": [248045, 8678, 198, 3320, 61446, 13, 248046, 198, 248045, 846, 198, 33963, 799, 2029, 13, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+    },
+    {
+      "name": "multi-message",
+      "messages": [
+        {"role": "system", "content": "Use plain text."},
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "One"},
+        {"role": "user", "content": "Second"}
+      ],
+      "addGenerationPrompt": true,
+      "enableThinking": true,
+      "rendered": "<|im_start|>system\nUse plain text.<|im_end|>\n<|im_start|>user\nFirst<|im_end|>\n<|im_start|>assistant\nOne<|im_end|>\n<|im_start|>user\nSecond<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "ids": [248045, 8678, 198, 9947, 13983, 1414, 13, 248046, 198, 248045, 846, 198, 5170, 248046, 198, 248045, 74455, 198, 3833, 248046, 198, 248045, 846, 198, 15207, 248046, 198, 248045, 74455, 198, 248068, 198]
+    },
+    {
+      "name": "typed-image-marker",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {"type": "text", "text": "Describe: "},
+            {"type": "image"}
+          ]
+        }
+      ],
+      "addGenerationPrompt": true,
+      "enableThinking": false,
+      "rendered": "<|im_start|>user\nDescribe: <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "ids": [248045, 846, 198, 72240, 25, 220, 248053, 248056, 248054, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]
+    }
+  ]
+}
