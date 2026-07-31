@@ -31,6 +31,7 @@ import {
   packFloat16PairCpu,
   qwen35OnlineAttentionHeadCpu,
   splitQwen35QueryGateProjection,
+  unpackFloat16PairCpu,
 } from "../dist/src/full-attention.js";
 import {
   deltaNetRecurrentHeadStepCpu,
@@ -726,6 +727,7 @@ async function runFullAttentionPrepare(device, kernel) {
     { length: 4 * 256 },
     (_, index) => ((index * 5) % 23 - 11) / 7,
   );
+  value[0] = 58_832;
   const queryNormWeight = Float32Array.from(
     { length: 256 },
     (_, lane) => 0.75 + (lane % 7) / 10,
@@ -955,14 +957,16 @@ async function runFullAttentionOnline(device, kernel) {
     for (let kvHead = 0; kvHead < 4; kvHead += 1) {
       const base = (token * 4 + kvHead) * 256;
       for (let lane = 0; lane < 256; lane += 1) {
-        keys[base + lane] = ((token * 7 + kvHead * 5 + lane) % 9 - 4) / 4;
+        keys[base + lane] = ((token * 7 + kvHead * 5 + lane) % 9 - 4) / 7;
         values[base + lane] =
-          ((token * 11 + kvHead * 13 + lane * 3) % 15 - 7) / 2;
+          ((token * 11 + kvHead * 13 + lane * 3) % 15 - 7) / 11;
       }
     }
   }
   const packedKeys = new Uint32Array(keys.length / 2);
   const packedValues = new Uint32Array(values.length / 2);
+  const quantizedKeys = new Float32Array(keys.length);
+  const quantizedValues = new Float32Array(values.length);
   for (let scalar = 0; scalar < keys.length; scalar += 2) {
     packedKeys[scalar / 2] = packFloat16PairCpu(
       keys[scalar],
@@ -971,6 +975,14 @@ async function runFullAttentionOnline(device, kernel) {
     packedValues[scalar / 2] = packFloat16PairCpu(
       values[scalar],
       values[scalar + 1],
+    );
+    quantizedKeys.set(
+      unpackFloat16PairCpu(packedKeys[scalar / 2]),
+      scalar,
+    );
+    quantizedValues.set(
+      unpackFloat16PairCpu(packedValues[scalar / 2]),
+      scalar,
     );
   }
   const expectedValues = new Float32Array(16 * 256);
@@ -981,8 +993,14 @@ async function runFullAttentionOnline(device, kernel) {
     const headValues = new Float32Array(headKeys.length);
     for (let token = 0; token < tokenCount; token += 1) {
       const source = (token * 4 + kvHead) * 256;
-      headKeys.set(keys.subarray(source, source + 256), token * 256);
-      headValues.set(values.subarray(source, source + 256), token * 256);
+      headKeys.set(
+        quantizedKeys.subarray(source, source + 256),
+        token * 256,
+      );
+      headValues.set(
+        quantizedValues.subarray(source, source + 256),
+        token * 256,
+      );
     }
     const attention = qwen35OnlineAttentionHeadCpu(
       prepared.subarray(queryBase, queryBase + 256),

@@ -448,6 +448,11 @@ export function gatedDeltaNetPrefillCpu(
   if (tokens.length > state.capacity - state.position) {
     throw new Error("DeltaNet prefill exceeds state capacity");
   }
+  // Decode mutates convolution and recurrent state. Validate the full batch
+  // first so a malformed later token cannot leave a partial prefix committed.
+  for (const token of tokens) {
+    validateToken(token);
+  }
   return Object.freeze(
     tokens.map((token) => gatedDeltaNetDecodeCpu(state, token)),
   );

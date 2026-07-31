@@ -77,8 +77,8 @@ export function qwen35GqaKvHead(queryHead: number): number {
 
 export class FullAttentionCpuCache {
   readonly #capacity: number;
-  readonly #keys: Float32Array;
-  readonly #values: Float32Array;
+  readonly #keys: Uint16Array;
+  readonly #values: Uint16Array;
   #position = 0;
 
   constructor(capacity: number) {
@@ -86,8 +86,8 @@ export class FullAttentionCpuCache {
       throw new Error("Full-attention cache capacity is invalid");
     }
     this.#capacity = capacity;
-    this.#keys = new Float32Array(capacity * KV_HEAD_COUNT * HEAD_DIMENSION);
-    this.#values = new Float32Array(this.#keys.length);
+    this.#keys = new Uint16Array(capacity * KV_HEAD_COUNT * HEAD_DIMENSION);
+    this.#values = new Uint16Array(this.#keys.length);
   }
 
   get capacity(): number {
@@ -105,23 +105,29 @@ export class FullAttentionCpuCache {
     requireLength(key, KV_HEAD_COUNT * HEAD_DIMENSION, "Attention key");
     requireLength(value, KV_HEAD_COUNT * HEAD_DIMENSION, "Attention value");
     const offset = this.#position * KV_HEAD_COUNT * HEAD_DIMENSION;
-    this.#keys.set(key, offset);
-    this.#values.set(value, offset);
+    for (let lane = 0; lane < key.length; lane += 1) {
+      this.#keys[offset + lane] = float16Bits(key[lane]!);
+      this.#values[offset + lane] = float16Bits(value[lane]!);
+    }
     this.#position += 1;
   }
 
   key(token: number, head: number, lane: number): number {
     this.#requireAddress(token, head, lane);
-    return this.#keys[
-      (token * KV_HEAD_COUNT + head) * HEAD_DIMENSION + lane
-    ]!;
+    return float16Value(
+      this.#keys[
+        (token * KV_HEAD_COUNT + head) * HEAD_DIMENSION + lane
+      ]!,
+    );
   }
 
   value(token: number, head: number, lane: number): number {
     this.#requireAddress(token, head, lane);
-    return this.#values[
-      (token * KV_HEAD_COUNT + head) * HEAD_DIMENSION + lane
-    ]!;
+    return float16Value(
+      this.#values[
+        (token * KV_HEAD_COUNT + head) * HEAD_DIMENSION + lane
+      ]!,
+    );
   }
 
   reset(): void {
@@ -164,6 +170,26 @@ function normalizedAndRotated(
     positions,
     theta: 10_000_000,
   });
+}
+
+function validateFullAttentionToken(token: FullAttentionToken): void {
+  requireLength(
+    token.queryGate,
+    QUERY_HEAD_COUNT * QUERY_GATE_RECORD_WIDTH,
+    "Q/gate projection",
+  );
+  requireLength(token.key, KV_HEAD_COUNT * HEAD_DIMENSION, "Attention key");
+  requireLength(token.value, KV_HEAD_COUNT * HEAD_DIMENSION, "Attention value");
+  requireLength(token.queryNormWeight, HEAD_DIMENSION, "Q norm weight");
+  requireLength(token.keyNormWeight, HEAD_DIMENSION, "K norm weight");
+  if (
+    token.positions.some(
+      (position) =>
+        !Number.isSafeInteger(position) || position < 0,
+    )
+  ) {
+    throw new Error("Attention M-RoPE positions are invalid");
+  }
 }
 
 function onlineAttentionHead(
@@ -246,15 +272,7 @@ export function fullAttentionDecodeCpu(
   if (cache.position >= cache.capacity) {
     throw new Error("Full-attention cache capacity exceeded");
   }
-  requireLength(
-    token.queryGate,
-    QUERY_HEAD_COUNT * QUERY_GATE_RECORD_WIDTH,
-    "Q/gate projection",
-  );
-  requireLength(token.key, KV_HEAD_COUNT * HEAD_DIMENSION, "Attention key");
-  requireLength(token.value, KV_HEAD_COUNT * HEAD_DIMENSION, "Attention value");
-  requireLength(token.queryNormWeight, HEAD_DIMENSION, "Q norm weight");
-  requireLength(token.keyNormWeight, HEAD_DIMENSION, "K norm weight");
+  validateFullAttentionToken(token);
 
   const split = splitQwen35QueryGateProjection(token.queryGate);
   const query = normalizedAndRotated(
@@ -269,6 +287,11 @@ export function fullAttentionDecodeCpu(
     KV_HEAD_COUNT,
     token.positions,
   );
+  // The prepare shader publishes K/V as binary16 before online attention reads
+  // the current row. Quantize this row now so the CPU oracle models both the
+  // current token and all historical rows with the production representation.
+  const quantizedKey = quantizeFloat16ArrayCpu(key);
+  const quantizedValue = quantizeFloat16ArrayCpu(token.value);
   const attention = new Float32Array(QUERY_HEAD_COUNT * HEAD_DIMENSION);
   const lastToken = cache.position;
 
@@ -280,17 +303,17 @@ export function fullAttentionDecodeCpu(
       lastToken + 1,
       (contextToken, lane) =>
         contextToken === lastToken
-          ? key[kvHead * HEAD_DIMENSION + lane]!
+          ? quantizedKey[kvHead * HEAD_DIMENSION + lane]!
           : cache.key(contextToken, kvHead, lane),
       (contextToken, lane) =>
         contextToken === lastToken
-          ? token.value[kvHead * HEAD_DIMENSION + lane]!
+          ? quantizedValue[kvHead * HEAD_DIMENSION + lane]!
           : cache.value(contextToken, kvHead, lane),
     );
     attention.set(headOutput, queryOffset);
   }
 
-  cache.append(key, token.value);
+  cache.append(quantizedKey, quantizedValue);
   return attentionOutputGateCpu(attention, split.gate);
 }
 
@@ -300,6 +323,11 @@ export function fullAttentionPrefillCpu(
 ): readonly Float32Array[] {
   if (tokens.length > cache.capacity - cache.position) {
     throw new Error("Full-attention prefill exceeds cache capacity");
+  }
+  // Validate the complete batch before the first decode. This keeps a bad
+  // later token from leaving a valid-looking but partially advanced cache.
+  for (const token of tokens) {
+    validateFullAttentionToken(token);
   }
   return Object.freeze(
     tokens.map((token) => fullAttentionDecodeCpu(cache, token)),
@@ -312,31 +340,83 @@ const UINT32_VIEW = new Uint32Array(FLOAT32_VIEW.buffer);
 function float16Bits(value: number): number {
   FLOAT32_VIEW[0] = value;
   const word = UINT32_VIEW[0]!;
-  let bits = (word >> 16) & 0x8000;
-  let mantissa = (word >> 12) & 0x07ff;
+  const sign = (word >>> 16) & 0x8000;
+  const mantissa = word & 0x007f_ffff;
   const exponent = (word >> 23) & 0xff;
-  if (exponent < 103) {
-    return bits;
+
+  if (exponent === 0xff) {
+    // JavaScript preserves a NaN sign but not its payload. Use the canonical
+    // quiet payload required by DataView.setFloat16 and keep infinities exact.
+    return sign | (mantissa === 0 ? 0x7c00 : 0x7e00);
   }
   if (exponent > 142) {
-    bits |= 0x7c00;
-    bits |= exponent === 255 && (word & 0x007f_ffff) !== 0 ? 1 : 0;
-    return bits;
+    return sign | 0x7c00;
   }
-  if (exponent < 113) {
-    mantissa |= 0x0800;
-    bits |=
-      (mantissa >> (114 - exponent)) +
-      ((mantissa >> (113 - exponent)) & 1);
-    return bits;
+  if (exponent >= 113) {
+    // Add one less than half an f16 ULP, then add the retained low bit. This
+    // makes exact halfway cases round to the even retained significand.
+    const rounded =
+      mantissa + 0x0fff + ((mantissa >>> 13) & 1);
+    return (
+      sign |
+      (((exponent - 112) << 10) + (rounded >>> 13))
+    );
   }
-  bits |= ((exponent - 112) << 10) | (mantissa >> 1);
-  bits += mantissa & 1;
-  return bits;
+  if (exponent < 102) {
+    return sign;
+  }
+
+  const significand = mantissa | 0x0080_0000;
+  const shift = 126 - exponent;
+  const divisor = 2 ** shift;
+  const quotient = Math.floor(significand / divisor);
+  const remainder = significand - quotient * divisor;
+  const halfway = divisor / 2;
+  const rounded =
+    remainder > halfway ||
+    (remainder === halfway && (quotient & 1) !== 0)
+      ? quotient + 1
+      : quotient;
+  return sign | rounded;
+}
+
+function float16Value(bits: number): number {
+  const sign = (bits & 0x8000) === 0 ? 1 : -1;
+  const exponent = (bits >>> 10) & 0x1f;
+  const mantissa = bits & 0x03ff;
+  if (exponent === 0x1f) {
+    return mantissa === 0
+      ? sign * Number.POSITIVE_INFINITY
+      : Number.NaN;
+  }
+  if (exponent === 0) {
+    return Math.fround(sign * mantissa * 2 ** -24);
+  }
+  return Math.fround(
+    sign * (1 + mantissa / 1_024) * 2 ** (exponent - 15),
+  );
+}
+
+function quantizeFloat16ArrayCpu(values: Float32Array): Float32Array {
+  return Float32Array.from(values, (value) =>
+    float16Value(float16Bits(value)),
+  );
 }
 
 export function packFloat16PairCpu(first: number, second: number): number {
   return (float16Bits(first) | (float16Bits(second) << 16)) >>> 0;
+}
+
+export function unpackFloat16PairCpu(
+  packed: number,
+): readonly [number, number] {
+  if (!Number.isSafeInteger(packed) || packed < 0 || packed > 0xffff_ffff) {
+    throw new Error("Packed FP16 pair must be a u32");
+  }
+  return Object.freeze([
+    float16Value(packed & 0xffff),
+    float16Value(packed >>> 16),
+  ]);
 }
 
 /**

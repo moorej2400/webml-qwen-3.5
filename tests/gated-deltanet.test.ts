@@ -183,6 +183,35 @@ test("serial DeltaNet prefill equals repeated decode from zero and nonzero state
   }
 });
 
+test("DeltaNet prefill validates every token before changing state", async () => {
+  const module = await loadDeltaNetModule();
+  const State = module.GatedDeltaNetCpuState as new (
+    capacity: number,
+  ) => {
+    readonly position: number;
+  };
+  const decode = module.gatedDeltaNetDecodeCpu as (
+    state: object,
+    token: DeltaNetToken,
+  ) => Float32Array;
+  const prefill = module.gatedDeltaNetPrefillCpu as (
+    state: object,
+    tokens: readonly DeltaNetToken[],
+  ) => readonly Float32Array[];
+  const valid = makeDeltaNetToken(0);
+  const invalid = makeDeltaNetToken(1);
+  invalid.ssmA[7] = 0;
+  const actualState = new State(2);
+  const expectedState = new State(1);
+
+  assert.throws(() => prefill(actualState, [valid, invalid]), /ssm_a/i);
+  assert.equal(actualState.position, 0);
+  assert.deepEqual(
+    decode(actualState, valid),
+    decode(expectedState, valid),
+  );
+});
+
 test("keeps the correctness-first prefill plan serial at critical boundaries", async () => {
   const module = await loadDeltaNetModule();
   assert.equal(typeof module.planSerialDeltaNetPrefill, "function");

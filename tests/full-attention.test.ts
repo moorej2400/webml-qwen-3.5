@@ -188,6 +188,66 @@ test("serial prefill equals repeated one-token decode", async () => {
   }
 });
 
+test("prefill validates every token before changing the cache", async () => {
+  const module = await loadAttentionModule();
+  const Cache = module.FullAttentionCpuCache as new (
+    capacity: number,
+  ) => {
+    readonly position: number;
+  };
+  const decode = module.fullAttentionDecodeCpu as (
+    state: object,
+    token: AttentionToken,
+  ) => Float32Array;
+  const prefill = module.fullAttentionPrefillCpu as (
+    state: object,
+    tokens: readonly AttentionToken[],
+  ) => readonly Float32Array[];
+  const valid = makeAttentionToken(1 / 3);
+  const invalid = {
+    ...makeAttentionToken(2 / 3),
+    key: new Float32Array(1),
+  };
+  const actualState = new Cache(2);
+  const expectedState = new Cache(1);
+
+  assert.throws(() => prefill(actualState, [valid, invalid]), /key/i);
+  assert.equal(actualState.position, 0);
+  assert.deepEqual(
+    decode(actualState, valid),
+    decode(expectedState, valid),
+  );
+});
+
+test("quantizes current and historical K/V to production FP16", async () => {
+  const module = await loadAttentionModule();
+  const Cache = module.FullAttentionCpuCache as new (
+    capacity: number,
+  ) => {
+    readonly position: number;
+    value(token: number, head: number, lane: number): number;
+  };
+  const decode = module.fullAttentionDecodeCpu as (
+    state: InstanceType<typeof Cache>,
+    token: AttentionToken,
+  ) => Float32Array;
+  const state = new Cache(2);
+  const first = makeAttentionToken(1 / 3);
+  const second = makeAttentionToken(2 / 3);
+
+  decode(state, first);
+  assert.equal(state.value(0, 0, 0), nativeFloat16(1 / 3));
+  const output = decode(state, second);
+  const expected = Math.fround(
+    Math.fround(
+      nativeFloat16(1 / 3) + nativeFloat16(2 / 3),
+    ) / 2,
+  );
+
+  assert.equal(output[0], expected);
+  assert.notEqual(output[0], Math.fround((1 / 3 + 2 / 3) / 2));
+});
+
 test("packs FP16 pairs and writes only the selected current-token K/V row", async () => {
   const module = await loadAttentionModule();
   assert.equal(typeof module.packFloat16PairCpu, "function");
@@ -197,6 +257,32 @@ test("packs FP16 pairs and writes only the selected current-token K/V row", asyn
     second: number,
   ) => number;
   assert.equal(pack(1, -2), 0xc0003c00);
+  assert.equal(pack(58_832, 0) & 0xffff, 0x7b2e);
+  assert.equal(pack(2 ** -25, 0) & 0xffff, 0);
+  assert.equal(pack(2 ** -25 + 2 ** -48, 0) & 0xffff, 1);
+  assert.equal(pack(3 * 2 ** -25, 0) & 0xffff, 2);
+  assert.equal(pack(65_504, 0) & 0xffff, 0x7bff);
+  assert.equal(pack(65_520, 0) & 0xffff, 0x7c00);
+  assert.equal(pack(Number.POSITIVE_INFINITY, 0) & 0xffff, 0x7c00);
+  assert.equal(pack(Number.NEGATIVE_INFINITY, 0) & 0xffff, 0xfc00);
+  assert.equal(pack(Number.NaN, 0) & 0xffff, 0x7e00);
+
+  // Every positive finite binary16 midpoint is exactly representable in f32.
+  // This checks ties-to-even across subnormal and normal boundaries; the
+  // explicit 65,520 assertion above covers the finite-to-infinity threshold.
+  for (let lower = 0; lower <= 0x7bfe; lower += 1) {
+    const midpoint = (nativeFloat16Bits(lower) + nativeFloat16Bits(lower + 1)) / 2;
+    assert.equal(
+      pack(midpoint, 0) & 0xffff,
+      nativeFloat16BitPattern(midpoint),
+      `positive midpoint after 0x${lower.toString(16)}`,
+    );
+    assert.equal(
+      pack(-midpoint, 0) & 0xffff,
+      nativeFloat16BitPattern(-midpoint),
+      `negative midpoint after 0x${lower.toString(16)}`,
+    );
+  }
 
   const sentinel = 0xdeadbeef;
   const packedKeys = new Uint32Array(2 * 512 + 3).fill(sentinel);
@@ -245,4 +331,33 @@ interface AttentionToken {
   readonly queryNormWeight: Float32Array;
   readonly keyNormWeight: Float32Array;
   readonly positions: readonly [number, number, number];
+}
+
+const FLOAT16_REFERENCE_BUFFER = new ArrayBuffer(2);
+const FLOAT16_REFERENCE_VIEW = new DataView(FLOAT16_REFERENCE_BUFFER);
+
+function nativeFloat16BitPattern(value: number): number {
+  FLOAT16_REFERENCE_VIEW.setFloat16(0, value, true);
+  return FLOAT16_REFERENCE_VIEW.getUint16(0, true);
+}
+
+function nativeFloat16(value: number): number {
+  FLOAT16_REFERENCE_VIEW.setFloat16(0, value, true);
+  return FLOAT16_REFERENCE_VIEW.getFloat16(0, true);
+}
+
+function nativeFloat16Bits(bits: number): number {
+  FLOAT16_REFERENCE_VIEW.setUint16(0, bits, true);
+  return FLOAT16_REFERENCE_VIEW.getFloat16(0, true);
+}
+
+function makeAttentionToken(value: number): AttentionToken {
+  return {
+    queryGate: makeProjection(() => 0, () => 80),
+    key: new Float32Array(4 * 256).fill(value),
+    value: new Float32Array(4 * 256).fill(value),
+    queryNormWeight: new Float32Array(256).fill(1),
+    keyNormWeight: new Float32Array(256).fill(1),
+    positions: [0, 0, 0],
+  };
 }
