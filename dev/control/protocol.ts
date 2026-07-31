@@ -82,7 +82,27 @@ export interface ReconcileMessage {
   commands: CommandSnapshot[];
 }
 
-export type ServerToPhoneMessage = CommandMessage | ReconcileMessage;
+export interface EventAckMessage {
+  schemaVersion: typeof CONTROL_SCHEMA_VERSION;
+  type: "eventAck";
+  documentId: string;
+  status: "accepted" | "gap" | "replay";
+  acknowledgedSeq: number;
+  expectedSeq: number;
+}
+
+export interface SequenceSyncMessage {
+  schemaVersion: typeof CONTROL_SCHEMA_VERSION;
+  type: "sequenceSync";
+  documentId: string;
+  expectedSeq: number;
+}
+
+export type ServerToPhoneMessage =
+  | CommandMessage
+  | ReconcileMessage
+  | EventAckMessage
+  | SequenceSyncMessage;
 
 const ID_PATTERN = /^[A-Za-z0-9._:-]{16,128}$/;
 
@@ -246,5 +266,10 @@ export class EventSequenceTracker {
     if (sequence > expected) return { accepted: false, expected, classification: "gap" };
     this.#nextByDocument.set(documentId, expected + 1);
     return { accepted: true, expected };
+  }
+
+  expected(documentId: string): number {
+    validateProtocolId(documentId, "documentId");
+    return this.#nextByDocument.get(documentId) ?? 1;
   }
 }

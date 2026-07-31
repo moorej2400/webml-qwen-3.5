@@ -6,6 +6,7 @@
 export const createBrowserAgentSource = (): string => `(() => {
   "use strict";
   const VERSION = 1;
+  const OUTBOX_LIMIT = 256;
   const safeId = (prefix) => prefix + "_" + crypto.randomUUID().replaceAll("-", "");
   const durable = (storage, key, prefix) => {
     let value = storage.getItem(key);
@@ -25,6 +26,8 @@ export const createBrowserAgentSource = (): string => `(() => {
   let tabClaimed = false;
   let tabCollision = false;
   const records = new Map();
+  const outbox = new Map();
+  let highestAcknowledged = 0;
   const tabChannel = new BroadcastChannel("qwen-control-tabs-v1");
   tabChannel.addEventListener("message", ({ data }) => {
     if (!data || data.tabId !== tabId || data.claimantId === claimantId) return;
@@ -65,10 +68,67 @@ export const createBrowserAgentSource = (): string => `(() => {
     if (!response.ok) throw new Error("control_auth_failed");
     return response.json();
   };
-  const send = (message) => {
+  const sendFrame = (frame) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ schemaVersion: VERSION, ...identity(), eventSeq: ++sequence, ...message }));
+      socket.send(JSON.stringify(frame));
     }
+  };
+  const send = (message) => {
+    if (outbox.size >= OUTBOX_LIMIT) throw new Error("control_outbox_limit");
+    const frame = {
+      schemaVersion: VERSION,
+      ...identity(),
+      eventSeq: ++sequence,
+      ...message
+    };
+    // Retain ownership before transport delivery so reconnect and synchronous
+    // test transports cannot lose an unacknowledged state transition.
+    outbox.set(frame.eventSeq, frame);
+    sendFrame(frame);
+  };
+  const replayFrom = (expectedSeq) => {
+    if (!Number.isSafeInteger(expectedSeq) || expectedSeq < 1 || expectedSeq <= highestAcknowledged) {
+      throw new Error("control_replay_sequence_invalid");
+    }
+    if (!outbox.has(expectedSeq)) {
+      if (outbox.size === 0 && expectedSeq === sequence + 1) return;
+      throw new Error("control_replay_unavailable");
+    }
+    for (const [eventSeq, frame] of [...outbox].sort(([left], [right]) => left - right)) {
+      if (eventSeq >= expectedSeq) sendFrame(frame);
+    }
+  };
+  const acknowledge = (message) => {
+    if (
+      message.documentId !== documentId ||
+      !["accepted", "gap", "replay"].includes(message.status) ||
+      !Number.isSafeInteger(message.acknowledgedSeq) ||
+      !Number.isSafeInteger(message.expectedSeq) ||
+      message.acknowledgedSeq < 0 ||
+      message.expectedSeq !== message.acknowledgedSeq + 1
+    ) throw new Error("control_ack_invalid");
+    if (message.status === "gap") {
+      replayFrom(message.expectedSeq);
+      return;
+    }
+    if (message.acknowledgedSeq < highestAcknowledged || message.acknowledgedSeq > sequence) {
+      throw new Error("control_ack_bounds_invalid");
+    }
+    highestAcknowledged = message.acknowledgedSeq;
+    for (const eventSeq of outbox.keys()) {
+      if (eventSeq <= highestAcknowledged) outbox.delete(eventSeq);
+    }
+  };
+  const resendState = (commandId, record) => {
+    const retained = [...outbox.values()].reverse().find(
+      (frame) => frame.type === "commandState" &&
+        frame.commandId === commandId && frame.state === record.state
+    );
+    if (retained) {
+      sendFrame(retained);
+      return;
+    }
+    transition(commandId, record.state, record.reason, record.result);
   };
   const transition = (commandId, state, reason, result) => {
     records.set(commandId, { state, reason, result });
@@ -139,7 +199,7 @@ export const createBrowserAgentSource = (): string => `(() => {
   const handleCommand = async (message) => {
     const previous = records.get(message.commandId);
     if (previous) {
-      transition(message.commandId, previous.state, previous.reason, previous.result);
+      resendState(message.commandId, previous);
       return;
     }
     transition(message.commandId, "accepted");
@@ -194,10 +254,27 @@ export const createBrowserAgentSource = (): string => `(() => {
         let message;
         try { message = JSON.parse(event.data); } catch { return; }
         if (message.schemaVersion !== VERSION) return;
+        if (message.type === "eventAck") {
+          try { acknowledge(message); } catch { socket.close(1008, "protocol_error"); }
+          return;
+        }
+        if (message.type === "sequenceSync") {
+          try {
+            if (message.documentId !== documentId) throw new Error("control_sync_document_invalid");
+            replayFrom(message.expectedSeq);
+          } catch {
+            socket.close(1008, "protocol_error");
+          }
+          return;
+        }
         if (message.type === "command") void handleCommand(message);
         if (message.type === "reconcile") {
           for (const command of message.commands || []) {
             const local = records.get(command.commandId);
+            if (local && local.state !== command.state) {
+              resendState(command.commandId, local);
+              continue;
+            }
             if (!local && command.state !== "issued" && command.state !== "accepted") {
               records.set(command.commandId, {
                 state: command.state,

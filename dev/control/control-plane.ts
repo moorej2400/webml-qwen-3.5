@@ -148,6 +148,13 @@ export class ControlPlane {
       }
     }
 
+    send({
+      schemaVersion: CONTROL_SCHEMA_VERSION,
+      type: "sequenceSync",
+      documentId: identity.documentId,
+      expectedSeq: this.#sequences.expected(identity.documentId),
+    });
+
     const commands = [...this.#commands.values()]
       .filter((stored) => tabKey(stored.target) === key)
       .map((stored) => stored.tracker.snapshot());
@@ -231,6 +238,9 @@ export class ControlPlane {
       dispatched: connection !== undefined,
       ...(connection === undefined ? {} : { originalDocumentId: connection.identity.documentId }),
     };
+    // Publish tracker ownership before transport delivery because in-memory
+    // tests and future local transports can synchronously acknowledge a send.
+    this.#commands.set(commandId, stored);
     if (connection !== undefined) connection.send(message);
 
     const timeoutMs = isReload(request.command) ? this.#reloadTimeoutMs : this.#commandTimeoutMs;
@@ -246,7 +256,6 @@ export class ControlPlane {
         this.#promoteSuspectedCrash(target, "command_timeout");
       }
     }, timeoutMs);
-    this.#commands.set(commandId, stored);
     return tracker.snapshot();
   }
 
@@ -262,7 +271,17 @@ export class ControlPlane {
       throw new Error("phone message identity does not match its authenticated connection");
     }
     const sequence = this.#sequences.accept(message.documentId, message.eventSeq);
-    if (!sequence.accepted) return sequence;
+    if (!sequence.accepted) {
+      connection.send({
+        schemaVersion: CONTROL_SCHEMA_VERSION,
+        type: "eventAck",
+        documentId: message.documentId,
+        status: sequence.classification,
+        acknowledgedSeq: sequence.expected - 1,
+        expectedSeq: sequence.expected,
+      });
+      return sequence;
+    }
 
     if (message.type === "commandState") this.#applyCommandState(message);
     if (message.type === "ready") this.#completeReplacementReload(message);
@@ -282,6 +301,14 @@ export class ControlPlane {
         ).catch(() => undefined);
       }
     }
+    connection.send({
+      schemaVersion: CONTROL_SCHEMA_VERSION,
+      type: "eventAck",
+      documentId: message.documentId,
+      status: "accepted",
+      acknowledgedSeq: message.eventSeq,
+      expectedSeq: message.eventSeq + 1,
+    });
     return sequence;
   }
 
@@ -289,6 +316,14 @@ export class ControlPlane {
     const stored = this.#commands.get(message.commandId);
     if (stored === undefined) throw new Error("unknown commandId");
     if (tabKey(stored.target) !== tabKey(message)) throw new Error("command target mismatch");
+    if (
+      isReload(stored.message.command) &&
+      (message.state === "completed" ||
+        message.state === "indeterminate" ||
+        message.state === "timed_out")
+    ) {
+      throw new Error(`phone cannot report server-owned reload state ${message.state}`);
+    }
     stored.tracker.transition(message.state, this.#clock.now(), message.reason, message.result);
     if (isTerminal(stored.tracker.snapshot().state) && stored.timer !== undefined) {
       this.#clock.clearTimeout(stored.timer);

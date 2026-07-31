@@ -4,7 +4,10 @@ import {
   type CommandState,
   type ControlCommand,
   type PhoneIdentity,
+  type ReconcileMessage,
+  type ServerToPhoneMessage,
 } from "./protocol.js";
+import { PhoneEventOutbox } from "./phone-event-outbox.js";
 import { sanitizeStateResult, type SanitizedStateResult } from "./state-result.js";
 
 export interface AgentPlatform {
@@ -23,6 +26,7 @@ export interface PhoneAgentRuntimeOptions {
   identity: PhoneIdentity;
   platform: AgentPlatform;
   handlers: AgentHandlers;
+  outboxLimit?: number;
 }
 
 interface AgentCommandRecord {
@@ -36,20 +40,47 @@ export class PhoneAgentRuntime {
   readonly #platform: AgentPlatform;
   readonly #handlers: AgentHandlers;
   readonly #commands = new Map<string, AgentCommandRecord>();
+  readonly #outbox: PhoneEventOutbox;
   #eventSeq = 0;
 
   constructor(options: PhoneAgentRuntimeOptions) {
     this.#identity = options.identity;
     this.#platform = options.platform;
     this.#handlers = options.handlers;
+    this.#outbox = new PhoneEventOutbox({
+      documentId: options.identity.documentId,
+      ...(options.outboxLimit === undefined ? {} : { maxEntries: options.outboxLimit }),
+    });
   }
 
-  async receive(message: CommandMessage): Promise<void> {
+  async receive(message: ServerToPhoneMessage): Promise<void> {
+    if (message.type === "eventAck") {
+      this.#outbox.acknowledge(message);
+      if (message.status === "gap") {
+        for (const replay of this.#outbox.replayFrom(message.expectedSeq)) {
+          this.#platform.send(replay);
+        }
+      }
+      return;
+    }
+    if (message.type === "sequenceSync") {
+      if (message.documentId !== this.#identity.documentId) {
+        throw new Error("sequence sync document mismatch");
+      }
+      for (const replay of this.#outbox.replayFrom(message.expectedSeq)) {
+        this.#platform.send(replay);
+      }
+      return;
+    }
+    if (message.type === "reconcile") {
+      this.#reconcile(message);
+      return;
+    }
     const previous = this.#commands.get(message.commandId);
     if (previous !== undefined) {
       // A retry retransmits state only; executing the handler again could
       // generate the same prompt twice after a reconnect race.
-      this.#report(message.commandId, previous.state, previous.reason, previous.result);
+      this.#resendOrReport(message.commandId, previous);
       return;
     }
 
@@ -88,7 +119,7 @@ export class PhoneAgentRuntime {
   }
 
   reportReady(): void {
-    this.#platform.send({
+    this.#emit({
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "ready",
       ...this.#identity,
@@ -97,7 +128,7 @@ export class PhoneAgentRuntime {
   }
 
   reportTelemetry(event: Record<string, unknown>): void {
-    this.#platform.send({
+    this.#emit({
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "telemetry",
       ...this.#identity,
@@ -126,7 +157,7 @@ export class PhoneAgentRuntime {
     reason?: string,
     result?: SanitizedStateResult,
   ): void {
-    this.#platform.send({
+    this.#emit({
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "commandState",
       ...this.#identity,
@@ -136,5 +167,36 @@ export class PhoneAgentRuntime {
       ...(reason === undefined ? {} : { reason }),
       ...(result === undefined ? {} : { result }),
     });
+  }
+
+  #emit(message: Parameters<PhoneEventOutbox["enqueue"]>[0]): void {
+    this.#outbox.enqueue(message);
+    this.#platform.send(message);
+  }
+
+  #resendOrReport(commandId: string, record: AgentCommandRecord): void {
+    const queued = this.#outbox.latestCommandState(commandId, record.state);
+    if (queued !== undefined) {
+      this.#platform.send(queued);
+      return;
+    }
+    this.#report(commandId, record.state, record.reason, record.result);
+  }
+
+  #reconcile(message: ReconcileMessage): void {
+    for (const serverCommand of message.commands) {
+      const local = this.#commands.get(serverCommand.commandId);
+      if (local !== undefined) {
+        if (local.state !== serverCommand.state) this.#resendOrReport(serverCommand.commandId, local);
+        continue;
+      }
+      if (serverCommand.state !== "issued" && serverCommand.state !== "accepted") {
+        this.#commands.set(serverCommand.commandId, {
+          state: serverCommand.state,
+          ...(serverCommand.reason === undefined ? {} : { reason: serverCommand.reason }),
+          ...(serverCommand.result === undefined ? {} : { result: serverCommand.result }),
+        });
+      }
+    }
   }
 }

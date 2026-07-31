@@ -214,6 +214,84 @@ test("reload timeout is indeterminate when no replacement document can be proven
   assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "indeterminate");
 });
 
+for (const rejectedState of ["completed", "indeterminate"] as const) {
+  test(`phone cannot report server-owned reload state ${rejectedState}`, () => {
+    const plane = new ControlPlane({ clock: new FakeClock(), reloadTimeoutMs: 5_000 });
+    const phone = connect(plane, identity("document_0123456789abcdef"));
+    plane.issueCommand({
+      deviceId: identity("").deviceId,
+      tabId: identity("").tabId,
+      commandId: "command_0123456789abcdef",
+      command: "warmReload",
+    });
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...identity("document_0123456789abcdef"),
+      eventSeq: 1,
+      commandId: "command_0123456789abcdef",
+      state: "accepted",
+    });
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...identity("document_0123456789abcdef"),
+      eventSeq: 2,
+      commandId: "command_0123456789abcdef",
+      state: "started",
+    });
+
+    assert.throws(
+      () =>
+        plane.receive(phone.connectionId, {
+          schemaVersion: 1,
+          type: "commandState",
+          ...identity("document_0123456789abcdef"),
+          eventSeq: 3,
+          commandId: "command_0123456789abcdef",
+          state: rejectedState,
+        }),
+      /server-owned reload state/i,
+    );
+    assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "started");
+  });
+}
+
+test("phone-reported reload failure cannot later bypass replacement proof", () => {
+  const plane = new ControlPlane({ clock: new FakeClock(), reloadTimeoutMs: 5_000 });
+  const original = connect(plane, identity("document_0123456789abcdef"));
+  plane.issueCommand({
+    deviceId: identity("").deviceId,
+    tabId: identity("").tabId,
+    commandId: "command_0123456789abcdef",
+    command: "warmReload",
+  });
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+    [3, "failed"],
+  ] as const) {
+    plane.receive(original.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...identity("document_0123456789abcdef"),
+      eventSeq,
+      commandId: "command_0123456789abcdef",
+      state,
+    });
+  }
+  plane.disconnect(original.connectionId, { kind: "page_lifecycle", lifecycle: "navigation" });
+  const replacement = connect(plane, identity("document_1123456789abcdef"));
+  plane.receive(replacement.connectionId, {
+    schemaVersion: 1,
+    type: "ready",
+    ...identity("document_1123456789abcdef"),
+    eventSeq: 1,
+  });
+
+  assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "failed");
+});
+
 test("ordinary command timeout is timed_out", () => {
   const clock = new FakeClock();
   const plane = new ControlPlane({ clock, commandTimeoutMs: 500 });

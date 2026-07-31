@@ -25,6 +25,17 @@ test("public browser agent contains no reusable or one-time credential", () => {
   assert.match(source, /autocomplete = "one-time-code"/);
 });
 
+test("injected browser agent retains and replays bounded unacknowledged events", () => {
+  const source = createBrowserAgentSource();
+
+  assert.match(source, /const OUTBOX_LIMIT = 256/);
+  assert.match(source, /outbox\.set\(frame\.eventSeq, frame\)/);
+  assert.match(source, /message\.type === "eventAck"/);
+  assert.match(source, /message\.type === "sequenceSync"/);
+  assert.match(source, /replayFrom\(message\.expectedSeq\)/);
+  assert.match(source, /resendState\(command\.commandId, local\)/);
+});
+
 test("pairing code is one-time and creates a short-lived session capability", () => {
   let nowMs = 1_000;
   const pairingCode = randomBytes(32).toString("base64url");
