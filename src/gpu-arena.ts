@@ -1,4 +1,8 @@
-import { AllocationLedger } from "./allocation-ledger.js";
+import {
+  AllocationLedger,
+  type AllocationHandle,
+} from "./allocation-ledger.js";
+import { diagnosticError } from "./diagnostics.js";
 
 export type GpuAllocationCategory =
   | "model"
@@ -16,6 +20,8 @@ export interface GpuArenaDevice {
     readonly maxBufferSize: number;
     readonly maxStorageBufferBindingSize: number;
   };
+  pushErrorScope(filter: "validation" | "out-of-memory"): void;
+  popErrorScope(): Promise<{ readonly message?: string } | null>;
   createBuffer(descriptor: {
     readonly size: number;
     readonly usage: number;
@@ -24,7 +30,12 @@ export interface GpuArenaDevice {
 }
 
 export interface GpuAllocation {
-  readonly buffers: readonly GpuBufferLike[];
+  readonly shards: readonly {
+    readonly buffer: GpuBufferLike;
+    readonly logicalByteOffset: bigint;
+    readonly logicalByteLength: bigint;
+    readonly allocatedByteLength: bigint;
+  }[];
   readonly logicalBytes: bigint;
   readonly allocatedBytes: bigint;
   destroy(): void;
@@ -36,6 +47,7 @@ export interface GpuAllocationRequest {
   readonly byteLength: bigint;
   readonly usage: number;
   readonly alignment: number;
+  readonly requiredShardQuantumBytes?: bigint;
 }
 
 function requirePositiveSafeInteger(value: number, label: string): void {
@@ -64,6 +76,31 @@ function destroyEveryBuffer(buffers: readonly GpuBufferLike[]): unknown {
   return firstError;
 }
 
+const GPU_BUFFER_USAGE_ALL = 0x03ff;
+const GPU_BUFFER_USAGE_MAP_READ = 0x0001;
+const GPU_BUFFER_USAGE_MAP_WRITE = 0x0002;
+const GPU_BUFFER_USAGE_COPY_SRC = 0x0004;
+const GPU_BUFFER_USAGE_COPY_DST = 0x0008;
+
+function requireLegalBufferUsage(usage: number): void {
+  requirePositiveSafeInteger(usage, "GPU buffer usage");
+  const hasUnknownBits =
+    usage > GPU_BUFFER_USAGE_ALL ||
+    (usage & ~GPU_BUFFER_USAGE_ALL) !== 0;
+  const mapReadIsLegal =
+    (usage & GPU_BUFFER_USAGE_MAP_READ) === 0 ||
+    (usage & ~(GPU_BUFFER_USAGE_MAP_READ | GPU_BUFFER_USAGE_COPY_DST)) === 0;
+  const mapWriteIsLegal =
+    (usage & GPU_BUFFER_USAGE_MAP_WRITE) === 0 ||
+    (usage & ~(GPU_BUFFER_USAGE_MAP_WRITE | GPU_BUFFER_USAGE_COPY_SRC)) === 0;
+  if (hasUnknownBits || !mapReadIsLegal || !mapWriteIsLegal) {
+    throw diagnosticError(
+      "GPU_BUFFER_USAGE_INVALID",
+      "GPU buffer usage is invalid",
+    );
+  }
+}
+
 export class GpuArena {
   readonly #device: GpuArenaDevice;
   readonly #ledger: AllocationLedger;
@@ -82,14 +119,11 @@ export class GpuArena {
     this.#bufferShardCapBytes = options.bufferShardCapBytes;
   }
 
-  allocate(request: GpuAllocationRequest): GpuAllocation {
+  async allocate(request: GpuAllocationRequest): Promise<GpuAllocation> {
     if (request.byteLength <= 0n) {
       throw new Error("GPU allocation byteLength must be greater than zero");
     }
-    requirePositiveSafeInteger(request.usage, "GPU buffer usage");
-    if (request.usage > 0xffff_ffff) {
-      throw new Error("GPU buffer usage must fit an unsigned u32 bitmask");
-    }
+    requireLegalBufferUsage(request.usage);
     if (!isPowerOfTwo(request.alignment)) {
       throw new Error("GPU buffer alignment must be a positive power of two");
     }
@@ -103,6 +137,18 @@ export class GpuArena {
     );
 
     const alignment = BigInt(request.alignment);
+    const shardQuantum =
+      request.requiredShardQuantumBytes ?? alignment;
+    if (
+      shardQuantum <= 0n ||
+      shardQuantum % alignment !== 0n ||
+      (request.requiredShardQuantumBytes !== undefined &&
+        request.byteLength % shardQuantum !== 0n)
+    ) {
+      throw new Error(
+        "GPU shard quantum must align buffers and divide the logical allocation",
+      );
+    }
     const allocatedBytes =
       ((request.byteLength + alignment - 1n) / alignment) * alignment;
     if (allocatedBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -118,10 +164,10 @@ export class GpuArena {
       this.#bufferShardCapBytes,
     ].reduce((smallest, value) => (value < smallest ? value : smallest));
     const alignedChunkLimit =
-      (liveBufferLimit / alignment) * alignment;
-    if (alignedChunkLimit < alignment) {
+      (liveBufferLimit / shardQuantum) * shardQuantum;
+    if (alignedChunkLimit < shardQuantum) {
       throw new Error(
-        "GPU buffer shard cap or device limits are smaller than the requested alignment",
+        "GPU buffer shard cap or device limits cannot hold the requested alignment or shard quantum",
       );
     }
     const alignedChunkLimitNumber = Number(alignedChunkLimit);
@@ -131,39 +177,100 @@ export class GpuArena {
       );
     }
 
-    this.#ledger.reserve({
+    const ledgerHandle: AllocationHandle = this.#ledger.reserve({
       id: request.id,
       category: request.category,
       bytes: allocatedBytes,
     });
-    const buffers: GpuBufferLike[] = [];
+    const shards: Array<{
+      buffer: GpuBufferLike;
+      logicalByteOffset: bigint;
+      logicalByteLength: bigint;
+      allocatedByteLength: bigint;
+    }> = [];
+    let scopesPushed = 0;
+    let creationFailed = false;
+    let scopeFailed = false;
+    let outOfMemoryError: { readonly message?: string } | null = null;
+    let validationError: { readonly message?: string } | null = null;
     try {
-      let remaining = Number(allocatedBytes);
-      while (remaining > 0) {
-        const size = Math.min(remaining, alignedChunkLimitNumber);
-        buffers.push(
-          this.#device.createBuffer({
-            size,
-            usage: request.usage,
-            // Tensor identifiers may contain model or user data; labels expose
-            // only the public category and an allocation-local ordinal.
-            label: `qwen-runtime:${request.category}:${buffers.length}`,
-          }),
-        );
-        remaining -= size;
+      this.#device.pushErrorScope("validation");
+      scopesPushed = 1;
+      this.#device.pushErrorScope("out-of-memory");
+      scopesPushed = 2;
+
+      let remainingAllocated = allocatedBytes;
+      let remainingLogical = request.byteLength;
+      let logicalByteOffset = 0n;
+      while (remainingAllocated > 0n) {
+        const allocatedByteLength =
+          remainingAllocated < alignedChunkLimit
+            ? remainingAllocated
+            : alignedChunkLimit;
+        const logicalByteLength =
+          remainingLogical < allocatedByteLength
+            ? remainingLogical
+            : allocatedByteLength;
+        const buffer = this.#device.createBuffer({
+          size: Number(allocatedByteLength),
+          usage: request.usage,
+          // Tensor identifiers may contain model or user data; labels expose
+          // only the public category and an allocation-local ordinal.
+          label: `qwen-runtime:${request.category}:${shards.length}`,
+        });
+        shards.push({
+          buffer,
+          logicalByteOffset,
+          logicalByteLength,
+          allocatedByteLength,
+        });
+        logicalByteOffset += logicalByteLength;
+        remainingLogical -= logicalByteLength;
+        remainingAllocated -= allocatedByteLength;
       }
-    } catch (error) {
-      // The arena owns each buffer as soon as createBuffer returns. On a later
-      // failure it destroys that prefix before releasing the single ledger
-      // reservation, so neither side can retain orphaned ownership.
-      destroyEveryBuffer(buffers);
-      this.#ledger.release(request.id);
-      throw error;
+    } catch {
+      creationFailed = true;
     }
 
+    // WebGPU reports createBuffer validation and OOM failures asynchronously.
+    // Pop both scopes before transferring ownership to the returned allocation.
+    if (scopesPushed === 2) {
+      try {
+        outOfMemoryError = await this.#device.popErrorScope();
+      } catch {
+        scopeFailed = true;
+      }
+    }
+    if (scopesPushed >= 1) {
+      try {
+        validationError = await this.#device.popErrorScope();
+      } catch {
+        scopeFailed = true;
+      }
+    }
+
+    if (
+      creationFailed ||
+      scopeFailed ||
+      outOfMemoryError !== null ||
+      validationError !== null
+    ) {
+      // The arena owns every returned prefix buffer until both async scopes
+      // succeed. Any failure destroys the prefix and releases ledger ownership.
+      destroyEveryBuffer(shards.map(({ buffer }) => buffer));
+      this.#ledger.release(ledgerHandle);
+      throw diagnosticError(
+        "GPU_BUFFER_ALLOCATION_FAILED",
+        "GPU buffer allocation failed",
+      );
+    }
+
+    const ownedLedgerHandle = ledgerHandle;
     let destroyed = false;
     return {
-      buffers,
+      shards: Object.freeze(
+        shards.map((shard) => Object.freeze({ ...shard })),
+      ),
       logicalBytes: request.byteLength,
       allocatedBytes,
       destroy: () => {
@@ -171,10 +278,15 @@ export class GpuArena {
           return;
         }
         destroyed = true;
-        const destroyError = destroyEveryBuffer(buffers);
-        this.#ledger.release(request.id);
+        const destroyError = destroyEveryBuffer(
+          shards.map(({ buffer }) => buffer),
+        );
+        this.#ledger.release(ownedLedgerHandle);
         if (destroyError !== undefined) {
-          throw destroyError;
+          throw diagnosticError(
+            "GPU_BUFFER_DESTRUCTION_FAILED",
+            "GPU buffer destruction failed",
+          );
         }
       },
     };

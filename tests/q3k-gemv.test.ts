@@ -49,17 +49,19 @@ test("executes deterministic packed matrix rows through the CPU reference", () =
 test("plans one correctness invocation per row with aligned u32 offsets", () => {
   assert.deepEqual(
     planQ3KGemvDispatch({
-      rows: 7,
+      localRows: 7,
       columns: 512,
       packedByteOffset: 224,
+      outputRowOffset: 19,
     }),
     {
       workgroups: { x: 7, y: 1, z: 1 },
       uniforms: {
-        rows: 7,
+        localRows: 7,
         columns: 512,
         blocksPerRow: 2,
         weightWordOffset: 56,
+        outputRowOffset: 19,
       },
     },
   );
@@ -68,7 +70,7 @@ test("plans one correctness invocation per row with aligned u32 offsets", () => 
 test("uses a two-dimensional dispatch for the full vocabulary row count", () => {
   assert.deepEqual(
     planQ3KGemvDispatch({
-      rows: 248_320,
+      localRows: 248_320,
       columns: 2560,
     }).workgroups,
     { x: 65_535, y: 4, z: 1 },
@@ -78,17 +80,17 @@ test("uses a two-dimensional dispatch for the full vocabulary row count", () => 
 
 test("rejects invalid rows, block shapes, offsets, and packed extents", () => {
   assert.throws(
-    () => planQ3KGemvDispatch({ rows: 0, columns: 256 }),
-    /rows/i,
+    () => planQ3KGemvDispatch({ localRows: 0, columns: 256 }),
+    /localRows/i,
   );
   assert.throws(
-    () => planQ3KGemvDispatch({ rows: 1, columns: 255 }),
+    () => planQ3KGemvDispatch({ localRows: 1, columns: 255 }),
     /multiple of 256/i,
   );
   assert.throws(
     () =>
       planQ3KGemvDispatch({
-        rows: 1,
+        localRows: 1,
         columns: 256,
         packedByteOffset: 2,
       }),
@@ -97,7 +99,7 @@ test("rejects invalid rows, block shapes, offsets, and packed extents", () => {
   assert.throws(
     () =>
       planQ3KGemvDispatch({
-        rows: 1,
+        localRows: 1,
         columns: 256,
         packedByteOffset: 4,
       }),
@@ -126,6 +128,7 @@ test("publishes the packed shader ABI and structurally complete WGSL", () => {
     wordsPerBlock: 28,
     valuesPerBlock: 256,
     workgroupSize: 1,
+    uniformWords: 5,
     bindings: {
       packedWeights: 0,
       activation: 1,
@@ -138,5 +141,11 @@ test("publishes the packed shader ABI and structurally complete WGSL", () => {
   assert.match(Q3K_GEMV_WGSL, /VALUES_PER_BLOCK\s*:\s*u32\s*=\s*256u/);
   assert.match(Q3K_GEMV_WGSL, /unpack2x16float/);
   assert.match(Q3K_GEMV_WGSL, /@workgroup_size\(1\)/);
+  assert.match(Q3K_GEMV_WGSL, /local_rows\s*:\s*u32/);
+  assert.match(Q3K_GEMV_WGSL, /output_row_offset\s*:\s*u32/);
+  assert.match(
+    Q3K_GEMV_WGSL,
+    /output\[params\.output_row_offset\s*\+\s*row\]/,
+  );
   assert.doesNotMatch(Q3K_GEMV_WGSL, /array<f16>|mat(2|3|4)x/);
 });

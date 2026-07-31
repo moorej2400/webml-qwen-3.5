@@ -1,3 +1,5 @@
+import { diagnosticError, isSafeDiagnosticCode } from "./diagnostics.js";
+
 export interface AllocationReservation {
   readonly id: string;
   readonly category: string;
@@ -12,11 +14,29 @@ export interface AllocationLedgerSnapshot {
   readonly allocationCount: number;
 }
 
+const ALLOCATION_HANDLE = Symbol("allocation-handle");
+
+// The opaque token binds release authority to one reservation generation.
+// Stable string IDs may then be reused without allowing stale releases.
+export interface AllocationHandle {
+  readonly [ALLOCATION_HANDLE]: true;
+}
+
+interface ActiveAllocation {
+  readonly reservation: AllocationReservation;
+  readonly generation: bigint;
+  readonly handle: AllocationHandle;
+}
+
 export class AllocationLedger {
   readonly #limitBytes: bigint;
-  readonly #active = new Map<string, AllocationReservation>();
-  readonly #usedIds = new Set<string>();
+  readonly #active = new Map<string, ActiveAllocation>();
+  readonly #handles = new WeakMap<
+    AllocationHandle,
+    { readonly id: string; readonly generation: bigint }
+  >();
   readonly #currentByCategory = new Map<string, bigint>();
+  #nextGeneration = 1n;
   #currentBytes = 0n;
   #peakBytes = 0n;
 
@@ -27,18 +47,24 @@ export class AllocationLedger {
     this.#limitBytes = limitBytes;
   }
 
-  reserve(reservation: AllocationReservation): void {
+  reserve(reservation: AllocationReservation): AllocationHandle {
     if (reservation.id.length === 0) {
       throw new Error("Allocation id must not be empty");
     }
-    if (reservation.category.length === 0) {
-      throw new Error("Allocation category must not be empty");
+    if (!isSafeDiagnosticCode(reservation.category)) {
+      throw diagnosticError(
+        "ALLOCATION_CATEGORY_INVALID",
+        "Allocation category is invalid",
+      );
     }
     if (reservation.bytes <= 0n) {
       throw new Error("Allocation bytes must be greater than zero");
     }
-    if (this.#usedIds.has(reservation.id)) {
-      throw new Error(`Duplicate allocation id: ${reservation.id}`);
+    if (this.#active.has(reservation.id)) {
+      throw diagnosticError(
+        "ALLOCATION_DUPLICATE",
+        "Duplicate allocation id is already active",
+      );
     }
     const nextBytes = this.#currentBytes + reservation.bytes;
     if (nextBytes > this.#limitBytes) {
@@ -49,8 +75,17 @@ export class AllocationLedger {
 
     // Mutation starts only after all checks pass, so a rejected reservation
     // cannot leave category totals or ownership in a partial state.
-    this.#active.set(reservation.id, { ...reservation });
-    this.#usedIds.add(reservation.id);
+    const generation = this.#nextGeneration;
+    this.#nextGeneration += 1n;
+    const handle = Object.freeze({
+      [ALLOCATION_HANDLE]: true as const,
+    });
+    this.#active.set(reservation.id, {
+      reservation: { ...reservation },
+      generation,
+      handle,
+    });
+    this.#handles.set(handle, { id: reservation.id, generation });
     this.#currentBytes = nextBytes;
     this.#peakBytes =
       this.#peakBytes > this.#currentBytes
@@ -61,14 +96,26 @@ export class AllocationLedger {
       (this.#currentByCategory.get(reservation.category) ?? 0n) +
         reservation.bytes,
     );
+    return handle;
   }
 
-  release(id: string): void {
-    const reservation = this.#active.get(id);
-    if (reservation === undefined) {
-      throw new Error(`Allocation ${id} is not reserved or was already released`);
+  release(handle: AllocationHandle): void {
+    const identity = this.#handles.get(handle);
+    const active =
+      identity === undefined ? undefined : this.#active.get(identity.id);
+    if (
+      identity === undefined ||
+      active === undefined ||
+      active.generation !== identity.generation ||
+      active.handle !== handle
+    ) {
+      throw diagnosticError(
+        "ALLOCATION_HANDLE_STALE",
+        "Allocation handle is stale or already released",
+      );
     }
-    this.#active.delete(id);
+    const { reservation } = active;
+    this.#active.delete(identity.id);
     this.#currentBytes -= reservation.bytes;
     const categoryBytes =
       this.#currentByCategory.get(reservation.category)! - reservation.bytes;
@@ -97,12 +144,22 @@ export class AllocationLedger {
     if (this.#active.size === 0) {
       return;
     }
-    const allocations = [...this.#active.values()]
-      .sort((left, right) =>
-        left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+    const counts = new Map<string, number>();
+    for (const { reservation } of this.#active.values()) {
+      counts.set(
+        reservation.category,
+        (counts.get(reservation.category) ?? 0) + 1,
+      );
+    }
+    const categories = [...counts]
+      .sort(([left], [right]) =>
+        left < right ? -1 : left > right ? 1 : 0,
       )
-      .map(({ id, bytes }) => `${id}: ${bytes} bytes`)
+      .map(([category, count]) => `${category}:${count}`)
       .join(", ");
-    throw new Error(`GPU allocations remain live: ${allocations}`);
+    throw diagnosticError(
+      "GPU_RESOURCE_LEAK",
+      `${this.#active.size} active GPU allocation(s); categories ${categories}`,
+    );
   }
 }

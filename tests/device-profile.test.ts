@@ -12,6 +12,9 @@ const MIB = 1024 * 1024;
 function adapterSurface(options?: {
   readonly maxBufferSize?: number;
   readonly maxStorageBufferBindingSize?: number;
+  readonly minStorageBufferOffsetAlignment?: number;
+  readonly deviceMinStorageBufferOffsetAlignment?: number;
+  readonly deviceFeatures?: readonly string[];
   readonly heapLimit?: number;
 }) {
   const requests: unknown[] = [];
@@ -19,8 +22,9 @@ function adapterSurface(options?: {
     maxBufferSize: options?.maxBufferSize ?? 512 * MIB,
     maxStorageBufferBindingSize:
       options?.maxStorageBufferBindingSize ?? 384 * MIB,
+    minStorageBufferOffsetAlignment:
+      options?.minStorageBufferOffsetAlignment ?? 256,
   };
-  const device = { limits, createBuffer: () => ({ destroy() {} }) };
   return {
     requests,
     surface: {
@@ -29,9 +33,29 @@ function adapterSurface(options?: {
           return {
             features: new Set(["shader-f16", "timestamp-query"]),
             limits,
-            async requestDevice(descriptor: unknown) {
+            async requestDevice(descriptor: {
+              requiredFeatures?: readonly string[];
+              requiredLimits?: Readonly<Record<string, number>>;
+            }) {
               requests.push(descriptor);
-              return device;
+              return {
+                limits: {
+                  ...limits,
+                  ...descriptor.requiredLimits,
+                  ...(options?.deviceMinStorageBufferOffsetAlignment ===
+                  undefined
+                    ? {}
+                    : {
+                        minStorageBufferOffsetAlignment:
+                          options.deviceMinStorageBufferOffsetAlignment,
+                      }),
+                },
+                features: new Set(
+                  options?.deviceFeatures ??
+                    descriptor.requiredFeatures ??
+                    [],
+                ),
+              };
             },
           };
         },
@@ -63,19 +87,87 @@ test("probes sanitized facts and requests only declared requirements", async () 
   );
   assert.equal(profile.uploadLaneBytes, DEFAULT_UPLOAD_LANE_BYTES);
   assert.equal(profile.facts.jsHeapLimitBytes, 768 * MIB);
-  assert.deepEqual(profile.facts.features, [
+  assert.deepEqual(profile.facts.adapter.features, [
     "shader-f16",
     "timestamp-query",
   ]);
-  assert.deepEqual(profile.facts.limits, {
+  assert.deepEqual(profile.facts.device.features, ["shader-f16"]);
+  assert.deepEqual(profile.facts.adapter.limits, {
     maxBufferSize: 512 * MIB,
     maxStorageBufferBindingSize: 384 * MIB,
   });
+  assert.deepEqual(profile.facts.device.limits, {
+    maxBufferSize: 512 * MIB,
+    maxStorageBufferBindingSize: 128 * MIB,
+  });
   assert.deepEqual(Object.keys(profile.facts).sort(), [
-    "features",
+    "adapter",
+    "device",
     "jsHeapLimitBytes",
-    "limits",
   ]);
+});
+
+test("does not advertise an available but unrequested feature as enabled", async () => {
+  const profile = await probeDeviceProfile(adapterSurface().surface);
+
+  assert.deepEqual(profile.facts.adapter.features, [
+    "shader-f16",
+    "timestamp-query",
+  ]);
+  assert.deepEqual(profile.facts.device.features, []);
+  assert.equal(profile.facts.device.features.includes("timestamp-query"), false);
+});
+
+test("reports the feature set returned by the device as enabled", async () => {
+  const profile = await probeDeviceProfile(
+    adapterSurface({
+      deviceFeatures: ["shader-f16", "timestamp-query"],
+    }).surface,
+    { requiredFeatures: ["shader-f16"] },
+  );
+
+  assert.deepEqual(profile.facts.device.features, [
+    "shader-f16",
+    "timestamp-query",
+  ]);
+});
+
+test("applies inverse comparison semantics to minimum alignment limits", async () => {
+  const betterAdapter = adapterSurface({
+    minStorageBufferOffsetAlignment: 128,
+  });
+
+  const accepted = await probeDeviceProfile(betterAdapter.surface, {
+    requiredLimits: { minStorageBufferOffsetAlignment: 256 },
+  });
+
+  assert.equal(
+    accepted.facts.device.limits.minStorageBufferOffsetAlignment,
+    256,
+  );
+  await assert.rejects(
+    probeDeviceProfile(
+      adapterSurface({
+        minStorageBufferOffsetAlignment: 256,
+      }).surface,
+      {
+        requiredLimits: { minStorageBufferOffsetAlignment: 128 },
+      },
+    ),
+    /required WebGPU limit is unavailable/i,
+  );
+  await assert.rejects(
+    probeDeviceProfile(
+      adapterSurface({
+        minStorageBufferOffsetAlignment: 128,
+        deviceMinStorageBufferOffsetAlignment: 512,
+      }).surface,
+      {
+        requiredLimits: { minStorageBufferOffsetAlignment: 256 },
+      },
+    ),
+    /returned WebGPU device does not satisfy required limits/i,
+  );
 });
 
 test("keeps missing Safari heap telemetry null and supports evidence profiles", async () => {
@@ -107,19 +199,33 @@ test("rejects unavailable requirements and either limiting buffer dimension", as
     probeDeviceProfile(fake.surface, {
       requiredFeatures: ["subgroups"],
     }),
-    /required WebGPU feature.*subgroups/i,
+    /required WebGPU feature is unavailable/i,
   );
   await assert.rejects(
     probeDeviceProfile(fake.surface, {
       requiredLimits: { maxBufferSize: 128 * MIB },
     }),
-    /maxBufferSize/i,
+    /required WebGPU limit is unavailable/i,
   );
   await assert.rejects(
     probeDeviceProfile(fake.surface, {
       requiredLimits: { maxStorageBufferBindingSize: 64 * MIB },
     }),
-    /maxStorageBufferBindingSize/i,
+    /required WebGPU limit is unavailable/i,
+  );
+});
+
+test("does not echo caller-provided feature identifiers in diagnostics", async () => {
+  await assert.rejects(
+    probeDeviceProfile(adapterSurface().surface, {
+      requiredFeatures: ["https://example.invalid/<feature-id>"],
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /required WebGPU feature is unavailable/i);
+      assert.doesNotMatch(error.message, /example\.invalid|feature-id|https/i);
+      return true;
+    },
   );
 });
 

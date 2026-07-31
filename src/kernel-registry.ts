@@ -1,3 +1,8 @@
+import {
+  diagnosticError,
+  isSafeDiagnosticCode,
+} from "./diagnostics.js";
+
 export interface KernelKey {
   readonly operation: string;
   readonly layout: string;
@@ -36,7 +41,7 @@ export interface CompilationMetric {
   readonly durationMs: number;
   readonly pivot: KernelPivot | null;
   readonly error: {
-    readonly name: string;
+    readonly code: "KERNEL_COMPILE_FAILED";
     readonly message: string;
   } | null;
 }
@@ -50,11 +55,40 @@ function keyText(key: KernelKey): string {
   ]);
 }
 
-function sanitizeError(error: unknown): { name: string; message: string } {
-  if (error instanceof Error) {
-    return { name: error.name, message: error.message };
+function requireSafeKernelCode(value: string): void {
+  if (!isSafeDiagnosticCode(value)) {
+    throw diagnosticError(
+      "KERNEL_REGISTRATION_INVALID",
+      "Kernel diagnostic code is invalid",
+    );
   }
-  return { name: "Error", message: String(error) };
+}
+
+function frozenKey(key: KernelKey): KernelKey {
+  return Object.freeze({ ...key });
+}
+
+function frozenKernel(kernel: KernelDefinition): KernelDefinition {
+  return Object.freeze({
+    ...kernel,
+    key: frozenKey(kernel.key),
+  });
+}
+
+function frozenPivot(pivot: KernelPivot): KernelPivot {
+  return Object.freeze({ ...pivot });
+}
+
+function frozenSelection(
+  kernel: KernelDefinition,
+  pivot: KernelPivot | null,
+  attemptedProfiles: readonly string[],
+): KernelSelection {
+  return Object.freeze({
+    kernel: frozenKernel(kernel),
+    pivot: pivot === null ? null : frozenPivot(pivot),
+    attemptedProfiles: Object.freeze([...attemptedProfiles]),
+  });
 }
 
 export class KernelRegistry {
@@ -68,17 +102,29 @@ export class KernelRegistry {
   }
 
   register(kernel: KernelDefinition): void {
+    requireSafeKernelCode(kernel.id);
+    requireSafeKernelCode(kernel.key.operation);
+    requireSafeKernelCode(kernel.key.layout);
+    requireSafeKernelCode(kernel.key.phase);
+    requireSafeKernelCode(kernel.key.profile);
     const text = keyText(kernel.key);
     if (this.#kernels.has(text)) {
-      throw new Error(`Duplicate kernel key: ${text}`);
+      throw diagnosticError(
+        "KERNEL_REGISTRATION_DUPLICATE",
+        "Duplicate kernel key",
+      );
     }
-    this.#kernels.set(text, {
-      ...kernel,
-      key: { ...kernel.key },
-    });
+    this.#kernels.set(text, frozenKernel(kernel));
   }
 
   select(request: KernelSelectionRequest): KernelSelection {
+    requireSafeKernelCode(request.key.operation);
+    requireSafeKernelCode(request.key.layout);
+    requireSafeKernelCode(request.key.phase);
+    requireSafeKernelCode(request.key.profile);
+    for (const profile of request.fallbackProfiles) {
+      requireSafeKernelCode(profile);
+    }
     const attemptedProfiles: string[] = [];
     for (const profile of [
       request.key.profile,
@@ -91,27 +137,28 @@ export class KernelRegistry {
         continue;
       }
       if (profile === request.key.profile) {
-        return { kernel, pivot: null, attemptedProfiles };
+        return frozenSelection(kernel, null, attemptedProfiles);
       }
-      if (request.pivotReason === undefined || request.pivotReason.length === 0) {
-        throw new Error(
-          "An explicit pivot reason is required for kernel fallback",
+      if (
+        request.pivotReason === undefined ||
+        !isSafeDiagnosticCode(request.pivotReason)
+      ) {
+        throw diagnosticError(
+          "KERNEL_FALLBACK_REASON_INVALID",
+          "Kernel fallback requires a safe reason code",
         );
       }
-      const pivot = {
+      const pivot = frozenPivot({
         fromProfile: request.key.profile,
         toProfile: profile,
         reason: request.pivotReason,
-      };
+      });
       this.#pivots.push(pivot);
-      return {
-        kernel,
-        pivot,
-        attemptedProfiles,
-      };
+      return frozenSelection(kernel, pivot, attemptedProfiles);
     }
-    throw new Error(
-      `No kernel for ${request.key.operation}/${request.key.layout}/${request.key.phase}; attempted profiles: ${attemptedProfiles.join(", ")}`,
+    throw diagnosticError(
+      "KERNEL_NOT_FOUND",
+      "No kernel matched the requested operation and explicit profiles",
     );
   }
 
@@ -123,40 +170,58 @@ export class KernelRegistry {
     const started = this.#clock();
     try {
       const value = await compiler(selection.kernel);
-      this.#metrics.push({
+      this.#metrics.push(Object.freeze({
         kernelId: selection.kernel.id,
-        key: { ...selection.kernel.key },
+        key: frozenKey(selection.kernel.key),
         status: "success",
         durationMs: Math.max(0, this.#clock() - started),
-        pivot: selection.pivot,
+        pivot:
+          selection.pivot === null ? null : frozenPivot(selection.pivot),
         error: null,
-      });
+      }));
       return { value, selection };
-    } catch (error) {
+    } catch {
       // Compilation failure is evidence for a future explicit pivot; compile()
       // never retries another profile without a new selection request.
-      this.#metrics.push({
+      this.#metrics.push(Object.freeze({
         kernelId: selection.kernel.id,
-        key: { ...selection.kernel.key },
+        key: frozenKey(selection.kernel.key),
         status: "error",
         durationMs: Math.max(0, this.#clock() - started),
-        pivot: selection.pivot,
-        error: sanitizeError(error),
-      });
-      throw error;
+        pivot:
+          selection.pivot === null ? null : frozenPivot(selection.pivot),
+        error: Object.freeze({
+          code: "KERNEL_COMPILE_FAILED" as const,
+          message: "Kernel compilation failed",
+        }),
+      }));
+      throw diagnosticError(
+        "KERNEL_COMPILE_FAILED",
+        "Kernel compilation failed",
+      );
     }
   }
 
   pivotRecords(): readonly KernelPivot[] {
-    return this.#pivots.map((pivot) => ({ ...pivot }));
+    return Object.freeze(
+      this.#pivots.map((pivot) => frozenPivot(pivot)),
+    );
   }
 
   compilationMetrics(): readonly CompilationMetric[] {
-    return this.#metrics.map((metric) => ({
-      ...metric,
-      key: { ...metric.key },
-      pivot: metric.pivot === null ? null : { ...metric.pivot },
-      error: metric.error === null ? null : { ...metric.error },
-    }));
+    return Object.freeze(
+      this.#metrics.map((metric) =>
+        Object.freeze({
+          ...metric,
+          key: frozenKey(metric.key),
+          pivot:
+            metric.pivot === null ? null : frozenPivot(metric.pivot),
+          error:
+            metric.error === null
+              ? null
+              : Object.freeze({ ...metric.error }),
+        }),
+      ),
+    );
   }
 }

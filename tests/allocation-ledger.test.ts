@@ -6,9 +6,17 @@ import { AllocationLedger } from "../src/allocation-ledger.js";
 test("reserves and releases bytes atomically by category", () => {
   const ledger = new AllocationLedger(100n);
 
-  ledger.reserve({ id: "weights", category: "model", bytes: 60n });
-  ledger.reserve({ id: "work", category: "scratch", bytes: 20n });
-  ledger.release("weights");
+  const weights = ledger.reserve({
+    id: "weights",
+    category: "model",
+    bytes: 60n,
+  });
+  const work = ledger.reserve({
+    id: "work",
+    category: "scratch",
+    bytes: 20n,
+  });
+  ledger.release(weights);
 
   assert.deepEqual(ledger.snapshot(), {
     limitBytes: 100n,
@@ -17,7 +25,7 @@ test("reserves and releases bytes atomically by category", () => {
     currentByCategory: { scratch: 20n },
     allocationCount: 1,
   });
-  ledger.release("work");
+  ledger.release(work);
   assert.doesNotThrow(() => ledger.assertAllReleased());
 });
 
@@ -28,7 +36,7 @@ test("rejects over-limit, duplicate, negative, and double-release operations", (
     () => ledger.reserve({ id: "negative", category: "model", bytes: -1n }),
     /greater than zero/i,
   );
-  ledger.reserve({ id: "one", category: "model", bytes: 48n });
+  const one = ledger.reserve({ id: "one", category: "model", bytes: 48n });
   assert.throws(
     () => ledger.reserve({ id: "one", category: "upload", bytes: 1n }),
     /duplicate/i,
@@ -38,13 +46,52 @@ test("rejects over-limit, duplicate, negative, and double-release operations", (
     /limit/i,
   );
   assert.equal(ledger.snapshot().currentBytes, 48n);
-  ledger.release("one");
-  assert.throws(() => ledger.release("one"), /not reserved|already released/i);
+  ledger.release(one);
+  assert.throws(() => ledger.release(one), /stale|already released/i);
 });
 
-test("reports unreleased ownership", () => {
+test("allows a released stable id to be reused but rejects stale handles", () => {
   const ledger = new AllocationLedger(64n);
-  ledger.reserve({ id: "live", category: "activation", bytes: 8n });
+  const first = ledger.reserve({ id: "scratch", category: "scratch", bytes: 8n });
+  ledger.release(first);
 
-  assert.throws(() => ledger.assertAllReleased(), /live.*8 bytes/i);
+  const second = ledger.reserve({
+    id: "scratch",
+    category: "scratch",
+    bytes: 16n,
+  });
+
+  assert.throws(() => ledger.release(first), /stale|already released/i);
+  assert.equal(ledger.snapshot().currentBytes, 16n);
+  ledger.release(second);
+  ledger.assertAllReleased();
+});
+
+test("redacts allocation ids from duplicate and leak diagnostics", () => {
+  const ledger = new AllocationLedger(64n);
+  const privateId = "local-path:<path>/<tensor-id>.gguf";
+  ledger.reserve({ id: privateId, category: "activation", bytes: 8n });
+
+  assert.throws(
+    () =>
+      ledger.reserve({
+        id: privateId,
+        category: "activation",
+        bytes: 8n,
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.doesNotMatch(error.message, /local-path|tensor-id|gguf/i);
+      return true;
+    },
+  );
+  assert.throws(
+    () => ledger.assertAllReleased(),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.match(error.message, /1.*activation/i);
+      assert.doesNotMatch(error.message, /local-path|tensor-id|gguf/i);
+      return true;
+    },
+  );
 });

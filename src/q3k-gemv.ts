@@ -9,6 +9,7 @@ export const Q3K_GEMV_ABI = {
   wordsPerBlock: 28,
   valuesPerBlock: Q3_K_ELEMENTS_PER_BLOCK,
   workgroupSize: 1,
+  uniformWords: 5,
   bindings: {
     packedWeights: 0,
     activation: 1,
@@ -27,10 +28,11 @@ const WORDS_PER_BLOCK: u32 = 28u;
 const VALUES_PER_BLOCK: u32 = 256u;
 
 struct GemvUniforms {
-  rows: u32,
+  local_rows: u32,
   columns: u32,
   blocks_per_row: u32,
   weight_word_offset: u32,
+  output_row_offset: u32,
 }
 
 @group(0) @binding(0) var<storage, read> packed_weights: array<u32>;
@@ -93,7 +95,7 @@ fn q3k_gemv(
   @builtin(num_workgroups) grid: vec3<u32>,
 ) {
   let row = invocation.y * grid.x + invocation.x;
-  if (row >= params.rows) {
+  if (row >= params.local_rows) {
     return;
   }
   var sum = 0.0f;
@@ -105,15 +107,27 @@ fn q3k_gemv(
       sum += q3_value(block_word, element) * activation[activation_index];
     }
   }
-  output[row] = sum;
+  output[params.output_row_offset + row] = sum;
 }
 `;
 
-export interface Q3KGemvShape {
+export interface Q3KGemvDispatchShape {
+  readonly localRows: number;
+  readonly columns: number;
+  readonly packedByteOffset?: number;
+  readonly outputRowOffset?: number;
+  readonly maxWorkgroupsPerDimension?: number;
+}
+
+export interface Q3KMatrixShape {
   readonly rows: number;
   readonly columns: number;
   readonly packedByteOffset?: number;
-  readonly maxWorkgroupsPerDimension?: number;
+}
+
+export interface Q3KLogicalShard {
+  readonly logicalByteOffset: bigint;
+  readonly logicalByteLength: bigint;
 }
 
 function requireU32(value: number, label: string, allowZero = false): void {
@@ -129,20 +143,25 @@ function requireU32(value: number, label: string, allowZero = false): void {
   }
 }
 
-export function planQ3KGemvDispatch(shape: Q3KGemvShape): {
+export interface Q3KGemvDispatchPlan {
   readonly workgroups: {
     readonly x: number;
     readonly y: number;
     readonly z: 1;
   };
   readonly uniforms: {
-    readonly rows: number;
+    readonly localRows: number;
     readonly columns: number;
     readonly blocksPerRow: number;
     readonly weightWordOffset: number;
+    readonly outputRowOffset: number;
   };
-} {
-  requireU32(shape.rows, "Q3_K GEMV rows");
+}
+
+export function planQ3KGemvDispatch(
+  shape: Q3KGemvDispatchShape,
+): Q3KGemvDispatchPlan {
+  requireU32(shape.localRows, "Q3_K GEMV localRows");
   requireU32(shape.columns, "Q3_K GEMV columns");
   if (shape.columns % Q3_K_ELEMENTS_PER_BLOCK !== 0) {
     throw new Error("Q3_K GEMV columns must be a multiple of 256");
@@ -158,14 +177,25 @@ export function planQ3KGemvDispatch(shape: Q3KGemvShape): {
   const blocksPerRow = shape.columns / Q3_K_ELEMENTS_PER_BLOCK;
   const weightWordOffset = packedByteOffset / 4;
   requireU32(weightWordOffset, "Q3_K packed word offset", true);
+  const outputRowOffset = shape.outputRowOffset ?? 0;
+  requireU32(outputRowOffset, "Q3_K output row offset", true);
+  if (
+    BigInt(outputRowOffset) + BigInt(shape.localRows) >
+    0x1_0000_0000n
+  ) {
+    throw new Error("Q3_K output rows exceed u32 shader addressing");
+  }
   const maxWorkgroupsPerDimension =
     shape.maxWorkgroupsPerDimension ?? 65_535;
   requireU32(
     maxWorkgroupsPerDimension,
     "Q3_K max workgroups per dimension",
   );
-  const workgroupsX = Math.min(shape.rows, maxWorkgroupsPerDimension);
-  const workgroupsY = Math.ceil(shape.rows / workgroupsX);
+  const workgroupsX = Math.min(
+    shape.localRows,
+    maxWorkgroupsPerDimension,
+  );
+  const workgroupsY = Math.ceil(shape.localRows / workgroupsX);
   if (workgroupsY > maxWorkgroupsPerDimension) {
     throw new Error(
       "Q3_K row dispatch exceeds the two-dimensional device limit",
@@ -174,7 +204,7 @@ export function planQ3KGemvDispatch(shape: Q3KGemvShape): {
 
   const lastWord =
     BigInt(weightWordOffset) +
-    BigInt(shape.rows) * BigInt(blocksPerRow) *
+    BigInt(shape.localRows) * BigInt(blocksPerRow) *
       BigInt(Q3K_GEMV_ABI.wordsPerBlock);
   if (lastWord > 0x1_0000_0000n) {
     throw new Error("Q3_K packed extent exceeds u32 shader addressing");
@@ -183,12 +213,75 @@ export function planQ3KGemvDispatch(shape: Q3KGemvShape): {
   return {
     workgroups: { x: workgroupsX, y: workgroupsY, z: 1 },
     uniforms: {
-      rows: shape.rows,
+      localRows: shape.localRows,
       columns: shape.columns,
       blocksPerRow,
       weightWordOffset,
+      outputRowOffset,
     },
   };
+}
+
+export function planQ3KMatrixShardDispatch(input: {
+  readonly rows: number;
+  readonly columns: number;
+  readonly shards: readonly Q3KLogicalShard[];
+  readonly maxWorkgroupsPerDimension?: number;
+}): readonly (Q3KGemvDispatchPlan & { readonly shardIndex: number })[] {
+  requireU32(input.rows, "Q3_K matrix rows");
+  requireU32(input.columns, "Q3_K matrix columns");
+  if (input.columns % Q3_K_ELEMENTS_PER_BLOCK !== 0) {
+    throw new Error("Q3_K matrix columns must be a multiple of 256");
+  }
+  const blocksPerRow = input.columns / Q3_K_ELEMENTS_PER_BLOCK;
+  const rowBytes =
+    BigInt(blocksPerRow) * BigInt(WEBGPU_Q3_K_BLOCK_BYTES);
+  const expectedBytes = BigInt(input.rows) * rowBytes;
+  let nextByteOffset = 0n;
+  let nextOutputRow = 0;
+  const plans: Array<
+    Q3KGemvDispatchPlan & { readonly shardIndex: number }
+  > = [];
+
+  for (const [shardIndex, shard] of input.shards.entries()) {
+    // Each shard is bound as its own packed-weight buffer. Therefore its
+    // shader-local weight offset is zero, while outputRowOffset preserves the
+    // matrix-global output position.
+    if (
+      shard.logicalByteOffset !== nextByteOffset ||
+      shard.logicalByteLength <= 0n ||
+      shard.logicalByteOffset % BigInt(WEBGPU_Q3_K_BLOCK_BYTES) !== 0n ||
+      shard.logicalByteLength % BigInt(WEBGPU_Q3_K_BLOCK_BYTES) !== 0n ||
+      shard.logicalByteOffset % rowBytes !== 0n ||
+      shard.logicalByteLength % rowBytes !== 0n
+    ) {
+      throw new Error(
+        "Q3_K matrix shards must be contiguous whole rows and blocks",
+      );
+    }
+    const localRowsBig = shard.logicalByteLength / rowBytes;
+    if (localRowsBig > BigInt(0xffff_ffff)) {
+      throw new Error("Q3_K matrix shard row count exceeds u32");
+    }
+    const plan = planQ3KGemvDispatch({
+      localRows: Number(localRowsBig),
+      columns: input.columns,
+      outputRowOffset: nextOutputRow,
+      ...(input.maxWorkgroupsPerDimension === undefined
+        ? {}
+        : {
+            maxWorkgroupsPerDimension:
+              input.maxWorkgroupsPerDimension,
+          }),
+    });
+    plans.push(Object.freeze({ shardIndex, ...plan }));
+    nextByteOffset += shard.logicalByteLength;
+    nextOutputRow += Number(localRowsBig);
+  }
+  if (nextByteOffset !== expectedBytes || nextOutputRow !== input.rows) {
+    throw new Error("Q3_K matrix shards do not cover the complete matrix");
+  }
+  return Object.freeze(plans);
 }
 
 /**
@@ -198,9 +291,15 @@ export function planQ3KGemvDispatch(shape: Q3KGemvShape): {
 export function q3kGemvCpu(
   packedWeights: Uint8Array,
   activation: Float32Array,
-  shape: Q3KGemvShape,
+  shape: Q3KMatrixShape,
 ): Float32Array {
-  const plan = planQ3KGemvDispatch(shape);
+  const plan = planQ3KGemvDispatch({
+    localRows: shape.rows,
+    columns: shape.columns,
+    ...(shape.packedByteOffset === undefined
+      ? {}
+      : { packedByteOffset: shape.packedByteOffset }),
+  });
   if (activation.length !== shape.columns) {
     throw new Error(
       `Q3_K GEMV activation length must equal ${shape.columns}`,
