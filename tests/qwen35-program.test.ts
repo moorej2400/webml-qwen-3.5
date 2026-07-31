@@ -134,6 +134,18 @@ test("rejects architecture, shape metadata, MTP policy, and product context drif
 test("uses provenance-pinned parsed GGUF metadata and tensor facts", () => {
   assert.equal(PINNED_QWEN35_GGUF_FIXTURE.provenance.revision.length, 40);
   assert.equal(PINNED_QWEN35_GGUF_FIXTURE.provenance.sha256.length, 64);
+  assert.equal(
+    PINNED_QWEN35_GGUF_FIXTURE.tensors.find(
+      (tensor) => tensor.name === "blk.3.attn_q.weight",
+    )?.type,
+    GgmlType.Q6_K,
+  );
+  assert.equal(
+    PINNED_QWEN35_GGUF_FIXTURE.tensors.find(
+      (tensor) => tensor.name === "blk.32.nextn.eh_proj.weight",
+    )?.type,
+    GgmlType.Q8_0,
+  );
   assert.deepEqual(
     PINNED_QWEN35_GGUF_FIXTURE.tensors.find(
       (tensor) => tensor.name === "blk.0.ssm_conv1d.weight",

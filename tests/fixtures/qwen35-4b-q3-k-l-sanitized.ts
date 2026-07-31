@@ -62,13 +62,13 @@ export const PINNED_QWEN35_GGUF_FIXTURE = Object.freeze({
     Object.freeze({
       name: "blk.3.attn_q.weight",
       dimensions: Object.freeze([2_560n, 8_192n]),
-      type: GgmlType.Q3_K,
+      type: GgmlType.Q6_K,
       offset: 0n,
     }),
     Object.freeze({
-      name: "blk.32.eh_proj.weight",
+      name: "blk.32.nextn.eh_proj.weight",
       dimensions: Object.freeze([5_120n, 2_560n]),
-      type: GgmlType.Q3_K,
+      type: GgmlType.Q8_0,
       offset: 0n,
     }),
   ] satisfies readonly GgufTensorInfo[]),
