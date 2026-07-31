@@ -5,6 +5,14 @@ import { AllocationLedger } from "../src/allocation-ledger.js";
 import { GpuArena } from "../src/gpu-arena.js";
 import { planQ3KMatrixShardDispatch } from "../src/q3k-gemv.js";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 function fakeDevice(options?: {
   readonly maxBufferSize?: number;
   readonly maxStorageBufferBindingSize?: number;
@@ -397,6 +405,112 @@ test("rolls back every buffer after asynchronous validation or OOM errors", asyn
     assert.deepEqual(fake.poppedScopes, ["out-of-memory", "validation"]);
     ledger.assertAllReleased();
   }
+});
+
+test("keeps overlapping allocations paired with their own device error scopes", async () => {
+  type ScopeResult = { readonly message: string } | null;
+  const allocationAOom = deferred<ScopeResult>();
+  const allocationBOom = deferred<ScopeResult>();
+  const thirdPopObserved = deferred<void>();
+  const scopePlans = [
+    {
+      filter: "validation" as const,
+      result: Promise.resolve<ScopeResult>(null),
+    },
+    { filter: "out-of-memory" as const, result: allocationAOom.promise },
+    {
+      filter: "validation" as const,
+      result: Promise.resolve<ScopeResult>({
+        message: "allocation B validation error",
+      }),
+    },
+    { filter: "out-of-memory" as const, result: allocationBOom.promise },
+  ];
+  const scopeStack: typeof scopePlans = [];
+  const popOrder: number[] = [];
+  const buffers: Array<{ destroyCount: number; destroy(): void }> = [];
+  let nextScope = 0;
+  const device = {
+    limits: {
+      maxBufferSize: 64,
+      maxStorageBufferBindingSize: 64,
+    },
+    pushErrorScope(filter: "validation" | "out-of-memory") {
+      const scope = scopePlans[nextScope];
+      assert.ok(scope);
+      assert.equal(filter, scope.filter);
+      scopeStack.push(scope);
+      nextScope += 1;
+    },
+    popErrorScope() {
+      const scope = scopeStack.pop();
+      assert.ok(scope);
+      const scopeIndex = scopePlans.indexOf(scope);
+      popOrder.push(scopeIndex);
+      if (popOrder.length === 3) {
+        thirdPopObserved.resolve();
+      }
+      return scope.result;
+    },
+    createBuffer() {
+      const buffer = {
+        destroyCount: 0,
+        destroy() {
+          this.destroyCount += 1;
+        },
+      };
+      buffers.push(buffer);
+      return buffer;
+    },
+  };
+  const ledger = new AllocationLedger(64n);
+  const arena = new GpuArena(device, ledger, {
+    bufferShardCapBytes: 64n,
+  });
+
+  const allocationAPromise = arena.allocate({
+    id: "allocation-a",
+    category: "model",
+    byteLength: 16n,
+    usage: 128,
+    alignment: 4,
+  });
+  const allocationBPromise = arena.allocate({
+    id: "allocation-b",
+    category: "activation",
+    byteLength: 16n,
+    usage: 128,
+    alignment: 4,
+  });
+
+  // Resolve A while B is still waiting. A must not be able to pop B's
+  // validation scope from the device-wide stack.
+  allocationAOom.resolve(null);
+  await thirdPopObserved.promise;
+  allocationBOom.resolve(null);
+  const outcomes = await Promise.allSettled([
+    allocationAPromise,
+    allocationBPromise,
+  ]);
+  const preCleanupDestroyCounts = buffers.map(
+    ({ destroyCount }) => destroyCount,
+  );
+  const preCleanupLedger = ledger.snapshot();
+  for (const outcome of outcomes) {
+    if (outcome.status === "fulfilled") {
+      outcome.value.destroy();
+    }
+  }
+  ledger.assertAllReleased();
+
+  assert.deepEqual(popOrder, [1, 0, 3, 2]);
+  assert.deepEqual(
+    outcomes.map(({ status }) => status),
+    ["fulfilled", "rejected"],
+  );
+  assert.deepEqual(preCleanupDestroyCounts, [0, 1]);
+  assert.deepEqual(preCleanupLedger.currentByCategory, { model: 16n });
+  assert.equal(preCleanupLedger.allocationCount, 1);
 });
 
 test("releases ledger ownership without exposing buffer destruction errors", async () => {

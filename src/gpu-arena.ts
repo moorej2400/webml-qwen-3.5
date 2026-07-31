@@ -193,6 +193,12 @@ export class GpuArena {
     let scopeFailed = false;
     let outOfMemoryError: { readonly message?: string } | null = null;
     let validationError: { readonly message?: string } | null = null;
+    let outOfMemoryResult:
+      | Promise<{ readonly message?: string } | null>
+      | undefined;
+    let validationResult:
+      | Promise<{ readonly message?: string } | null>
+      | undefined;
     try {
       this.#device.pushErrorScope("validation");
       scopesPushed = 1;
@@ -232,18 +238,32 @@ export class GpuArena {
       creationFailed = true;
     }
 
-    // WebGPU reports createBuffer validation and OOM failures asynchronously.
-    // Pop both scopes before transferring ownership to the returned allocation.
+    // Error scopes share one device-wide stack. Capture both pops synchronously;
+    // awaiting between them lets another allocation steal the outer scope.
     if (scopesPushed === 2) {
       try {
-        outOfMemoryError = await this.#device.popErrorScope();
+        outOfMemoryResult = this.#device.popErrorScope();
       } catch {
         scopeFailed = true;
       }
     }
     if (scopesPushed >= 1) {
       try {
-        validationError = await this.#device.popErrorScope();
+        validationResult = this.#device.popErrorScope();
+      } catch {
+        scopeFailed = true;
+      }
+    }
+    if (outOfMemoryResult !== undefined) {
+      try {
+        outOfMemoryError = await outOfMemoryResult;
+      } catch {
+        scopeFailed = true;
+      }
+    }
+    if (validationResult !== undefined) {
+      try {
+        validationError = await validationResult;
       } catch {
         scopeFailed = true;
       }
