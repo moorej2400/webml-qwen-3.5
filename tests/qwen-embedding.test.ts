@@ -63,6 +63,7 @@ test("plans a direct packed row read without expanding the token table", () => {
       tokenId: 17,
       vocabSize: 248_320,
       embeddingLength: 2_560,
+      maxComputeWorkgroupsPerDimension: 65_535,
     }),
     {
       storageType: "q6-k-212",
@@ -71,6 +72,45 @@ test("plans a direct packed row read without expanding the token table", () => {
       outputElements: 2_560,
       workgroups: { x: 10, y: 1, z: 1 },
     },
+  );
+});
+
+test("rejects shader u32 overflow and device dispatch overflow", () => {
+  assert.throws(
+    () =>
+      planPackedEmbeddingRow({
+        ggmlType: GgmlType.F32,
+        storageType: "f32",
+        tokenId: 0,
+        vocabSize: 1,
+        embeddingLength: 2 ** 32,
+        maxComputeWorkgroupsPerDimension: 65_535,
+      }),
+    /embedding length.*u32/i,
+  );
+  assert.throws(
+    () =>
+      planPackedEmbeddingRow({
+        ggmlType: GgmlType.F32,
+        storageType: "f32",
+        tokenId: 0,
+        vocabSize: 1,
+        embeddingLength: 512,
+        maxComputeWorkgroupsPerDimension: 1,
+      }),
+    /workgroups.*device limit/i,
+  );
+  assert.throws(
+    () =>
+      planPackedEmbeddingRow({
+        ggmlType: GgmlType.F32,
+        storageType: "f32",
+        tokenId: 0,
+        vocabSize: 1,
+        embeddingLength: 256,
+        maxComputeWorkgroupsPerDimension: 2 ** 32,
+      }),
+    /device limit.*u32/i,
   );
 });
 

@@ -143,6 +143,45 @@ test("uses the exact interleaved M-RoPE owners and split-half rotation", () => {
   );
 });
 
+test("matches WGSL f32 M-RoPE arithmetic at the product context boundary", () => {
+  const input = Float32Array.from(
+    { length: 256 },
+    (_, index) => Math.fround(((index * 19) % 31 - 15) / 7),
+  );
+  const actual = partialMropeCpu(input, {
+    headCount: 1,
+    headDimension: 256,
+    rotaryDimension: 64,
+    sections: [11, 11, 10],
+    positions: [16_384, 16_383, 16_382],
+    theta: 10_000_000,
+  });
+  const exponent = Math.fround(Math.fround(2) / Math.fround(64));
+  const divisor = Math.fround(Math.pow(Math.fround(10_000_000), exponent));
+  const angle = Math.fround(Math.fround(16_383) / divisor);
+  const tau = Math.fround(2 * Math.PI);
+  const turns = Math.floor(Math.fround(angle / tau));
+  const reducedAngle = Math.fround(
+    angle - Math.fround(Math.fround(turns) * tau),
+  );
+  const cosine = Math.fround(Math.cos(reducedAngle));
+  const sine = Math.fround(Math.sin(reducedAngle));
+  assert.equal(
+    actual[1],
+    Math.fround(
+      Math.fround(input[1]! * cosine) -
+        Math.fround(input[33]! * sine),
+    ),
+  );
+  assert.equal(
+    actual[33],
+    Math.fround(
+      Math.fround(input[33]! * cosine) +
+        Math.fround(input[1]! * sine),
+    ),
+  );
+});
+
 test("merges tiled top-k with stable ties and explicit non-finite handling", () => {
   assert.deepEqual(
     stableTiledTopK(
@@ -163,6 +202,13 @@ test("merges tiled top-k with stable ties and explicit non-finite handling", () 
     ],
   );
   assert.throws(() => stableTiledTopK([], 0), /positive/i);
+  assert.deepEqual(
+    stableTiledTopK(
+      [{ startIndex: 7, scores: Float32Array.of(Number.NaN, 3, Infinity) }],
+      4,
+    ),
+    [{ index: 8, score: 3 }],
+  );
 });
 
 test("defines typed WGSL ABIs, dispatches, and phase-profile registry entries", () => {
@@ -204,6 +250,13 @@ test("defines typed WGSL ABIs, dispatches, and phase-profile registry entries", 
     QWEN_PRIMITIVE_KERNELS.find((kernel) => kernel.operation === "top-k-merge")!.source,
     /bitcast<u32>.*0x7f800000u/,
   );
+  const topKKernel = QWEN_PRIMITIVE_KERNELS.find(
+    (kernel) => kernel.operation === "top-k-merge",
+  )!;
+  assert.equal(topKKernel.abi.bindings.outputValidCount, 3);
+  assert.equal(topKKernel.abi.bindings.uniforms, 4);
+  assert.match(topKKernel.source, /if \(!found\) \{ break; \}/);
+  assert.match(topKKernel.source, /output_valid_count\[0\] = valid_count/);
 
   assert.deepEqual(
     planPrimitiveDispatch({ operation: "residual-add", elementCount: 257 }).workgroups,

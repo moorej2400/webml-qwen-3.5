@@ -10,8 +10,22 @@ import {
   repackNativeQ8_0,
 } from "../dist/src/mixed-quant.js";
 import { repackNativeQ3K } from "../dist/src/q3k.js";
-import { QWEN_PRIMITIVE_KERNELS } from "../dist/src/qwen-primitives.js";
-import { PACKED_EMBEDDING_KERNELS } from "../dist/src/qwen-embedding.js";
+import {
+  QWEN_PRIMITIVE_KERNELS,
+  attentionOutputGateCpu,
+  fusedSwiGluCpu,
+  partialMropeCpu,
+  qkRmsNormPerHeadCpu,
+  residualAddCpu,
+  rmsNormCpu,
+  siluCpu,
+  stableTiledTopK,
+} from "../dist/src/qwen-primitives.js";
+import {
+  PACKED_EMBEDDING_KERNELS,
+  embeddingCpu,
+  planPackedEmbeddingRow,
+} from "../dist/src/qwen-embedding.js";
 import { validateParity } from "./webgpu-parity.mjs";
 
 function deterministicBytes(length, seed) {
@@ -213,9 +227,9 @@ async function runKernel(device, kernel) {
   };
 }
 
-async function compilePrimitive(device, kernel) {
+async function createPipeline(device, kernel) {
   const module = device.createShaderModule({
-    label: `primitive-compile-${kernel.id}`,
+    label: kernel.id,
     code: kernel.source,
   });
   const compilation = await module.getCompilationInfo();
@@ -227,11 +241,459 @@ async function compilePrimitive(device, kernel) {
       `${kernel.id}: ${errors.map((message) => message.message).join("; ")}`,
     );
   }
-  await device.createComputePipelineAsync({
+  return device.createComputePipelineAsync({
     layout: "auto",
     compute: { module, entryPoint: "main" },
   });
-  return { id: kernel.id, status: "compiled" };
+}
+
+function floatBytes(values) {
+  return new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+}
+
+function uintBytes(values) {
+  return new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+}
+
+function paramsBytes(byteLength, writes) {
+  const bytes = new Uint8Array(byteLength);
+  const view = new DataView(bytes.buffer);
+  for (const [kind, offset, value] of writes) {
+    view[kind](offset, value, true);
+  }
+  return bytes;
+}
+
+async function dispatchAndRead(
+  device,
+  kernel,
+  entries,
+  outputs,
+  workgroups,
+) {
+  const pipeline = await createPipeline(device, kernel);
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries,
+  });
+  const readbacks = outputs.map(({ byteLength }) =>
+    device.createBuffer({
+      size: byteLength,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    }),
+  );
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(workgroups.x, workgroups.y, workgroups.z);
+  pass.end();
+  outputs.forEach(({ buffer, byteLength }, index) => {
+    encoder.copyBufferToBuffer(buffer, 0, readbacks[index], 0, byteLength);
+  });
+  device.queue.submit([encoder.finish()]);
+  const result = [];
+  for (const readback of readbacks) {
+    await readback.mapAsync(GPUMapMode.READ);
+    result.push(readback.getMappedRange().slice(0));
+    readback.unmap();
+  }
+  for (const buffer of new Set([
+    ...entries.map((entry) => entry.resource.buffer),
+    ...readbacks,
+  ])) {
+    buffer.destroy();
+  }
+  return result;
+}
+
+function outputFixture(cpuValues, sentinel = -12_345.5) {
+  const outputRowOffset = 64;
+  const expected = new Float32Array(
+    outputRowOffset + cpuValues.length + 1,
+  ).fill(sentinel);
+  expected.set(cpuValues, outputRowOffset);
+  return {
+    expected,
+    initial: new Float32Array(expected.length).fill(sentinel),
+    outputRowOffset,
+  };
+}
+
+function vectorPrimitiveFixture(operation) {
+  const input = Float32Array.of(3, -4, 0.5, -2);
+  switch (operation) {
+    case "rms-norm": {
+      const weight = Float32Array.of(1, 0.75, 1.25, 0.5);
+      return {
+        inputs: [input, weight],
+        expected: rmsNormCpu(input, weight, Math.fround(1e-6)),
+        params: paramsBytes(16, [
+          ["setUint32", 0, input.length],
+          ["setUint32", 4, input.length],
+          ["setFloat32", 8, Math.fround(1e-6)],
+        ]),
+      };
+    }
+    case "residual-add": {
+      const residual = Float32Array.of(-1, 2, 3, -4);
+      return {
+        inputs: [input, residual],
+        expected: residualAddCpu(input, residual),
+        params: uintBytes(Uint32Array.of(input.length, 0, 0, 0)),
+      };
+    }
+    case "silu":
+      return {
+        inputs: [input],
+        expected: Float32Array.from(input, siluCpu),
+        params: uintBytes(Uint32Array.of(input.length, 0, 0, 0)),
+      };
+    case "swiglu": {
+      const up = Float32Array.of(2, 0.5, -3, 4);
+      return {
+        inputs: [input, up],
+        expected: fusedSwiGluCpu(input, up),
+        params: uintBytes(Uint32Array.of(input.length, 0, 0, 0)),
+      };
+    }
+    case "attention-output-gate": {
+      const gate = Float32Array.of(0, 1, -1, 2);
+      return {
+        inputs: [input, gate],
+        expected: attentionOutputGateCpu(input, gate),
+        params: uintBytes(Uint32Array.of(input.length, 0, 0, 0)),
+      };
+    }
+    case "qk-rms-norm": {
+      const weight = Float32Array.of(1, 0.75);
+      return {
+        inputs: [input, weight],
+        expected: qkRmsNormPerHeadCpu(input, weight, {
+          headCount: 2,
+          headDimension: 2,
+          epsilon: Math.fround(1e-6),
+        }),
+        params: paramsBytes(16, [
+          ["setUint32", 0, input.length],
+          ["setUint32", 4, 2],
+          ["setFloat32", 8, Math.fround(1e-6)],
+        ]),
+      };
+    }
+    default:
+      throw new Error(`No vector fixture for ${operation}`);
+  }
+}
+
+async function runVectorPrimitive(device, kernel) {
+  const fixture = vectorPrimitiveFixture(kernel.operation);
+  const output = outputFixture(fixture.expected);
+  const outputBuffer = storageBuffer(
+    device,
+    floatBytes(output.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const inputBuffers = fixture.inputs.map((input) =>
+    storageBuffer(device, floatBytes(input), GPUBufferUsage.STORAGE),
+  );
+  const uniformBuffer = storageBuffer(
+    device,
+    fixture.params,
+    GPUBufferUsage.UNIFORM,
+  );
+  const entries = inputBuffers.map((buffer, binding) => ({
+    binding,
+    resource: { buffer },
+  }));
+  const outputBinding = kernel.abi.bindings.output;
+  entries.push({
+    binding: outputBinding,
+    resource: {
+      buffer: outputBuffer,
+      offset: output.outputRowOffset * 4,
+      size: (fixture.expected.length + 1) * 4,
+    },
+  });
+  entries.push({
+    binding: kernel.abi.bindings.uniforms,
+    resource: { buffer: uniformBuffer },
+  });
+  const [actualBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    entries,
+    [{ buffer: outputBuffer, byteLength: output.expected.byteLength }],
+    { x: 1, y: 1, z: 1 },
+  );
+  const actual = new Float32Array(actualBytes);
+  validateParity(kernel.id, output.expected, actual);
+  return {
+    id: kernel.id,
+    status: "executed",
+    outputRowOffset: output.outputRowOffset,
+  };
+}
+
+async function runMropePrimitive(device, kernel) {
+  const input = Float32Array.from(
+    { length: 256 },
+    (_, index) => Math.fround(((index * 19) % 31 - 15) / 7),
+  );
+  const positions = [16_384, 16_383, 16_382];
+  const expectedValues = partialMropeCpu(input, {
+    headCount: 1,
+    headDimension: 256,
+    rotaryDimension: 64,
+    sections: [11, 11, 10],
+    positions: [16_384, 16_383, 16_382],
+    theta: 10_000_000,
+  });
+  const output = outputFixture(expectedValues);
+  const inputBuffer = storageBuffer(
+    device,
+    floatBytes(input),
+    GPUBufferUsage.STORAGE,
+  );
+  const outputBuffer = storageBuffer(
+    device,
+    floatBytes(output.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const sectionsBuffer = storageBuffer(
+    device,
+    uintBytes(Uint32Array.of(11, 11, 10)),
+    GPUBufferUsage.STORAGE,
+  );
+  const positionsBuffer = storageBuffer(
+    device,
+    uintBytes(Uint32Array.from(positions)),
+    GPUBufferUsage.STORAGE,
+  );
+  const uniformBuffer = storageBuffer(
+    device,
+    paramsBytes(32, [
+      ["setUint32", 0, input.length],
+      ["setUint32", 4, 256],
+      ["setUint32", 8, 64],
+      ["setUint32", 12, 32],
+      ["setFloat32", 16, 10_000_000],
+    ]),
+    GPUBufferUsage.UNIFORM,
+  );
+  const [actualBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      { binding: 0, resource: { buffer: inputBuffer } },
+      {
+        binding: 1,
+        resource: {
+          buffer: outputBuffer,
+          offset: output.outputRowOffset * 4,
+          size: (expectedValues.length + 1) * 4,
+        },
+      },
+      { binding: 2, resource: { buffer: sectionsBuffer } },
+      { binding: 3, resource: { buffer: positionsBuffer } },
+      { binding: 4, resource: { buffer: uniformBuffer } },
+    ],
+    [{ buffer: outputBuffer, byteLength: output.expected.byteLength }],
+    { x: 1, y: 1, z: 1 },
+  );
+  const actual = new Float32Array(actualBytes);
+  // Portable WebGPU trigonometric built-ins are approximate even after both
+  // paths use the same explicit f32 range reduction.
+  validateParity(kernel.id, output.expected, actual, 1e-3);
+  return {
+    id: kernel.id,
+    status: "executed",
+    positions: [16_384, 16_383, 16_382],
+    outputRowOffset: output.outputRowOffset,
+  };
+}
+
+async function runTopKPrimitive(device, kernel) {
+  const scores = Float32Array.of(Number.NaN, 5, 5, Infinity, -2);
+  const k = 4;
+  const cpu = stableTiledTopK([{ startIndex: 0, scores }], k);
+  const sentinel = -12_345.5;
+  const outputRowOffset = 64;
+  const expectedScores = new Float32Array(outputRowOffset + k + 1).fill(
+    sentinel,
+  );
+  const expectedIndices = new Uint32Array(outputRowOffset + k + 1).fill(
+    0xffff_ffff,
+  );
+  cpu.forEach((entry, index) => {
+    expectedScores[outputRowOffset + index] = entry.score;
+    expectedIndices[outputRowOffset + index] = entry.index;
+  });
+  const scoreBuffer = storageBuffer(
+    device,
+    floatBytes(scores),
+    GPUBufferUsage.STORAGE,
+  );
+  const outputScores = storageBuffer(
+    device,
+    floatBytes(new Float32Array(expectedScores.length).fill(sentinel)),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const outputIndices = storageBuffer(
+    device,
+    uintBytes(new Uint32Array(expectedIndices.length).fill(0xffff_ffff)),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const validCount = storageBuffer(
+    device,
+    uintBytes(Uint32Array.of(0xffff_ffff)),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const uniforms = storageBuffer(
+    device,
+    uintBytes(Uint32Array.of(scores.length, k, 0, 0)),
+    GPUBufferUsage.UNIFORM,
+  );
+  const bindingSize = (k + 1) * 4;
+  const [scoreBytes, indexBytes, countBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      { binding: 0, resource: { buffer: scoreBuffer } },
+      {
+        binding: 1,
+        resource: {
+          buffer: outputScores,
+          offset: outputRowOffset * 4,
+          size: bindingSize,
+        },
+      },
+      {
+        binding: 2,
+        resource: {
+          buffer: outputIndices,
+          offset: outputRowOffset * 4,
+          size: bindingSize,
+        },
+      },
+      { binding: 3, resource: { buffer: validCount } },
+      { binding: 4, resource: { buffer: uniforms } },
+    ],
+    [
+      { buffer: outputScores, byteLength: expectedScores.byteLength },
+      { buffer: outputIndices, byteLength: expectedIndices.byteLength },
+      { buffer: validCount, byteLength: 4 },
+    ],
+    { x: 1, y: 1, z: 1 },
+  );
+  const actualScores = new Float32Array(scoreBytes);
+  const actualIndices = new Uint32Array(indexBytes);
+  const actualValidCount = new Uint32Array(countBytes)[0];
+  validateParity(kernel.id, expectedScores, actualScores);
+  if (
+    actualValidCount !== cpu.length ||
+    actualIndices.some((value, index) => value !== expectedIndices[index])
+  ) {
+    throw new Error(`${kernel.id}: GPU top-k indices or validCount differ`);
+  }
+  return {
+    id: kernel.id,
+    status: "executed",
+    validCount: actualValidCount,
+    outputRowOffset,
+  };
+}
+
+async function runPrimitive(device, kernel) {
+  if (kernel.operation === "partial-mrope") {
+    return runMropePrimitive(device, kernel);
+  }
+  if (kernel.operation === "top-k-merge") {
+    return runTopKPrimitive(device, kernel);
+  }
+  return runVectorPrimitive(device, kernel);
+}
+
+async function runEmbedding(device, kernel) {
+  const rows = 3;
+  const tokenId = 1;
+  const blocksPerRow = 2;
+  const embeddingLength = kernel.abi.valuesPerBlock * blocksPerRow;
+  const packed = new Uint8Array(
+    rows * blocksPerRow * kernel.abi.bytesPerBlock,
+  );
+  for (let rowIndex = 0; rowIndex < rows; rowIndex += 1) {
+    for (let blockIndex = 0; blockIndex < blocksPerRow; blockIndex += 1) {
+      packed.set(
+        packedFixture(kernel.storageType, rowIndex, blockIndex),
+        (rowIndex * blocksPerRow + blockIndex) * kernel.abi.bytesPerBlock,
+      );
+    }
+  }
+  const plan = planPackedEmbeddingRow({
+    ggmlType: kernel.ggmlType,
+    storageType: kernel.storageType,
+    tokenId,
+    vocabSize: rows,
+    embeddingLength,
+    maxComputeWorkgroupsPerDimension:
+      device.limits.maxComputeWorkgroupsPerDimension,
+  });
+  const expectedValues = embeddingCpu(
+    kernel.storageType,
+    packed,
+    tokenId,
+    { vocabSize: rows, embeddingLength },
+  );
+  const output = outputFixture(expectedValues);
+  const packedBuffer = storageBuffer(
+    device,
+    packed,
+    GPUBufferUsage.STORAGE,
+  );
+  const outputBuffer = storageBuffer(
+    device,
+    floatBytes(output.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const uniforms = storageBuffer(
+    device,
+    uintBytes(
+      Uint32Array.of(
+        plan.packedByteOffset / 4,
+        plan.outputElements,
+        blocksPerRow,
+        0,
+      ),
+    ),
+    GPUBufferUsage.UNIFORM,
+  );
+  const [actualBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      { binding: 0, resource: { buffer: packedBuffer } },
+      {
+        binding: 1,
+        resource: {
+          buffer: outputBuffer,
+          offset: output.outputRowOffset * 4,
+          size: (expectedValues.length + 1) * 4,
+        },
+      },
+      { binding: 2, resource: { buffer: uniforms } },
+    ],
+    [{ buffer: outputBuffer, byteLength: output.expected.byteLength }],
+    plan.workgroups,
+  );
+  const actual = new Float32Array(actualBytes);
+  validateParity(kernel.id, output.expected, actual);
+  return {
+    id: kernel.id,
+    status: "executed",
+    packedByteOffset: plan.packedByteOffset,
+    outputRowOffset: output.outputRowOffset,
+  };
 }
 
 export async function runWebGpuKernelHarness() {
@@ -246,10 +708,10 @@ export async function runWebGpuKernelHarness() {
     results.push(await runKernel(device, kernel));
   }
   for (const kernel of QWEN_PRIMITIVE_KERNELS) {
-    results.push(await compilePrimitive(device, kernel));
+    results.push(await runPrimitive(device, kernel));
   }
   for (const kernel of PACKED_EMBEDDING_KERNELS) {
-    results.push(await compilePrimitive(device, kernel));
+    results.push(await runEmbedding(device, kernel));
   }
   device.destroy();
   return results;

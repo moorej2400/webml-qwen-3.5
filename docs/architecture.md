@@ -34,8 +34,9 @@ offset does not need to be a multiple of the quantization block size. A shader
 guard rejects any 2D invocation whose flattened row index would overflow u32.
 
 `tools/webgpu-kernel-harness.html` is the deterministic browser validation
-surface. It compiles and dispatches every language shader with two blocks per
-row, distinct row data, a 2D grid, and sentinel slots around an output offset.
+surface. It executes every language GEMV, reusable primitive, and packed
+embedding layout against a CPU reference. Fixtures use distinct row data,
+nonzero packed and output offsets, and sentinel slots around each output.
 The parity check rejects non-finite CPU or GPU output before it applies the
 numeric tolerance.
 
@@ -60,14 +61,17 @@ The tensor-directory validator requires all 32 base layers with exact names and
 shapes, including linear-attention convolution weights shaped `[4, 8192]`. It
 rejects unknown base tensors and the `blk.32.*` MTP block. Tensor
 storage is selected independently from the six manifest layouts; quantization
-does not change a logical tensor shape.
+does not change a logical tensor shape. Program construction revalidates every
+configuration field, snapshots tensor entries and shapes, and exposes bindings
+through an immutable lookup facade.
 
 Embedding decodes one packed vocabulary row after checking token and table
 bounds. It never expands the 248,320 by 2,560 table. The same
 `token_embd.weight` allocation owns output logits: logits are tiled,
 row-sharded GEMV consumers, not a duplicate output matrix. The GPU embedding
 family shares the GEMV register decoders for all six layouts and dispatches
-only the selected row.
+only the selected row. Its planner bounds every shader-facing value to u32 and
+rejects a dispatch that exceeds the live device workgroup limit.
 
 Reusable correctness kernels cover FP32-accumulating RMSNorm, residual add,
 SiLU, fused SwiGLU, attention output gating, per-head Q/K RMSNorm, partial
@@ -77,8 +81,10 @@ for the linear-attention gated norm, whose stored weight is directly
 multiplicative. Partial M-RoPE rotates only the first 64 values of each
 256-value head. It uses interleaved temporal-height-width frequency ownership
 for `[11, 11, 10]` and split-half `rotate_half` lanes, then copies lanes 64
-through 255 to the output. Top-k rejects non-finite candidates and breaks
-equal-score ties by vocabulary index.
+through 255 to the output. CPU and WGSL use the same f32 angle arithmetic and
+explicit range reduction at large positions. Top-k rejects non-finite
+candidates, breaks equal-score ties by vocabulary index, and reports a valid
+result count when fewer than `k` finite candidates exist.
 
 The source GGUF advertises a native maximum context of 262,144 tokens. The
 current product contract selects 16,384 tokens and stores the native maximum

@@ -18,7 +18,7 @@ test("rejects non-finite CPU and GPU parity values", () => {
   }
 });
 
-test("ships a deterministic browser compile and CPU parity harness", async () => {
+test("ships a deterministic browser execution and CPU parity harness", async () => {
   const html = await readFile(
     new URL("../tools/webgpu-kernel-harness.html", import.meta.url),
     "utf8",
@@ -29,14 +29,23 @@ test("ships a deterministic browser compile and CPU parity harness", async () =>
   );
 
   assert.match(html, /webgpu-kernel-harness\.mjs/);
+  assert.match(html, /Executes all pinned language kernels/);
+  assert.doesNotMatch(html, /Compiles all pinned language/);
   assert.match(script, /LANGUAGE_GEMV_KERNELS/);
   assert.match(script, /QWEN_PRIMITIVE_KERNELS/);
   assert.match(script, /PACKED_EMBEDDING_KERNELS/);
   assert.match(script, /for \(const kernel of LANGUAGE_GEMV_KERNELS\)/);
   assert.match(script, /for \(const kernel of QWEN_PRIMITIVE_KERNELS\)/);
   assert.match(script, /for \(const kernel of PACKED_EMBEDDING_KERNELS\)/);
-  assert.match(script, /primitive-compile/);
+  assert.doesNotMatch(script, /compilePrimitive/);
   assert.match(script, /results\.push\(await runKernel\(device, kernel\)\)/);
+  assert.match(script, /runPrimitive/);
+  assert.match(script, /runEmbedding/);
+  assert.match(script, /partialMropeCpu/);
+  assert.match(script, /stableTiledTopK/);
+  assert.match(script, /embeddingCpu/);
+  assert.match(script, /positions:\s*\[16_384/);
+  assert.match(script, /validCount/);
   assert.match(script, /getCompilationInfo/);
   assert.match(script, /gemvCpu/);
   assert.match(script, /dispatchWorkgroups/);

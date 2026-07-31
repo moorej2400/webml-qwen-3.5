@@ -1,7 +1,10 @@
 import { GgmlType, type GgmlType as GgmlTypeValue } from "./gguf.js";
 import type { GemvLayout } from "./mixed-gemv.js";
 import { isMtpTensorName } from "./tensor-policy.js";
-import type { Qwen35Config } from "./qwen35-config.js";
+import {
+  assertQwen35Config,
+  type Qwen35Config,
+} from "./qwen35-config.js";
 
 export interface Qwen35TensorDirectoryEntry {
   readonly name: string;
@@ -102,10 +105,22 @@ export interface Qwen35TensorBinding {
   readonly consumers: readonly string[];
 }
 
+/**
+ * Lookup-only facade; a ReadonlyMap type would still expose mutable Map
+ * methods at runtime when callers cast or inspect the returned object.
+ */
+export interface Qwen35TensorBindings
+  extends Iterable<readonly [string, Qwen35TensorBinding]> {
+  readonly size: number;
+  get(name: string): Qwen35TensorBinding | undefined;
+  has(name: string): boolean;
+  entries(): MapIterator<[string, Qwen35TensorBinding]>;
+}
+
 export interface Qwen35Program {
   readonly model: "qwen35-4b";
   readonly invocations: readonly Qwen35Invocation[];
-  readonly tensorBindings: ReadonlyMap<string, Qwen35TensorBinding>;
+  readonly tensorBindings: Qwen35TensorBindings;
 }
 
 const SUPPORTED_LAYOUTS = new Map<GgmlTypeValue, GemvLayout>([
@@ -196,7 +211,13 @@ function validateDirectory(
     if (expectedLayout === undefined || expectedLayout !== tensor.storageType) {
       throw new Error(`Unsupported type/layout for Qwen3.5 tensor ${tensor.name}`);
     }
-    actual.set(tensor.name, tensor);
+    const snapshot = Object.freeze({
+      name: tensor.name,
+      shape: Object.freeze([...tensor.shape]),
+      ggmlType: tensor.ggmlType,
+      storageType: tensor.storageType,
+    });
+    actual.set(snapshot.name, snapshot);
   }
   const required = requiredContracts(config);
   const expectedNames = new Set(required.map((item) => item.name));
@@ -215,6 +236,19 @@ function validateDirectory(
     }
   }
   return actual;
+}
+
+function immutableTensorBindings(
+  entries: Iterable<readonly [string, Qwen35TensorBinding]>,
+): Qwen35TensorBindings {
+  const bindings = new Map(entries);
+  return Object.freeze({
+    size: bindings.size,
+    get: (name: string) => bindings.get(name),
+    has: (name: string) => bindings.has(name),
+    entries: () => bindings.entries(),
+    [Symbol.iterator]: () => bindings[Symbol.iterator](),
+  });
 }
 
 function linearBindings(layer: number): LinearAttentionTensorBindings {
@@ -252,6 +286,7 @@ export function buildQwen35Program(input: {
   readonly config: Qwen35Config;
   readonly tensors: readonly Qwen35TensorDirectoryEntry[];
 }): Qwen35Program {
+  assertQwen35Config(input.config);
   const directory = validateDirectory(input.config, input.tensors);
   const invocations: Qwen35Invocation[] = [
     Object.freeze({
@@ -376,6 +411,6 @@ export function buildQwen35Program(input: {
   return Object.freeze({
     model: "qwen35-4b",
     invocations: Object.freeze(invocations),
-    tensorBindings,
+    tensorBindings: immutableTensorBindings(tensorBindings),
   });
 }

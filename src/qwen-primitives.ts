@@ -239,18 +239,32 @@ export function partialMropeCpu(
     const base = head * options.headDimension;
     for (let frequency = 0; frequency < frequencyCount; frequency += 1) {
       const position = options.positions[owners[frequency]!]!;
-      const angle =
-        position /
-        options.theta ** ((2 * frequency) / options.rotaryDimension);
-      const cosine = Math.cos(angle);
-      const sine = Math.sin(angle);
+      const exponent = Math.fround(
+        Math.fround(2 * frequency) /
+          Math.fround(options.rotaryDimension),
+      );
+      const divisor = Math.fround(
+        Math.pow(Math.fround(options.theta), exponent),
+      );
+      const angle = Math.fround(Math.fround(position) / divisor);
+      const tau = Math.fround(2 * Math.PI);
+      // Explicit f32 range reduction avoids device-specific large-angle trig
+      // reduction from breaking CPU/WebGPU parity at the context boundary.
+      const turns = Math.floor(Math.fround(angle / tau));
+      const reducedAngle = Math.fround(
+        angle - Math.fround(Math.fround(turns) * tau),
+      );
+      const cosine = Math.fround(Math.cos(reducedAngle));
+      const sine = Math.fround(Math.sin(reducedAngle));
       const firstIndex = base + frequency;
       const secondIndex = firstIndex + frequencyCount;
       const first = input[firstIndex]!;
       const second = input[secondIndex]!;
-      output[firstIndex] = Math.fround(first * cosine - second * sine);
+      output[firstIndex] = Math.fround(
+        Math.fround(first * cosine) - Math.fround(second * sine),
+      );
       output[secondIndex] = Math.fround(
-        first * sine + second * cosine,
+        Math.fround(first * sine) + Math.fround(second * cosine),
       );
     }
   }
@@ -438,8 +452,10 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   );
   let angle = f32(positions[frequency_owner(frequency)]) /
     pow(params.theta, f32(frequency * 2u) / f32(params.rotary_dimension));
-  let cosine = cos(angle);
-  let sine = sin(angle);
+  let tau = 6.28318548f;
+  let reduced_angle = angle - floor(angle / tau) * tau;
+  let cosine = cos(reduced_angle);
+  let sine = sin(reduced_angle);
   let value = input_values[index];
   let partner = input_values[partner_index];
   output_values[index] = select(
@@ -454,10 +470,12 @@ struct Params { candidate_count: u32, k: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<storage, read> scores: array<f32>;
 @group(0) @binding(1) var<storage, read_write> output_scores: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output_indices: array<u32>;
-@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> output_valid_count: array<u32>;
+@group(0) @binding(4) var<uniform> params: Params;
 @compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   if (invocation.x != 0u) { return; }
+  var valid_count = 0u;
   for (var slot = 0u; slot < params.k; slot += 1u) {
     var found = false;
     var best_score = 0.0f;
@@ -477,9 +495,12 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
         best_index = index;
       }
     }
+    if (!found) { break; }
     output_scores[slot] = best_score;
     output_indices[slot] = best_index;
+    valid_count += 1u;
   }
+  output_valid_count[0] = valid_count;
 }`;
 
 function primitive(
@@ -526,7 +547,19 @@ export const QWEN_PRIMITIVE_KERNELS: readonly QwenPrimitiveKernel[] =
       8,
       { outputCoverage: "all-elements", coordinateCount: 3 },
     ),
-    primitive("top-k-merge", TOP_K_WGSL, 1, { scores: 0, outputScores: 1, outputIndices: 2, uniforms: 3 }, 4),
+    primitive(
+      "top-k-merge",
+      TOP_K_WGSL,
+      1,
+      {
+        scores: 0,
+        outputScores: 1,
+        outputIndices: 2,
+        outputValidCount: 3,
+        uniforms: 4,
+      },
+      4,
+    ),
   ]);
 
 export interface QwenPrimitiveRegistryDefinition extends KernelDefinition {

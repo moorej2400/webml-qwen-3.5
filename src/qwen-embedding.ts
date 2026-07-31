@@ -293,8 +293,30 @@ export function planPackedEmbeddingRow(input: {
   readonly tokenId: number;
   readonly vocabSize: number;
   readonly embeddingLength: number;
+  /** Live device limit used to reject an invalid 1D dispatch before encoding. */
+  readonly maxComputeWorkgroupsPerDimension: number;
 }): PackedEmbeddingRowPlan {
-  positiveInteger(input.vocabSize, "Embedding vocabulary size");
+  if (
+    !Number.isSafeInteger(input.vocabSize) ||
+    input.vocabSize < 1 ||
+    input.vocabSize > 0xffff_ffff
+  ) {
+    throw new Error("Embedding vocabulary size must fit a positive u32");
+  }
+  if (
+    !Number.isSafeInteger(input.embeddingLength) ||
+    input.embeddingLength < 1 ||
+    input.embeddingLength > 0xffff_ffff
+  ) {
+    throw new Error("Embedding length must fit a positive u32");
+  }
+  if (
+    !Number.isSafeInteger(input.maxComputeWorkgroupsPerDimension) ||
+    input.maxComputeWorkgroupsPerDimension < 1 ||
+    input.maxComputeWorkgroupsPerDimension > 0xffff_ffff
+  ) {
+    throw new Error("Embedding device limit must fit a positive u32");
+  }
   if (
     !Number.isSafeInteger(input.tokenId) ||
     input.tokenId < 0 ||
@@ -313,13 +335,23 @@ export function planPackedEmbeddingRow(input: {
   ) {
     throw new Error("Embedding row offset exceeds u32 shader addressing");
   }
+  if (
+    geometry.blocksPerRow > 0xffff_ffff ||
+    geometry.rowBytes > 0xffff_ffff
+  ) {
+    throw new Error("Embedding row geometry exceeds u32 shader addressing");
+  }
+  const workgroups = Math.ceil(input.embeddingLength / 256);
+  if (workgroups > input.maxComputeWorkgroupsPerDimension) {
+    throw new Error("Embedding workgroups exceed the device limit");
+  }
   return Object.freeze({
     storageType: input.storageType,
     packedByteOffset,
     packedByteLength: geometry.rowBytes,
     outputElements: input.embeddingLength,
     workgroups: Object.freeze({
-      x: Math.ceil(input.embeddingLength / 256),
+      x: workgroups,
       y: 1,
       z: 1,
     }),

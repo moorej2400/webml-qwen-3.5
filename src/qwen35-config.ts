@@ -79,6 +79,41 @@ function createConfig(productContextLength: number): Qwen35Config {
 
 export const QWEN35_4B_CONFIG = createConfig(QWEN35_PRODUCT_CONTEXT_CAP);
 
+function configValueEqual(actual: unknown, expected: unknown): boolean {
+  if (Array.isArray(expected)) {
+    return (
+      Array.isArray(actual) &&
+      actual.length === expected.length &&
+      expected.every((item, index) => configValueEqual(actual[index], item))
+    );
+  }
+  return actual === expected;
+}
+
+/**
+ * Revalidates the static program boundary instead of trusting a structurally
+ * compatible object that may not have passed GGUF metadata validation.
+ */
+export function assertQwen35Config(config: Qwen35Config): void {
+  const productContextLength = config.productContextLength;
+  if (
+    !Number.isSafeInteger(productContextLength) ||
+    productContextLength < 1 ||
+    productContextLength > QWEN35_PRODUCT_CONTEXT_CAP
+  ) {
+    throw new Error("Qwen3.5 config productContextLength is invalid");
+  }
+  const expected = createConfig(productContextLength);
+  for (const key of Object.keys(expected) as (keyof Qwen35Config)[]) {
+    if (!configValueEqual(config[key], expected[key])) {
+      throw new Error(`Qwen3.5 config ${key} does not match the pinned contract`);
+    }
+  }
+  if (Object.keys(config).length !== Object.keys(expected).length) {
+    throw new Error("Qwen3.5 config contains unexpected fields");
+  }
+}
+
 const REQUIRED_METADATA = Object.freeze({
   "general.architecture": "qwen35",
   "qwen35.block_count": 33,

@@ -5,6 +5,7 @@ import { GgmlType } from "../src/gguf.js";
 import {
   QWEN35_4B_CONFIG,
   validateQwen35Config,
+  type Qwen35Config,
 } from "../src/qwen35-config.js";
 import {
   buildQwen35Program,
@@ -205,6 +206,88 @@ test("builds the exact deterministic 32-layer static program", () => {
   });
   assert.equal(program.invocations.at(-1)?.kind, "top-k-placeholder");
   assert.equal(program.tensorBindings.get("token_embd.weight")?.consumers.length, 2);
+});
+
+test("rejects forged Qwen3.5 configuration drift at the program boundary", () => {
+  const drift: Readonly<Record<keyof Qwen35Config, unknown>> = {
+    architecture: "qwen3",
+    baseBlockCount: 0,
+    sourceBlockCount: 32,
+    nextnPredictLayers: 0,
+    mtpBlock: 31,
+    mtpPolicy: "include-block-32",
+    embeddingLength: 4_096,
+    feedForwardLength: 8_192,
+    vocabularySize: 1,
+    sourceMaxContextLength: 16_384,
+    productContextLength: 0,
+    attentionHeadCount: 8,
+    keyValueHeadCount: 8,
+    headDimension: 128,
+    keyLength: 128,
+    valueLength: 128,
+    rmsNormEpsilon: 1e-5,
+    fullAttentionInterval: 3,
+    fullAttentionLayers: [3, 7, 11, 15, 19, 23, 27, 30],
+    linearAttentionLayerCount: 23,
+    fullAttentionLayerCount: 9,
+    ropeFrequencyBase: 10_000,
+    rotaryDimension: 128,
+    mropeSections: [10, 11, 11, 0],
+    ssmConvKernel: 3,
+    ssmStateSize: 64,
+    ssmGroupCount: 8,
+    ssmTimeStepRank: 16,
+    ssmInnerSize: 2_048,
+  };
+  for (const [key, value] of Object.entries(drift)) {
+    const forged = {
+      ...QWEN35_4B_CONFIG,
+      [key]: value,
+    } as Qwen35Config;
+    assert.throws(
+      () => buildQwen35Program({ config: forged, tensors: directory() }),
+      new RegExp(`config.*${key}`, "i"),
+    );
+  }
+
+  const validatedShortContext = validateQwen35Config(
+    PINNED_QWEN35_GGUF_FIXTURE.metadata,
+    { productContextLength: 1_024 },
+  );
+  assert.doesNotThrow(() =>
+    buildQwen35Program({
+      config: validatedShortContext,
+      tensors: directory(),
+    }),
+  );
+});
+
+test("snapshots tensor inputs and exposes mutation-free bindings", () => {
+  const tensors = directory();
+  const original = tensors[0]!;
+  const mutableShape = [...original.shape];
+  const mutableEntry = { ...original, shape: mutableShape };
+  tensors[0] = mutableEntry;
+  const program = buildQwen35Program({
+    config: QWEN35_4B_CONFIG,
+    tensors,
+  });
+  const binding = program.tensorBindings.get(original.name)!;
+
+  mutableShape[0] = 1;
+  mutableEntry.name = "changed.weight";
+  assert.equal(binding.tensor.name, "output_norm.weight");
+  assert.deepEqual(binding.tensor.shape, [2_560]);
+  assert.ok(Object.isFrozen(binding));
+  assert.ok(Object.isFrozen(binding.tensor));
+  assert.ok(Object.isFrozen(binding.tensor.shape));
+  assert.ok(Object.isFrozen(binding.consumers));
+  assert.ok(Object.isFrozen(program.tensorBindings));
+  assert.equal(
+    (program.tensorBindings as unknown as { set?: unknown }).set,
+    undefined,
+  );
 });
 
 test("rejects missing, extra, mis-shaped, wrong-interval, and MTP tensors", () => {
