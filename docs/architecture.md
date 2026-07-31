@@ -35,10 +35,13 @@ guard rejects any 2D invocation whose flattened row index would overflow u32.
 
 `tools/webgpu-kernel-harness.html` is the deterministic browser validation
 surface. It executes every language GEMV, reusable primitive, and packed
-embedding layout against a CPU reference. Fixtures use distinct row data,
-nonzero packed and output offsets, and sentinel slots around each output.
-The parity check rejects non-finite CPU or GPU output before it applies the
-numeric tolerance.
+embedding layout against a CPU reference, then compiles all six hybrid
+attention and DeltaNet kernels. The full-attention preparation fixture executes
+at position 16,383 and verifies normalized/rotated Q, the per-head gate split,
+the packed FP16 K/V row, and two untouched suffix words. Fixtures use distinct
+row data, nonzero packed and output offsets, and sentinel slots around each
+output. The parity check rejects non-finite CPU or GPU output before it applies
+the numeric tolerance.
 
 ## Qwen3.5 4B program
 
@@ -51,11 +54,12 @@ dimensions, the exact parsed F32 RMSNorm epsilon, partial rotary dimensions,
 and GGUF M-RoPE sections `[11, 11, 10, 0]`.
 
 Layers 3, 7, 11, 15, 19, 23, 27, and 31 use full attention. The remaining 24
-layers use typed Gated DeltaNet placeholders. Each layer has a fixed invocation
-sequence: input RMSNorm, its exact attention placeholder, residual add,
+layers use typed Gated DeltaNet operators. Each layer has a fixed invocation
+sequence: input RMSNorm, its exact attention operator, residual add,
 post-attention RMSNorm, gate and up projections, SwiGLU, down projection, and
-residual add. Full attention and DeltaNet recurrence remain explicit
-non-runnable operators until their own runtime phases are implemented.
+residual add. These attention operators are individually runnable, but the
+complete program remains explicitly non-runnable until model-weight
+orchestration connects every invocation.
 
 The tensor-directory validator requires all 32 base layers with exact names and
 shapes, including linear-attention convolution weights shaped `[4, 8192]`. It
@@ -86,6 +90,26 @@ explicit range reduction at large positions. Top-k rejects non-finite
 candidates, breaks equal-score ties by vocabulary index, and reports a valid
 result count when fewer than `k` finite candidates exist.
 
+HybridState allocates no dummy state. At 16,384 tokens it owns exactly eight
+logical packed FP16 K/V pairs, 24 FP32 `[8192,4]` convolution states, and 24
+FP32 `[32,128,128]` recurrent states. Their total is 590,348,288 bytes
+(563 MiB). Allocation is rollback-safe. A failed partial reset poisons the
+state so only disposal remains legal.
+
+Full attention keeps the Qwen GGUF query projection as 16 per-head
+`[q256,gate256]` records. A fused preparation kernel splits those records,
+applies multiplicative Q/K RMSNorm and exact partial M-RoPE, and writes the
+current K/V row as packed FP16 u32 words. The online kernel maps each group of
+four query heads to one K/V head and uses a stable running maximum,
+denominator, and value accumulator without a full score matrix. Its dispatch
+contract validates `1 <= tokenCount <= position + 1 <= capacity <= 16384`.
+
+Gated DeltaNet keeps convolution and recurrent math in FP32. It shifts raw QKV
+through oldest-to-current convolution taps, applies SiLU, maps each value head
+to Q/K head `h % 16`, computes beta and negative-`ssm_a` decay, and preserves
+the required decay, read, beta-delta, rank-one update, then query order. The
+serial prefill path is the correctness oracle for later bounded parallel scans.
+
 The source GGUF advertises a native maximum context of 262,144 tokens. The
 current product contract selects 16,384 tokens and stores the native maximum
 separately. This selection is a product limit, not a browser capability
@@ -98,9 +122,9 @@ components. A generic model loader is outside the production design. External
 inference frameworks may be used only as independent development references;
 they are not production dependencies.
 
-This program does not yet implement full-attention score/KV math, Gated
-DeltaNet recurrence, tokenization, session lifecycle, OPFS persistence, vision,
-UI, or a control server.
+This program does not yet connect the hybrid operators to complete model-weight
+orchestration. Session lifecycle, OPFS persistence, vision, UI, and the control
+server remain later runtime phases.
 
 ## Experimental feasibility
 

@@ -175,7 +175,7 @@ test("builds the exact deterministic 32-layer static program", () => {
     [
       "embedding",
       "rms-norm",
-      "linear-attention-placeholder",
+      "gated-deltanet",
       "residual-add",
       "rms-norm",
       "gemv",
@@ -187,15 +187,18 @@ test("builds the exact deterministic 32-layer static program", () => {
     ],
   );
   const attention = program.invocations.filter((item) =>
-    item.kind.endsWith("attention-placeholder"),
+    item.kind === "gated-deltanet" || item.kind === "full-attention",
   );
   assert.equal(attention.length, 32);
   assert.deepEqual(
     attention
-      .filter((item) => item.kind === "full-attention-placeholder")
+      .filter((item) => item.kind === "full-attention")
       .map((item) => item.layer),
     [3, 7, 11, 15, 19, 23, 27, 31],
   );
+  assert.equal(attention.every((item) => item.runnable), true);
+  assert.equal(program.runnable, false);
+  assert.equal(program.blockedBy, "weight-orchestration");
   assert.equal(program.invocations.at(-3)?.kind, "rms-norm");
   assert.deepEqual(program.invocations.at(-2), {
     kind: "tiled-tied-logits",

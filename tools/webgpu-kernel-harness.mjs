@@ -26,6 +26,16 @@ import {
   embeddingCpu,
   planPackedEmbeddingRow,
 } from "../dist/src/qwen-embedding.js";
+import { QWEN35_HYBRID_KERNELS } from "../dist/src/hybrid-kernels.js";
+import {
+  packFloat16PairCpu,
+  qwen35OnlineAttentionHeadCpu,
+  splitQwen35QueryGateProjection,
+} from "../dist/src/full-attention.js";
+import {
+  deltaNetRecurrentHeadStepCpu,
+  qwen35DeltaNetParametersCpu,
+} from "../dist/src/gated-deltanet.js";
 import { validateParity } from "./webgpu-parity.mjs";
 
 function deterministicBytes(length, seed) {
@@ -696,6 +706,742 @@ async function runEmbedding(device, kernel) {
   };
 }
 
+async function runFullAttentionPrepare(device, kernel) {
+  const position = 16_383;
+  const capacity = 16_384;
+  const positions = [7, 5, 3];
+  const queryGate = new Float32Array(16 * 512);
+  for (let head = 0; head < 16; head += 1) {
+    const base = head * 512;
+    for (let lane = 0; lane < 256; lane += 1) {
+      queryGate[base + lane] = ((head * 13 + lane * 7) % 31 - 15) / 8;
+      queryGate[base + 256 + lane] = (head * 256 + lane) / 4096;
+    }
+  }
+  const key = Float32Array.from(
+    { length: 4 * 256 },
+    (_, index) => ((index * 11) % 37 - 18) / 9,
+  );
+  const value = Float32Array.from(
+    { length: 4 * 256 },
+    (_, index) => ((index * 5) % 23 - 11) / 7,
+  );
+  const queryNormWeight = Float32Array.from(
+    { length: 256 },
+    (_, lane) => 0.75 + (lane % 7) / 10,
+  );
+  const keyNormWeight = Float32Array.from(
+    { length: 256 },
+    (_, lane) => 0.8 + (lane % 5) / 8,
+  );
+  const split = splitQwen35QueryGateProjection(queryGate);
+  const normalizedQuery = qkRmsNormPerHeadCpu(
+    split.query,
+    queryNormWeight,
+    {
+      headCount: 16,
+      headDimension: 256,
+      epsilon: Math.fround(1e-6),
+    },
+  );
+  const expectedQuery = partialMropeCpu(normalizedQuery, {
+    headCount: 16,
+    headDimension: 256,
+    rotaryDimension: 64,
+    sections: [11, 11, 10],
+    positions,
+    theta: 10_000_000,
+  });
+  const normalizedKey = qkRmsNormPerHeadCpu(key, keyNormWeight, {
+    headCount: 4,
+    headDimension: 256,
+    epsilon: Math.fround(1e-6),
+  });
+  const expectedKey = partialMropeCpu(normalizedKey, {
+    headCount: 4,
+    headDimension: 256,
+    rotaryDimension: 64,
+    sections: [11, 11, 10],
+    positions,
+    theta: 10_000_000,
+  });
+
+  const wordsPerToken = 512;
+  const suffixSentinel = 0xdead_beef;
+  const cacheWords = capacity * wordsPerToken;
+  const packedKeyCache = new Uint32Array(cacheWords + 2).fill(suffixSentinel);
+  const packedValueCache = new Uint32Array(cacheWords + 2).fill(suffixSentinel);
+  const expectedPackedKey = new Uint32Array(wordsPerToken + 2).fill(
+    suffixSentinel,
+  );
+  const expectedPackedValue = new Uint32Array(wordsPerToken + 2).fill(
+    suffixSentinel,
+  );
+  for (let scalar = 0; scalar < 4 * 256; scalar += 2) {
+    expectedPackedKey[scalar / 2] = packFloat16PairCpu(
+      expectedKey[scalar],
+      expectedKey[scalar + 1],
+    );
+    expectedPackedValue[scalar / 2] = packFloat16PairCpu(
+      value[scalar],
+      value[scalar + 1],
+    );
+  }
+
+  const pipeline = await createPipeline(device, kernel);
+  const queryGateBuffer = storageBuffer(
+    device,
+    floatBytes(queryGate),
+    GPUBufferUsage.STORAGE,
+  );
+  const keyBuffer = storageBuffer(device, floatBytes(key), GPUBufferUsage.STORAGE);
+  const valueBuffer = storageBuffer(
+    device,
+    floatBytes(value),
+    GPUBufferUsage.STORAGE,
+  );
+  const queryNormBuffer = storageBuffer(
+    device,
+    floatBytes(queryNormWeight),
+    GPUBufferUsage.STORAGE,
+  );
+  const keyNormBuffer = storageBuffer(
+    device,
+    floatBytes(keyNormWeight),
+    GPUBufferUsage.STORAGE,
+  );
+  const preparedOutput = storageBuffer(
+    device,
+    floatBytes(new Float32Array(16 * 512)),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const packedKeyBuffer = storageBuffer(
+    device,
+    uintBytes(packedKeyCache),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const packedValueBuffer = storageBuffer(
+    device,
+    uintBytes(packedValueCache),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const uniforms = storageBuffer(
+    device,
+    uintBytes(
+      Uint32Array.of(position, capacity, ...positions, 0, 0, 0),
+    ),
+    GPUBufferUsage.UNIFORM,
+  );
+  const entries = [
+    queryGateBuffer,
+    keyBuffer,
+    valueBuffer,
+    queryNormBuffer,
+    keyNormBuffer,
+    preparedOutput,
+    packedKeyBuffer,
+    packedValueBuffer,
+    uniforms,
+  ].map((buffer, binding) => ({ binding, resource: { buffer } }));
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries,
+  });
+  const preparedReadback = device.createBuffer({
+    size: queryGate.byteLength,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const rowByteLength = expectedPackedKey.byteLength;
+  const keyReadback = device.createBuffer({
+    size: rowByteLength,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const valueReadback = device.createBuffer({
+    size: rowByteLength,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(16);
+  pass.end();
+  encoder.copyBufferToBuffer(
+    preparedOutput,
+    0,
+    preparedReadback,
+    0,
+    queryGate.byteLength,
+  );
+  const cacheByteOffset = position * wordsPerToken * 4;
+  encoder.copyBufferToBuffer(
+    packedKeyBuffer,
+    cacheByteOffset,
+    keyReadback,
+    0,
+    rowByteLength,
+  );
+  encoder.copyBufferToBuffer(
+    packedValueBuffer,
+    cacheByteOffset,
+    valueReadback,
+    0,
+    rowByteLength,
+  );
+  device.queue.submit([encoder.finish()]);
+  await Promise.all([
+    preparedReadback.mapAsync(GPUMapMode.READ),
+    keyReadback.mapAsync(GPUMapMode.READ),
+    valueReadback.mapAsync(GPUMapMode.READ),
+  ]);
+  const actualPrepared = new Float32Array(
+    preparedReadback.getMappedRange().slice(0),
+  );
+  const actualSplit = splitQwen35QueryGateProjection(actualPrepared);
+  const actualPackedKey = new Uint32Array(
+    keyReadback.getMappedRange().slice(0),
+  );
+  const actualPackedValue = new Uint32Array(
+    valueReadback.getMappedRange().slice(0),
+  );
+  for (const readback of [
+    preparedReadback,
+    keyReadback,
+    valueReadback,
+  ]) {
+    readback.unmap();
+  }
+  validateParity(kernel.id, expectedQuery, actualSplit.query, 1e-3);
+  validateParity(`${kernel.id}-gate`, split.gate, actualSplit.gate);
+  if (
+    actualPackedKey.some(
+      (word, index) => word !== expectedPackedKey[index],
+    ) ||
+    actualPackedValue.some(
+      (word, index) => word !== expectedPackedValue[index],
+    )
+  ) {
+    throw new Error(`${kernel.id}: packed K/V row or suffix differs`);
+  }
+  for (const buffer of [
+    ...entries.map((entry) => entry.resource.buffer),
+    preparedReadback,
+    keyReadback,
+    valueReadback,
+  ]) {
+    buffer.destroy();
+  }
+  return {
+    id: kernel.id,
+    status: "executed",
+    position,
+    suffixSentinel,
+  };
+}
+
+async function runFullAttentionOnline(device, kernel) {
+  const tokenCount = 2;
+  const prepared = new Float32Array(16 * 512);
+  const keys = new Float32Array(tokenCount * 4 * 256);
+  const values = new Float32Array(keys.length);
+  for (let head = 0; head < 16; head += 1) {
+    const base = head * 512;
+    for (let lane = 0; lane < 256; lane += 1) {
+      prepared[base + lane] = ((head * 5 + lane * 3) % 17 - 8) / 8;
+      prepared[base + 256 + lane] = (head - 8) / 4;
+    }
+  }
+  for (let token = 0; token < tokenCount; token += 1) {
+    for (let kvHead = 0; kvHead < 4; kvHead += 1) {
+      const base = (token * 4 + kvHead) * 256;
+      for (let lane = 0; lane < 256; lane += 1) {
+        keys[base + lane] = ((token * 7 + kvHead * 5 + lane) % 9 - 4) / 4;
+        values[base + lane] =
+          ((token * 11 + kvHead * 13 + lane * 3) % 15 - 7) / 2;
+      }
+    }
+  }
+  const packedKeys = new Uint32Array(keys.length / 2);
+  const packedValues = new Uint32Array(values.length / 2);
+  for (let scalar = 0; scalar < keys.length; scalar += 2) {
+    packedKeys[scalar / 2] = packFloat16PairCpu(
+      keys[scalar],
+      keys[scalar + 1],
+    );
+    packedValues[scalar / 2] = packFloat16PairCpu(
+      values[scalar],
+      values[scalar + 1],
+    );
+  }
+  const expectedValues = new Float32Array(16 * 256);
+  for (let queryHead = 0; queryHead < 16; queryHead += 1) {
+    const queryBase = queryHead * 512;
+    const kvHead = Math.floor(queryHead / 4);
+    const headKeys = new Float32Array(tokenCount * 256);
+    const headValues = new Float32Array(headKeys.length);
+    for (let token = 0; token < tokenCount; token += 1) {
+      const source = (token * 4 + kvHead) * 256;
+      headKeys.set(keys.subarray(source, source + 256), token * 256);
+      headValues.set(values.subarray(source, source + 256), token * 256);
+    }
+    const attention = qwen35OnlineAttentionHeadCpu(
+      prepared.subarray(queryBase, queryBase + 256),
+      headKeys,
+      headValues,
+    );
+    const gate = prepared.subarray(queryBase + 256, queryBase + 512);
+    expectedValues.set(
+      attentionOutputGateCpu(attention, gate),
+      queryHead * 256,
+    );
+  }
+  const output = outputFixture(expectedValues);
+  const preparedBuffer = storageBuffer(
+    device,
+    floatBytes(prepared),
+    GPUBufferUsage.STORAGE,
+  );
+  const keyBuffer = storageBuffer(
+    device,
+    uintBytes(packedKeys),
+    GPUBufferUsage.STORAGE,
+  );
+  const valueBuffer = storageBuffer(
+    device,
+    uintBytes(packedValues),
+    GPUBufferUsage.STORAGE,
+  );
+  const outputBuffer = storageBuffer(
+    device,
+    floatBytes(output.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const uniforms = storageBuffer(
+    device,
+    uintBytes(Uint32Array.of(tokenCount, 1, 2, 0)),
+    GPUBufferUsage.UNIFORM,
+  );
+  const [actualBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      { binding: 0, resource: { buffer: preparedBuffer } },
+      { binding: 1, resource: { buffer: keyBuffer } },
+      { binding: 2, resource: { buffer: valueBuffer } },
+      {
+        binding: 3,
+        resource: {
+          buffer: outputBuffer,
+          offset: output.outputRowOffset * 4,
+          size: (expectedValues.length + 1) * 4,
+        },
+      },
+      { binding: 4, resource: { buffer: uniforms } },
+    ],
+    [{ buffer: outputBuffer, byteLength: output.expected.byteLength }],
+    { x: 16, y: 1, z: 1 },
+  );
+  validateParity(kernel.id, output.expected, new Float32Array(actualBytes), 1e-3);
+  return { id: kernel.id, status: "executed", tokenCount };
+}
+
+async function runDeltaNetConv(device, kernel) {
+  const raw = Float32Array.from(
+    { length: 8192 },
+    (_, index) => ((index * 5) % 19 - 9) / 8,
+  );
+  const weights = Float32Array.from(
+    { length: 8192 * 4 },
+    (_, index) => ((index * 7) % 13 - 6) / 16,
+  );
+  const initialState = Float32Array.from(
+    { length: 8192 * 4 },
+    (_, index) => ((index * 11) % 17 - 8) / 32,
+  );
+  const expectedState = new Float32Array(initialState);
+  const expectedValues = new Float32Array(8192);
+  for (let channel = 0; channel < 8192; channel += 1) {
+    const base = channel * 4;
+    expectedState[base] = initialState[base + 1];
+    expectedState[base + 1] = initialState[base + 2];
+    expectedState[base + 2] = initialState[base + 3];
+    expectedState[base + 3] = raw[channel];
+    let sum = Math.fround(0);
+    for (let tap = 0; tap < 4; tap += 1) {
+      sum = Math.fround(
+        sum + Math.fround(expectedState[base + tap] * weights[base + tap]),
+      );
+    }
+    expectedValues[channel] = siluCpu(sum);
+  }
+  const output = outputFixture(expectedValues);
+  const rawBuffer = storageBuffer(device, floatBytes(raw), GPUBufferUsage.STORAGE);
+  const weightBuffer = storageBuffer(
+    device,
+    floatBytes(weights),
+    GPUBufferUsage.STORAGE,
+  );
+  const stateBuffer = storageBuffer(
+    device,
+    floatBytes(initialState),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const outputBuffer = storageBuffer(
+    device,
+    floatBytes(output.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const [actualOutputBytes, actualStateBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      { binding: 0, resource: { buffer: rawBuffer } },
+      { binding: 1, resource: { buffer: weightBuffer } },
+      { binding: 2, resource: { buffer: stateBuffer } },
+      {
+        binding: 3,
+        resource: {
+          buffer: outputBuffer,
+          offset: output.outputRowOffset * 4,
+          size: (expectedValues.length + 1) * 4,
+        },
+      },
+    ],
+    [
+      { buffer: outputBuffer, byteLength: output.expected.byteLength },
+      { buffer: stateBuffer, byteLength: expectedState.byteLength },
+    ],
+    { x: 128, y: 1, z: 1 },
+  );
+  const actualState = new Float32Array(actualStateBytes);
+  validateParity(kernel.id, output.expected, new Float32Array(actualOutputBytes));
+  validateParity(`${kernel.id}-state`, expectedState, actualState);
+  const stateMutation = actualState[0] !== initialState[0];
+  if (!stateMutation) throw new Error(`${kernel.id}: state did not mutate`);
+  return { id: kernel.id, status: "executed", stateMutation };
+}
+
+async function runDeltaNetParameters(device, kernel) {
+  const betaInput = Float32Array.from(
+    { length: 32 },
+    (_, head) => (head - 16) / 5,
+  );
+  const a = Float32Array.from(
+    { length: 32 },
+    (_, head) => (head % 7) / 4,
+  );
+  const dt = Float32Array.from(
+    { length: 32 },
+    (_, head) => -(head % 5) / 6,
+  );
+  const ssmA = Float32Array.from(
+    { length: 32 },
+    (_, head) => -0.25 - head / 64,
+  );
+  const expectedBeta = new Float32Array(32);
+  const expectedDecay = new Float32Array(32);
+  for (let head = 0; head < 32; head += 1) {
+    const result = qwen35DeltaNetParametersCpu(
+      betaInput[head],
+      a[head],
+      dt[head],
+      ssmA[head],
+    );
+    expectedBeta[head] = result.beta;
+    expectedDecay[head] = result.decay;
+  }
+  const betaOutput = outputFixture(expectedBeta);
+  const decayOutput = outputFixture(expectedDecay);
+  const inputBuffers = [betaInput, a, dt, ssmA].map((values) =>
+    storageBuffer(device, floatBytes(values), GPUBufferUsage.STORAGE),
+  );
+  const betaBuffer = storageBuffer(
+    device,
+    floatBytes(betaOutput.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const decayBuffer = storageBuffer(
+    device,
+    floatBytes(decayOutput.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const [actualBetaBytes, actualDecayBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      ...inputBuffers.map((buffer, binding) => ({
+        binding,
+        resource: { buffer },
+      })),
+      {
+        binding: 4,
+        resource: {
+          buffer: betaBuffer,
+          offset: betaOutput.outputRowOffset * 4,
+          size: (expectedBeta.length + 1) * 4,
+        },
+      },
+      {
+        binding: 5,
+        resource: {
+          buffer: decayBuffer,
+          offset: decayOutput.outputRowOffset * 4,
+          size: (expectedDecay.length + 1) * 4,
+        },
+      },
+    ],
+    [
+      { buffer: betaBuffer, byteLength: betaOutput.expected.byteLength },
+      { buffer: decayBuffer, byteLength: decayOutput.expected.byteLength },
+    ],
+    { x: 1, y: 1, z: 1 },
+  );
+  validateParity(
+    `${kernel.id}-beta`,
+    betaOutput.expected,
+    new Float32Array(actualBetaBytes),
+    1e-3,
+  );
+  validateParity(
+    `${kernel.id}-decay`,
+    decayOutput.expected,
+    new Float32Array(actualDecayBytes),
+    1e-3,
+  );
+  return { id: kernel.id, status: "executed" };
+}
+
+function normalizeDeltaHead(values, offset, query) {
+  let sum = Math.fround(0);
+  for (let lane = 0; lane < 128; lane += 1) {
+    const value = values[offset + lane];
+    sum = Math.fround(sum + Math.fround(value * value));
+  }
+  let scale = Math.fround(
+    1 / Math.sqrt(Math.fround(sum + Math.fround(1e-6))),
+  );
+  if (query) {
+    scale = Math.fround(scale * Math.fround(1 / Math.sqrt(128)));
+  }
+  return Float32Array.from(
+    { length: 128 },
+    (_, lane) => Math.fround(values[offset + lane] * scale),
+  );
+}
+
+async function runDeltaNetRecurrent(device, kernel) {
+  const qkv = new Float32Array(8192);
+  for (let qkHead = 0; qkHead < 16; qkHead += 1) {
+    for (let lane = 0; lane < 128; lane += 1) {
+      qkv[qkHead * 128 + lane] =
+        ((qkHead * 7 + lane * 3) % 11 - 5) / 8;
+      qkv[2048 + qkHead * 128 + lane] =
+        ((qkHead * 5 + lane * 2) % 13 - 6) / 8;
+    }
+  }
+  for (let valueHead = 0; valueHead < 32; valueHead += 1) {
+    for (let lane = 0; lane < 128; lane += 1) {
+      qkv[4096 + valueHead * 128 + lane] =
+        ((valueHead * 11 + lane * 5) % 17 - 8) / 4;
+    }
+  }
+  const beta = Float32Array.from(
+    { length: 32 },
+    (_, head) => 0.2 + (head % 5) / 10,
+  );
+  const decay = Float32Array.from(
+    { length: 32 },
+    (_, head) => 0.7 + (head % 3) / 20,
+  );
+  const initialState = new Float32Array(32 * 128 * 128);
+  for (let head = 0; head < 32; head += 1) {
+    const base = head * 128 * 128;
+    initialState[base + (head % 128) * 128 + ((head * 3) % 128)] =
+      (head + 1) / 64;
+    initialState[base + ((head + 17) % 128) * 128 + ((head * 7) % 128)] =
+      -(head + 1) / 96;
+  }
+  const expectedState = new Float32Array(initialState);
+  const expectedValues = new Float32Array(4096);
+  for (let valueHead = 0; valueHead < 32; valueHead += 1) {
+    const qkHead = valueHead % 16;
+    const query = normalizeDeltaHead(qkv, qkHead * 128, true);
+    const key = normalizeDeltaHead(qkv, 2048 + qkHead * 128, false);
+    const value = qkv.subarray(
+      4096 + valueHead * 128,
+      4096 + (valueHead + 1) * 128,
+    );
+    const state = expectedState.subarray(
+      valueHead * 128 * 128,
+      (valueHead + 1) * 128 * 128,
+    );
+    expectedValues.set(
+      deltaNetRecurrentHeadStepCpu(
+        state,
+        query,
+        key,
+        value,
+        beta[valueHead],
+        decay[valueHead],
+      ),
+      valueHead * 128,
+    );
+  }
+  const output = outputFixture(expectedValues);
+  const qkvBuffer = storageBuffer(device, floatBytes(qkv), GPUBufferUsage.STORAGE);
+  const betaBuffer = storageBuffer(
+    device,
+    floatBytes(beta),
+    GPUBufferUsage.STORAGE,
+  );
+  const decayBuffer = storageBuffer(
+    device,
+    floatBytes(decay),
+    GPUBufferUsage.STORAGE,
+  );
+  const stateBuffer = storageBuffer(
+    device,
+    floatBytes(initialState),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const outputBuffer = storageBuffer(
+    device,
+    floatBytes(output.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const [actualOutputBytes, actualStateBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      { binding: 0, resource: { buffer: qkvBuffer } },
+      { binding: 1, resource: { buffer: betaBuffer } },
+      { binding: 2, resource: { buffer: decayBuffer } },
+      { binding: 3, resource: { buffer: stateBuffer } },
+      {
+        binding: 4,
+        resource: {
+          buffer: outputBuffer,
+          offset: output.outputRowOffset * 4,
+          size: (expectedValues.length + 1) * 4,
+        },
+      },
+    ],
+    [
+      { buffer: outputBuffer, byteLength: output.expected.byteLength },
+      { buffer: stateBuffer, byteLength: expectedState.byteLength },
+    ],
+    { x: 32, y: 1, z: 1 },
+  );
+  const actualState = new Float32Array(actualStateBytes);
+  validateParity(
+    kernel.id,
+    output.expected,
+    new Float32Array(actualOutputBytes),
+    1e-3,
+  );
+  validateParity(`${kernel.id}-state`, expectedState, actualState, 1e-3);
+  const stateMutation = actualState[0] !== initialState[0];
+  if (!stateMutation) throw new Error(`${kernel.id}: state did not mutate`);
+  return { id: kernel.id, status: "executed", stateMutation };
+}
+
+async function runDeltaNetGatedNorm(device, kernel) {
+  const recurrent = Float32Array.from(
+    { length: 4096 },
+    (_, index) => ((index * 7) % 19 - 9) / 6,
+  );
+  const z = Float32Array.from(
+    { length: 4096 },
+    (_, index) => ((index * 5) % 13 - 6) / 5,
+  );
+  const normWeight = Float32Array.from(
+    { length: 128 },
+    (_, lane) => 0.75 + (lane % 7) / 10,
+  );
+  const expectedValues = new Float32Array(4096);
+  for (let head = 0; head < 32; head += 1) {
+    const base = head * 128;
+    let sum = Math.fround(0);
+    for (let lane = 0; lane < 128; lane += 1) {
+      const value = recurrent[base + lane];
+      sum = Math.fround(sum + Math.fround(value * value));
+    }
+    const inverseRms = Math.fround(
+      1 /
+        Math.sqrt(
+          Math.fround(
+            Math.fround(sum / 128) + Math.fround(1e-6),
+          ),
+        ),
+    );
+    for (let lane = 0; lane < 128; lane += 1) {
+      const index = base + lane;
+      expectedValues[index] = Math.fround(
+        Math.fround(
+          Math.fround(recurrent[index] * inverseRms) * normWeight[lane],
+        ) * siluCpu(z[index]),
+      );
+    }
+  }
+  const output = outputFixture(expectedValues);
+  const recurrentBuffer = storageBuffer(
+    device,
+    floatBytes(recurrent),
+    GPUBufferUsage.STORAGE,
+  );
+  const zBuffer = storageBuffer(device, floatBytes(z), GPUBufferUsage.STORAGE);
+  const weightBuffer = storageBuffer(
+    device,
+    floatBytes(normWeight),
+    GPUBufferUsage.STORAGE,
+  );
+  const outputBuffer = storageBuffer(
+    device,
+    floatBytes(output.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const [actualBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      { binding: 0, resource: { buffer: recurrentBuffer } },
+      { binding: 1, resource: { buffer: zBuffer } },
+      { binding: 2, resource: { buffer: weightBuffer } },
+      {
+        binding: 3,
+        resource: {
+          buffer: outputBuffer,
+          offset: output.outputRowOffset * 4,
+          size: (expectedValues.length + 1) * 4,
+        },
+      },
+    ],
+    [{ buffer: outputBuffer, byteLength: output.expected.byteLength }],
+    { x: 32, y: 1, z: 1 },
+  );
+  validateParity(kernel.id, output.expected, new Float32Array(actualBytes), 1e-3);
+  return { id: kernel.id, status: "executed" };
+}
+
+async function runHybridKernel(device, kernel) {
+  switch (kernel.key.operation) {
+    case "full-attention-prepare":
+      return runFullAttentionPrepare(device, kernel);
+    case "full-attention-online":
+      return runFullAttentionOnline(device, kernel);
+    case "deltanet-conv":
+      return runDeltaNetConv(device, kernel);
+    case "deltanet-parameters":
+      return runDeltaNetParameters(device, kernel);
+    case "deltanet-recurrent":
+      return runDeltaNetRecurrent(device, kernel);
+    case "deltanet-gated-norm":
+      return runDeltaNetGatedNorm(device, kernel);
+    default:
+      throw new Error("No hybrid kernel fixture");
+  }
+}
+
 export async function runWebGpuKernelHarness() {
   if (!navigator.gpu) {
     throw new Error("WebGPU is not available in this browser");
@@ -712,6 +1458,9 @@ export async function runWebGpuKernelHarness() {
   }
   for (const kernel of PACKED_EMBEDDING_KERNELS) {
     results.push(await runEmbedding(device, kernel));
+  }
+  for (const kernel of QWEN35_HYBRID_KERNELS) {
+    results.push(await runHybridKernel(device, kernel));
   }
   device.destroy();
   return results;

@@ -57,17 +57,29 @@ export type Qwen35Invocation =
       fp32Accumulation: true;
     }>
   | Readonly<{
-      kind: "linear-attention-placeholder";
+      kind: "gated-deltanet";
       layer: number;
       tensors: LinearAttentionTensorBindings;
-      runnable: false;
+      kernels: readonly [
+        "deltanet-conv",
+        "deltanet-parameters",
+        "deltanet-recurrent",
+        "deltanet-gated-norm",
+      ];
+      stateLayout: "fp32-recurrent-state";
+      runnable: true;
     }>
   | Readonly<{
-      kind: "full-attention-placeholder";
+      kind: "full-attention";
       layer: number;
       tensors: FullAttentionTensorBindings;
       outputGate: "query-projection-second-half";
-      runnable: false;
+      kernels: readonly [
+        "full-attention-prepare",
+        "full-attention-online",
+      ];
+      stateLayout: "fp16-kv-pages";
+      runnable: true;
     }>
   | Readonly<{
       kind: "residual-add";
@@ -121,6 +133,9 @@ export interface Qwen35Program {
   readonly model: "qwen35-4b";
   readonly invocations: readonly Qwen35Invocation[];
   readonly tensorBindings: Qwen35TensorBindings;
+  /** Operator kernels exist, but model-weight scheduling is not wired yet. */
+  readonly runnable: false;
+  readonly blockedBy: "weight-orchestration";
 }
 
 const SUPPORTED_LAYOUTS = new Map<GgmlTypeValue, GemvLayout>([
@@ -279,8 +294,9 @@ function fullBindings(layer: number): FullAttentionTensorBindings {
 }
 
 /**
- * Builds a fixed Qwen3.5 4B invocation list. Attention entries are typed
- * placeholders so this program cannot be mistaken for an executable session.
+ * Builds a fixed Qwen3.5 4B invocation list. Attention operators have direct
+ * kernels and state contracts, while the complete program remains blocked on
+ * model-weight orchestration.
  */
 export function buildQwen35Program(input: {
   readonly config: Qwen35Config;
@@ -319,17 +335,29 @@ export function buildQwen35Program(input: {
       }),
       full
         ? Object.freeze({
-            kind: "full-attention-placeholder",
+            kind: "full-attention",
             layer,
             tensors: fullBindings(layer),
             outputGate: "query-projection-second-half",
-            runnable: false,
+            kernels: Object.freeze([
+              "full-attention-prepare",
+              "full-attention-online",
+            ] as const),
+            stateLayout: "fp16-kv-pages",
+            runnable: true,
           })
         : Object.freeze({
-            kind: "linear-attention-placeholder",
+            kind: "gated-deltanet",
             layer,
             tensors: linearBindings(layer),
-            runnable: false,
+            kernels: Object.freeze([
+              "deltanet-conv",
+              "deltanet-parameters",
+              "deltanet-recurrent",
+              "deltanet-gated-norm",
+            ] as const),
+            stateLayout: "fp32-recurrent-state",
+            runnable: true,
           }),
       Object.freeze({ kind: "residual-add", layer, site: "attention" }),
       Object.freeze({
@@ -412,5 +440,7 @@ export function buildQwen35Program(input: {
     model: "qwen35-4b",
     invocations: Object.freeze(invocations),
     tensorBindings: immutableTensorBindings(tensorBindings),
+    runnable: false,
+    blockedBy: "weight-orchestration",
   });
 }
