@@ -1,5 +1,6 @@
 import {
   GgmlType,
+  ggmlTensorByteLength,
   ggmlTypeLayout,
   type GgufTensorInfo,
   type ParsedGguf,
@@ -57,7 +58,6 @@ export interface RandomAccessWriter {
 }
 
 interface TypeLayout {
-  readonly elements: bigint;
   readonly sourceBytes: number;
   readonly outputBytes: number;
   readonly transform: PlannedSegment["transform"];
@@ -66,7 +66,6 @@ interface TypeLayout {
 function nativeCopyLayout(type: GgmlType): TypeLayout {
   const layout = ggmlTypeLayout(type);
   return {
-    elements: layout.blockElements,
     sourceBytes: Number(layout.blockBytes),
     outputBytes: Number(layout.blockBytes),
     transform: "copy",
@@ -93,7 +92,6 @@ const TYPE_LAYOUTS = new Map<GgmlType, TypeLayout>([
   [
     GgmlType.Q3_K,
     {
-      elements: nativeQ3K.blockElements,
       sourceBytes: Number(nativeQ3K.blockBytes),
       outputBytes: 112,
       transform: "q3-k-110-to-112",
@@ -104,10 +102,6 @@ const TYPE_LAYOUTS = new Map<GgmlType, TypeLayout>([
   [GgmlType.Q6_K, nativeCopyLayout(GgmlType.Q6_K)],
   [GgmlType.Q8_K, nativeCopyLayout(GgmlType.Q8_K)],
 ]);
-
-function tensorElementCount(tensor: GgufTensorInfo): bigint {
-  return tensor.dimensions.reduce((product, dimension) => product * dimension, 1n);
-}
 
 function tensorLayout(tensor: GgufTensorInfo): {
   layout: TypeLayout;
@@ -120,17 +114,12 @@ function tensorLayout(tensor: GgufTensorInfo): {
       `Unsupported GGML tensor type ${tensor.type} for ${tensor.name}`,
     );
   }
-  const elements = tensorElementCount(tensor);
-  if (elements % layout.elements !== 0n) {
-    throw new Error(
-      `Tensor ${tensor.name} does not contain whole quantization blocks`,
-    );
-  }
-  const blockCount = elements / layout.elements;
+  const sourceBytes = ggmlTensorByteLength(tensor.type, tensor.dimensions);
+  const blockCount = sourceBytes / BigInt(layout.sourceBytes);
   return {
     layout,
     blockCount,
-    sourceBytes: blockCount * BigInt(layout.sourceBytes),
+    sourceBytes,
   };
 }
 

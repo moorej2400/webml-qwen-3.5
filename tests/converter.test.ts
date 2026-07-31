@@ -284,3 +284,23 @@ test("starts a new shard when alignment crosses a non-aligned shard limit", () =
   );
   assert.equal(result.status, 0, result.stderr.toString());
 });
+
+test("rejects quantized tensors whose contiguous row is a partial block", () => {
+  const malformed = fixtureGguf([
+    {
+      name: "blk.0.attn_q.weight",
+      dimensions: [1n, 256n],
+      type: GgmlType.Q3_K,
+      offset: 0n,
+    },
+  ]);
+
+  assert.throws(
+    () =>
+      planConversion(malformed, {
+        maxShardBytes: 224n,
+        tensorAlignment: 16,
+      }),
+    /contiguous row dimension.*complete.*block/i,
+  );
+});

@@ -160,6 +160,9 @@ export function ggmlTensorByteLength(
   dimensions: readonly bigint[],
 ): bigint {
   const layout = ggmlTypeLayout(type);
+  if (dimensions.length === 0) {
+    throw new Error("GGML tensor must have at least one dimension");
+  }
   let elementCount = 1n;
   for (const dimension of dimensions) {
     if (dimension < 1n || elementCount > MAX_UINT64 / dimension) {
@@ -167,15 +170,20 @@ export function ggmlTensorByteLength(
     }
     elementCount *= dimension;
   }
-  if (elementCount % layout.blockElements !== 0n) {
-    throw new Error("GGML tensor does not contain a complete quantization block");
+  const rowElements = dimensions[0]!;
+  // GGML restarts block packing for each dimensions[0] row; checking only the
+  // total product would accept malformed transposed shapes such as [1, 256].
+  if (rowElements % layout.blockElements !== 0n) {
+    throw new Error(
+      "GGML tensor contiguous row dimension must contain complete quantization blocks",
+    );
   }
-  const byteLength =
-    (elementCount / layout.blockElements) * layout.blockBytes;
-  if (byteLength > MAX_UINT64) {
+  const rowBytes = (rowElements / layout.blockElements) * layout.blockBytes;
+  const rowCount = elementCount / rowElements;
+  if (rowBytes > MAX_UINT64 / rowCount) {
     throw new Error("GGML tensor byte length exceeds the supported bound");
   }
-  return byteLength;
+  return rowBytes * rowCount;
 }
 
 class Cursor {

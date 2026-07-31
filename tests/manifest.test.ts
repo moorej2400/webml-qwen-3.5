@@ -254,3 +254,13 @@ test("compares segment quantization attributes by value, not key order", () => {
 
   assert.doesNotThrow(() => validateModelPackageManifest(manifest));
 });
+
+test("rejects quantized tensors whose contiguous row is a partial block", () => {
+  const manifest = validManifest();
+  manifest.tensorLayout[0]!.shape = ["1", "256"];
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /contiguous row dimension.*complete.*block/i,
+  );
+});

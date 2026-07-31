@@ -322,3 +322,20 @@ test("decodes signed bytes from readers that return subarray views", async () =>
 
   assert.equal(parsed.metadata["fixture.signed"], -7);
 });
+
+test("rejects quantized tensors whose contiguous row is a partial block", async () => {
+  const malformed = validFixture();
+  const marker = new TextEncoder().encode("blk.0.attn_q.weight");
+  const markerIndex = malformed.findIndex((_, index) =>
+    marker.every((byte, offset) => malformed[index + offset] === byte),
+  );
+  const firstDimension = markerIndex + marker.length + 4;
+  const dimensions = new DataView(malformed.buffer);
+  dimensions.setBigUint64(firstDimension, 1n, true);
+  dimensions.setBigUint64(firstDimension + 8, 256n, true);
+
+  await assert.rejects(
+    parseGguf(memoryReader(malformed)),
+    /contiguous row dimension.*complete.*block/i,
+  );
+});
