@@ -23,6 +23,10 @@ export * from "./qwen35-program.js";
 export * from "./qwen35-session.js";
 export type {
   Qwen35BrowserLoadOptions,
+  Qwen35DriverFactoryContext,
   Qwen35ExecutionDriverFactory,
+  Qwen35PackageDirectory,
+  Qwen35PackageSegment,
+  Qwen35PackageTensor,
 } from "./qwen35-model-loader.js";
 export * from "./tensor-policy.js";

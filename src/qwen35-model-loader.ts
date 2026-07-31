@@ -23,6 +23,7 @@ import {
   type Qwen35HybridStateResource,
 } from "./hybrid-state.js";
 import {
+  stringifyManifest,
   validateModelPackageManifest,
   type ImmutableArtifactIdentity,
   type ModelPackageManifest,
@@ -31,6 +32,7 @@ import {
 import {
   BrowserOpfsStorage,
   ImmutableOpfsModelCache,
+  modelCacheKey,
   type CachedModelPackage,
   type ModelCacheStorage,
 } from "./opfs-model-cache.js";
@@ -77,6 +79,33 @@ interface Qwen35OwnedDevice extends GpuArenaDevice {
   destroy(): void;
 }
 
+export interface Qwen35PackageSegment {
+  readonly shardIndex: number;
+  readonly shardOffset: string;
+  readonly tensorOffset: string;
+  readonly length: string;
+}
+
+export interface Qwen35PackageTensor {
+  readonly name: string;
+  readonly shape: readonly number[];
+  readonly ggmlType: number;
+  readonly storageType: string;
+  readonly segments: readonly Qwen35PackageSegment[];
+}
+
+export interface Qwen35PackageDirectory {
+  readonly manifestSha256: string;
+  readonly shards: readonly {
+    readonly index: number;
+    readonly url: string;
+    readonly offset: string;
+    readonly length: string;
+    readonly sha256: string;
+  }[];
+  readonly tensors: readonly Qwen35PackageTensor[];
+}
+
 export interface Qwen35WeightUploadInput {
   readonly shardIndex: number;
   readonly allocation: GpuAllocation;
@@ -91,6 +120,8 @@ export interface Qwen35DriverFactoryContext {
   readonly arena: GpuArena;
   readonly hybridState: Qwen35HybridState;
   readonly weightAllocations: readonly GpuAllocation[];
+  /** Exact immutable mapping from logical tensors to uploaded shard ranges. */
+  readonly packageDirectory: Qwen35PackageDirectory;
 }
 
 /** Installation point for the next model-scheduler milestone. */
@@ -110,6 +141,8 @@ export interface Qwen35ExecutionDriverFactory {
 export interface Qwen35BrowserLoadOptions extends LoadOptions {
   readonly manifest: ModelPackageManifest;
   readonly packageBaseUrl: string;
+  readonly expectedPackageBaseUrl: string;
+  readonly expectedManifestSha256: string;
   readonly compiledTokenizerUrl: string;
   readonly executionDriverFactory?: Qwen35ExecutionDriverFactory;
   readonly fetchImplementation?: typeof fetch;
@@ -123,6 +156,25 @@ function browserLoadOptions(
   options: LoadOptions,
 ): Qwen35BrowserLoadOptions {
   return options as Qwen35BrowserLoadOptions;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) {
+    return value;
+  }
+  for (const child of Object.values(value)) {
+    deepFreeze(child);
+  }
+  return Object.freeze(value);
+}
+
+/** Copies caller-owned manifest data into an immutable canonical snapshot. */
+export function snapshotQwen35Manifest(
+  manifest: ModelPackageManifest,
+): ModelPackageManifest {
+  const canonical = stringifyManifest(manifest);
+  const owned = JSON.parse(canonical) as ModelPackageManifest;
+  return deepFreeze(validateModelPackageManifest(owned));
 }
 
 function sameIdentity(
@@ -150,6 +202,52 @@ export function assertQwen35PackageIdentity(
     throw diagnosticError(
       "model-package-identity-mismatch",
       "Model package does not match the pinned Qwen3.5 sources",
+    );
+  }
+}
+
+export function assertQwen35ConvertedPackageTrust(
+  manifest: ModelPackageManifest,
+  pins: {
+    readonly packageBaseUrl: string;
+    readonly expectedPackageBaseUrl: string;
+    readonly expectedManifestSha256: string;
+  },
+): void {
+  const expectedBase = safeUrl(
+    pins.expectedPackageBaseUrl,
+    "Expected package base URL",
+  );
+  if (
+    expectedBase.hostname !== "huggingface.co" ||
+    expectedBase.search !== "" ||
+    expectedBase.hash !== "" ||
+    !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/$/.test(
+      expectedBase.pathname,
+    )
+  ) {
+    throw diagnosticError(
+      "model-package-url-mutable",
+      "Converted package pin must use an immutable Hugging Face revision URL",
+    );
+  }
+  const actualBase = safeUrl(pins.packageBaseUrl, "Package base URL");
+  if (
+    pins.packageBaseUrl !== pins.expectedPackageBaseUrl ||
+    actualBase.href !== expectedBase.href
+  ) {
+    throw diagnosticError(
+      "model-package-url-mismatch",
+      "Package base URL does not match the application pin",
+    );
+  }
+  if (
+    !/^[a-f0-9]{64}$/.test(pins.expectedManifestSha256) ||
+    modelCacheKey(manifest) !== pins.expectedManifestSha256
+  ) {
+    throw diagnosticError(
+      "model-package-manifest-mismatch",
+      "Model package manifest does not match the application pin",
     );
   }
 }
@@ -211,6 +309,61 @@ export function buildQwen35TensorDirectory(
     }
   }
   return Object.freeze([...tensors.values()]);
+}
+
+export function buildQwen35PackageDirectory(
+  sourceManifest: ModelPackageManifest,
+): Qwen35PackageDirectory {
+  const manifest = validateModelPackageManifest(sourceManifest);
+  const tensors = new Map<string, {
+    entry: Omit<Qwen35PackageTensor, "segments">;
+    segments: Qwen35PackageSegment[];
+  }>();
+  for (const segment of manifest.tensorLayout) {
+    const shape = Object.freeze(
+      segment.shape.map((dimension) => safeBytes(dimension, "Tensor dimension")),
+    );
+    const existing = tensors.get(segment.name);
+    const entry = Object.freeze({
+      name: segment.name,
+      shape,
+      ggmlType: segment.ggmlType,
+      storageType: segment.storageType,
+    });
+    if (
+      existing !== undefined &&
+      (existing.entry.ggmlType !== entry.ggmlType ||
+        existing.entry.storageType !== entry.storageType ||
+        existing.entry.shape.length !== entry.shape.length ||
+        existing.entry.shape.some((value, index) => value !== entry.shape[index]))
+    ) {
+      throw diagnosticError(
+        "model-tensor-directory-invalid",
+        "Tensor segments disagree at the driver boundary",
+      );
+    }
+    const grouped = existing ?? { entry, segments: [] };
+    grouped.segments.push(Object.freeze({
+      shardIndex: segment.shard,
+      shardOffset: segment.shardOffset,
+      tensorOffset: segment.tensorOffset,
+      length: segment.length,
+    }));
+    tensors.set(segment.name, grouped);
+  }
+  return Object.freeze({
+    manifestSha256: modelCacheKey(manifest),
+    shards: Object.freeze(manifest.shards.map((shard, index) => Object.freeze({
+      index,
+      url: shard.url,
+      offset: shard.offset,
+      length: shard.length,
+      sha256: shard.sha256,
+    }))),
+    tensors: Object.freeze([...tensors.values()].map(({ entry, segments }) =>
+      Object.freeze({ ...entry, segments: Object.freeze(segments) }),
+    )),
+  });
 }
 
 async function* responseChunks(
@@ -343,6 +496,51 @@ function destroyReverse(allocations: readonly GpuAllocation[]): unknown {
   return firstError;
 }
 
+export async function cleanupQwen35GpuResources(input: {
+  readonly driver: Pick<Qwen35ExecutionDriver, "dispose"> | null;
+  readonly device: {
+    readonly queue: { onSubmittedWorkDone(): Promise<void> };
+    destroy(): void;
+  };
+  readonly hybridState: Pick<Qwen35HybridState, "dispose"> | null;
+  readonly weightAllocations: readonly GpuAllocation[];
+  readonly ledger: Pick<AllocationLedger, "assertAllReleased">;
+}): Promise<void> {
+  let firstError: unknown;
+  try {
+    await input.driver?.dispose();
+  } catch (error) {
+    firstError ??= error;
+  }
+  try {
+    // Submitted work may still reference weights or state after create/upload
+    // fails. Destruction starts only after the queue reaches this boundary.
+    await input.device.queue.onSubmittedWorkDone();
+  } catch (error) {
+    firstError ??= error;
+  }
+  try {
+    input.hybridState?.dispose();
+  } catch (error) {
+    firstError ??= error;
+  }
+  const weightError = destroyReverse(input.weightAllocations);
+  firstError ??= weightError;
+  try {
+    input.device.destroy();
+  } catch (error) {
+    firstError ??= error;
+  }
+  try {
+    input.ledger.assertAllReleased();
+  } catch (error) {
+    firstError ??= error;
+  }
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+}
+
 export function qwen35AllocatedWeightBytes(
   shards: readonly { readonly byteLength: number }[],
 ): bigint {
@@ -351,6 +549,40 @@ export function qwen35AllocatedWeightBytes(
       sum + ((BigInt(shard.byteLength) + 3n) / 4n) * 4n,
     0n,
   );
+}
+
+const GPU_LEDGER_REPRESENTATION_GUARD = BigInt(Number.MAX_SAFE_INTEGER);
+
+export function createQwen35GpuLedger(
+  requiredBytes: bigint,
+  experimentalBudgetBytes?: bigint,
+): AllocationLedger {
+  // The default is only the largest value metrics can represent exactly. It is
+  // not a product limit, device capability claim, or inferred memory budget.
+  const limitBytes =
+    experimentalBudgetBytes ?? GPU_LEDGER_REPRESENTATION_GUARD;
+  if (requiredBytes > GPU_LEDGER_REPRESENTATION_GUARD) {
+    throw diagnosticError(
+      "model-size-unsafe",
+      "Tracked GPU ownership exceeds the safe metrics representation",
+    );
+  }
+  if (
+    experimentalBudgetBytes !== undefined &&
+    experimentalBudgetBytes > GPU_LEDGER_REPRESENTATION_GUARD
+  ) {
+    throw diagnosticError(
+      "gpu-ledger-limit-unsafe",
+      "GPU ledger budget exceeds the safe metrics representation",
+    );
+  }
+  if (limitBytes < requiredBytes) {
+    throw diagnosticError(
+      "gpu-ledger-limit-insufficient",
+      "GPU ledger cannot own the complete model and context state",
+    );
+  }
+  return new AllocationLedger(limitBytes);
 }
 
 /** Builds the authenticated, GPU-owned resources for one lock-held session. */
@@ -366,8 +598,11 @@ export async function loadQwen35BrowserResources(
       "The Qwen3.5 execution driver is not installed",
     );
   }
-  const manifest = validateModelPackageManifest(options.manifest);
+  // No caller-owned manifest reference crosses the first asynchronous
+  // boundary. Every later cache, URL, and driver read uses this snapshot.
+  const manifest = snapshotQwen35Manifest(options.manifest);
   assertQwen35PackageIdentity(manifest);
+  assertQwen35ConvertedPackageTrust(manifest, options);
   const packageBase = safeUrl(options.packageBaseUrl, "Package base URL");
   const tokenizerUrl = safeUrl(
     options.compiledTokenizerUrl,
@@ -412,6 +647,7 @@ export async function loadQwen35BrowserResources(
     config: QWEN35_4B_CONFIG,
     tensors: buildQwen35TensorDirectory(manifest),
   });
+  const packageDirectory = buildQwen35PackageDirectory(manifest);
   const navigatorWithGpu = globalThis.navigator as
     | (Navigator & {
     readonly gpu?: WebGpuProbeSurface["gpu"];
@@ -446,22 +682,16 @@ export async function loadQwen35BrowserResources(
   ).totalBytes;
   const weightBytes = qwen35AllocatedWeightBytes(cached.shards);
   const minimumLedgerBytes = stateBytes + weightBytes;
-  if (minimumLedgerBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
-    device.destroy();
-    throw diagnosticError(
-      "model-size-unsafe",
-      "Tracked GPU ownership exceeds the safe metrics representation",
+  let ledger: AllocationLedger;
+  try {
+    ledger = createQwen35GpuLedger(
+      minimumLedgerBytes,
+      options.gpuLedgerLimitBytes,
     );
-  }
-  const ledgerLimit = options.gpuLedgerLimitBytes ?? minimumLedgerBytes;
-  if (ledgerLimit < minimumLedgerBytes) {
+  } catch (error) {
     device.destroy();
-    throw diagnosticError(
-      "gpu-ledger-limit-insufficient",
-      "GPU ledger cannot own the complete model and context state",
-    );
+    throw error;
   }
-  const ledger = new AllocationLedger(ledgerLimit);
   const arena = new GpuArena(device, ledger, {
     bufferShardCapBytes: BigInt(profile.bufferShardCapBytes),
   });
@@ -491,6 +721,7 @@ export async function loadQwen35BrowserResources(
       arena,
       hybridState,
       weightAllocations: Object.freeze([...weightAllocations]),
+      packageDirectory,
     });
     await streamQwen35CachedWeights({
       storage,
@@ -503,31 +734,15 @@ export async function loadQwen35BrowserResources(
     });
     signal.throwIfAborted();
   } catch (error) {
-    let cleanupFailed = false;
     try {
-      await driver?.dispose();
+      await cleanupQwen35GpuResources({
+        driver,
+        device,
+        hybridState,
+        weightAllocations,
+        ledger,
+      });
     } catch {
-      cleanupFailed = true;
-    }
-    try {
-      hybridState?.dispose();
-    } catch {
-      cleanupFailed = true;
-    }
-    if (destroyReverse(weightAllocations) !== undefined) {
-      cleanupFailed = true;
-    }
-    try {
-      device.destroy();
-    } catch {
-      cleanupFailed = true;
-    }
-    try {
-      ledger.assertAllReleased();
-    } catch {
-      cleanupFailed = true;
-    }
-    if (cleanupFailed) {
       throw diagnosticError(
         "model-load-rollback-failed",
         "Model load rollback did not complete",
@@ -544,40 +759,27 @@ export async function loadQwen35BrowserResources(
     driver: ownedDriver,
     cacheHit: cached.cacheHit,
     trackedCpuBytes: PINNED_QWEN35_COMPILED_TOKENIZER.byteLength,
-    trackedGpuBytes: Number(minimumLedgerBytes),
+    trackedGpuBytes: Number(ledger.snapshot().currentBytes),
+    gpuByteMetrics() {
+      const snapshot = ledger.snapshot();
+      return Object.freeze({
+        currentBytes: Number(snapshot.currentBytes),
+        peakBytes: Number(snapshot.peakBytes),
+      });
+    },
     deviceLost: device.lost,
     async dispose() {
       if (disposed) return;
       disposed = true;
-      let firstError: unknown;
       try {
-        await ownedDriver.dispose();
-      } catch (error) {
-        firstError ??= error;
-      }
-      try {
-        await device.queue.onSubmittedWorkDone();
-      } catch (error) {
-        firstError ??= error;
-      }
-      try {
-        ownedState.dispose();
-      } catch (error) {
-        firstError ??= error;
-      }
-      const weightCleanupError = destroyReverse(weightAllocations);
-      firstError ??= weightCleanupError;
-      try {
-        device.destroy();
-      } catch (error) {
-        firstError ??= error;
-      }
-      try {
-        ledger.assertAllReleased();
-      } catch (error) {
-        firstError ??= error;
-      }
-      if (firstError !== undefined) {
+        await cleanupQwen35GpuResources({
+          driver: ownedDriver,
+          device,
+          hybridState: ownedState,
+          weightAllocations,
+          ledger,
+        });
+      } catch {
         throw diagnosticError(
           "model-resource-cleanup-failed",
           "Model resource cleanup did not complete",

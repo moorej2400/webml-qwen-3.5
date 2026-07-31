@@ -155,6 +155,9 @@ function driver(ids: readonly number[] = [97, 226, 130, 172]): {
           yield id;
         }
       },
+      async cancel() {
+        events.push("driver-cancel");
+      },
       async reset() {
         events.push("reset");
       },
@@ -307,6 +310,7 @@ test("renders and prefills exact text while rejecting image input until vision l
   const state = await session.prefill([{ role: "user", content: "hello" }]);
   assert.ok(state.contextTokens > 5);
   assert.match(state.rendered, /^<\|im_start\|>user\nhello/);
+  await session.reset();
   await assert.rejects(
     session.prefill([
       {
@@ -318,6 +322,26 @@ test("renders and prefills exact text while rejecting image input until vision l
       error instanceof RuntimeDiagnosticError &&
       error.code === "vision-not-loaded",
   );
+  await session.dispose();
+});
+
+test("requires reset before replacing an existing full prefill", async () => {
+  const fake = driver();
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+  await session.prefill([{ role: "user", content: "first" }]);
+
+  await assert.rejects(
+    session.prefill([{ role: "user", content: "replacement" }]),
+    { code: "session-reset-required" },
+  );
+
+  assert.equal(
+    fake.events.filter((event) => event.startsWith("prefill:")).length,
+    1,
+  );
+  await session.reset();
+  await session.prefill([{ role: "user", content: "replacement" }]);
   await session.dispose();
 });
 
@@ -423,6 +447,10 @@ test("generator early return cancels once and reset reuses loaded resources", as
 
 test("cancel aborts an active prefill and returns session ownership to ready", async () => {
   const fake = driver();
+  let releaseCancel!: () => void;
+  const cancelGate = new Promise<void>((resolve) => {
+    releaseCancel = resolve;
+  });
   fake.driver.prefill = async ({ signal }) =>
     new Promise<void>((_resolve, reject) => {
       signal.addEventListener(
@@ -431,17 +459,31 @@ test("cancel aborts an active prefill and returns session ownership to ready", a
         { once: true },
       );
     });
+  fake.driver.cancel = async () => {
+    fake.events.push("cancel-start");
+    await cancelGate;
+    fake.events.push("cancel-end");
+  };
   const session = new Qwen35Session(runtime(fake.driver));
   await session.load({});
 
   const prefill = session.prefill([{ role: "user", content: "hello" }]);
   await Promise.resolve();
-  await session.cancel();
+  const cancellation = session.cancel();
+  await Promise.resolve();
+  assert.equal(fake.events.includes("reset"), false);
+  releaseCancel();
+  await cancellation;
 
   await assert.rejects(prefill, { name: "AbortError" });
   assert.equal(session.state, "ready");
   assert.equal(session.getMetrics().cancellationCount, 1);
-  assert.equal(fake.events.includes("reset"), true);
+  assert.deepEqual(
+    fake.events.filter((event) =>
+      event === "cancel-start" || event === "cancel-end" || event === "reset"
+    ),
+    ["cancel-start", "cancel-end", "reset"],
+  );
   await session.dispose();
 });
 
@@ -457,6 +499,7 @@ test("cancellation idempotence resets for each new operation", async () => {
   for await (const _token of session.generate({ maxNewTokens: 2 })) {
     break;
   }
+  await session.reset();
 
   let releaseSecond!: () => void;
   fake.driver.prefill = async ({ signal }) =>
@@ -501,6 +544,34 @@ test("a failed prefill rollback poisons the session instead of reporting ready",
   await assert.rejects(prefill, /prefill rollback/i);
   assert.equal(session.state, "failed");
   await session.dispose();
+});
+
+test("failed prefill cancellation does not reset unquiesced driver state", async () => {
+  const fake = driver();
+  fake.driver.prefill = async ({ signal }) =>
+    new Promise<void>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => reject(new DOMException("cancelled", "AbortError")),
+        { once: true },
+      );
+    });
+  fake.driver.cancel = async () => {
+    fake.events.push("cancel-failed");
+    throw new Error("private cancellation failure");
+  };
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+
+  const prefill = session.prefill([{ role: "user", content: "hello" }]);
+  await Promise.resolve();
+  await assert.rejects(session.cancel(), { code: "driver-cancel-failed" });
+  await assert.rejects(prefill, { code: "driver-cancel-failed" });
+
+  assert.equal(session.state, "failed");
+  assert.equal(fake.events.includes("reset"), false);
+  await assert.rejects(session.dispose(), { code: "driver-cancel-failed" });
+  assert.equal(fake.events.includes("driver-dispose"), true);
 });
 
 test("cancel stops an active generation iterator exactly once", async () => {
@@ -558,6 +629,214 @@ test("cancel settles a generation iterator that never started", async () => {
   await session.dispose();
 });
 
+test("concurrent cancel and dispose await one shared driver cancellation", async () => {
+  let cancelCount = 0;
+  let releaseCancel!: () => void;
+  const cancelGate = new Promise<void>((resolve) => {
+    releaseCancel = resolve;
+  });
+  const fake = driver([97]);
+  fake.driver.cancel = async () => {
+    cancelCount += 1;
+    await cancelGate;
+  };
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+  await session.prefill([{ role: "user", content: "hello" }]);
+  session.generate({ maxNewTokens: 1 });
+
+  let firstSettled = false;
+  let secondSettled = false;
+  let disposeSettled = false;
+  const first = session.cancel().finally(() => {
+    firstSettled = true;
+  });
+  const second = session.cancel().finally(() => {
+    secondSettled = true;
+  });
+  const disposing = session.dispose().finally(() => {
+    disposeSettled = true;
+  });
+  await Promise.resolve();
+
+  assert.equal(cancelCount, 1);
+  assert.equal(firstSettled, false);
+  assert.equal(secondSettled, false);
+  assert.equal(disposeSettled, false);
+  releaseCancel();
+  await Promise.all([first, second, disposing]);
+  assert.equal(session.state, "disposed");
+});
+
+test("dispose stays sticky while concurrent cancellation and cleanup settle", async () => {
+  let finishCancel!: () => void;
+  const cancelGate = new Promise<void>((resolve) => {
+    finishCancel = resolve;
+  });
+  let finishCleanup!: () => void;
+  const cleanupGate = new Promise<void>((resolve) => {
+    finishCleanup = resolve;
+  });
+  const events: string[] = [];
+  const fake = driver([97]);
+  fake.driver.cancel = async () => {
+    events.push("cancel-start");
+    await cancelGate;
+    events.push("cancel-end");
+  };
+  const stickyRuntime = runtime(fake.driver);
+  const loadResources = stickyRuntime.load.bind(stickyRuntime);
+  stickyRuntime.load = async (signal, options) => {
+    const resources = await loadResources(signal, options);
+    return {
+      ...resources,
+      async dispose() {
+        events.push("cleanup-start");
+        await cleanupGate;
+        events.push("cleanup-end");
+        await resources.dispose();
+      },
+    };
+  };
+  const session = new Qwen35Session(stickyRuntime);
+  await session.load({});
+  await session.prefill([{ role: "user", content: "hello" }]);
+  session.generate({ maxNewTokens: 1 });
+
+  const disposing = session.dispose();
+  assert.equal(session.state, "disposing");
+  const cancelling = session.cancel();
+  await Promise.resolve();
+  finishCancel();
+  await cancelling;
+  while (!events.includes("cleanup-start")) {
+    await Promise.resolve();
+  }
+
+  assert.equal(session.state, "disposing");
+  await assert.rejects(
+    session.prefill([{ role: "user", content: "blocked" }]),
+    { code: "session-not-ready" },
+  );
+  await assert.rejects(session.reset(), { code: "session-not-ready" });
+  assert.throws(
+    () => session.generate({ maxNewTokens: 1 }),
+    { code: "session-not-ready" },
+  );
+  await assert.rejects(session.load({}), { code: "session-load-illegal" });
+
+  finishCleanup();
+  await disposing;
+  assert.equal(session.state, "disposed");
+  assert.deepEqual(events.slice(0, 4), [
+    "cancel-start",
+    "cancel-end",
+    "cleanup-start",
+    "cleanup-end",
+  ]);
+});
+
+test("rejecting driver cancellation settles ownership and fails diagnostically", async () => {
+  const fake = driver([97]);
+  fake.driver.cancel = async () => {
+    throw new Error("private cancellation failure");
+  };
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+  await session.prefill([{ role: "user", content: "hello" }]);
+  session.generate({ maxNewTokens: 1 });
+
+  await assert.rejects(session.cancel(), { code: "driver-cancel-failed" });
+  assert.equal(session.state, "failed");
+  await assert.rejects(session.dispose(), { code: "driver-cancel-failed" });
+  assert.equal(fake.events.includes("driver-dispose"), true);
+});
+
+test("rejecting cancellation cannot hang disposal after generation started", async () => {
+  const fake = driver([97, 98]);
+  fake.driver.cancel = async () => {
+    throw new Error("private cancellation failure");
+  };
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+  await session.prefill([{ role: "user", content: "hello" }]);
+  const iterator = session.generate({ maxNewTokens: 2 })[Symbol.asyncIterator]();
+  await iterator.next();
+
+  await assert.rejects(session.cancel(), { code: "driver-cancel-failed" });
+  const disposalResult = await Promise.race([
+    session.dispose().then(
+      () => "resolved",
+      (error: unknown) =>
+        error instanceof RuntimeDiagnosticError ? error.code : "unsafe-error",
+    ),
+    new Promise<string>((resolve) => {
+      setTimeout(() => resolve("timed-out"), 25);
+    }),
+  ]);
+
+  assert.equal(disposalResult, "driver-cancel-failed");
+  const eventsAfterDispose = [...fake.events];
+  await assert.rejects(iterator.next(), { code: "driver-cancel-failed" });
+  assert.deepEqual(fake.events, eventsAfterDispose);
+  assert.equal(session.state, "failed");
+  assert.equal(fake.events.includes("driver-dispose"), true);
+});
+
+test("successful cancellation retires the inner iterator before reuse", async () => {
+  const events: string[] = [];
+  let operation = 0;
+  let activeInner = false;
+  const fake = driver();
+  fake.driver.generate = function () {
+    const id = operation + 1;
+    operation = id;
+    return (async function* () {
+      assert.equal(activeInner, false);
+      activeInner = true;
+      events.push(`inner-start-${id}`);
+      try {
+        yield 97;
+        yield 98;
+      } finally {
+        events.push(`inner-finally-${id}`);
+        activeInner = false;
+      }
+    })();
+  };
+  let cancelCount = 0;
+  fake.driver.cancel = async () => {
+    cancelCount += 1;
+    events.push(`driver-cancel-${cancelCount}`);
+  };
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+  await session.prefill([{ role: "user", content: "hello" }]);
+  const first = session.generate({ maxNewTokens: 2 })[Symbol.asyncIterator]();
+  await first.next();
+
+  await session.cancel();
+  assert.equal(session.state, "ready");
+  assert.deepEqual(events, [
+    "inner-start-1",
+    "driver-cancel-1",
+    "inner-finally-1",
+  ]);
+
+  const second = session.generate({ maxNewTokens: 2 })[Symbol.asyncIterator]();
+  await second.next();
+  const eventsBeforeStaleResume = [...events];
+  await assert.rejects(first.next(), { name: "AbortError" });
+  assert.deepEqual(events, eventsBeforeStaleResume);
+  assert.equal(session.state, "generating");
+
+  await second.return?.();
+  assert.deepEqual(events.slice(-2), ["driver-cancel-2", "inner-finally-2"]);
+  assert.equal(cancelCount, 2);
+  await session.dispose();
+  assert.equal(cancelCount, 2);
+});
+
 test("dispose waits for resource cleanup before lock ownership returns", async () => {
   const events: string[] = [];
   const fake = driver();
@@ -596,7 +875,25 @@ test("cleanup failure rejects dispose and leaves ownership failed", async () => 
 
 test("metrics contain structured values without prompt or output content", async () => {
   const fake = driver([115, 101, 99, 114, 101, 116]);
-  const session = new Qwen35Session(runtime(fake.driver));
+  let currentGpuBytes = 41;
+  let peakGpuBytes = 55;
+  const liveRuntime = runtime(fake.driver);
+  const loadResources = liveRuntime.load.bind(liveRuntime);
+  liveRuntime.load = async (signal, options) => {
+    const resources = await loadResources(signal, options);
+    return {
+      ...resources,
+      gpuByteMetrics: () => ({
+        currentBytes: currentGpuBytes,
+        peakBytes: peakGpuBytes,
+      }),
+      async dispose() {
+        await resources.dispose();
+        currentGpuBytes = 0;
+      },
+    };
+  };
+  const session = new Qwen35Session(liveRuntime);
   await session.load({});
   await session.prefill([{ role: "user", content: "PRIVATE PROMPT" }]);
   for await (const _token of session.generate({ maxNewTokens: 6 })) {
@@ -606,10 +903,17 @@ test("metrics contain structured values without prompt or output content", async
   const metrics = session.getMetrics();
   assert.equal(metrics.cacheHit, true);
   assert.equal(metrics.trackedCpuBytes, 12);
-  assert.equal(metrics.trackedGpuBytes, 34);
+  assert.equal(metrics.trackedGpuBytes, 41);
+  assert.equal(metrics.peakTrackedGpuBytes, 55);
+  currentGpuBytes = 43;
+  peakGpuBytes = 60;
+  assert.equal(session.getMetrics().trackedGpuBytes, 43);
+  assert.equal(session.getMetrics().peakTrackedGpuBytes, 60);
   assert.equal(JSON.stringify(metrics).includes("PRIVATE"), false);
   assert.equal(JSON.stringify(metrics).includes("secret"), false);
   await session.dispose();
+  assert.equal(session.getMetrics().trackedGpuBytes, 0);
+  assert.equal(session.getMetrics().peakTrackedGpuBytes, 60);
 });
 
 test("device loss is counted and fails closed until disposal", async () => {
@@ -639,4 +943,61 @@ test("device loss is counted and fails closed until disposal", async () => {
   assert.equal(session.state, "failed");
   assert.equal(session.getMetrics().deviceLostCount, 1);
   await session.dispose();
+});
+
+test("device loss during reset cannot restore the ready state", async () => {
+  let lose!: () => void;
+  const lost = new Promise<void>((resolve) => {
+    lose = resolve;
+  });
+  let finishReset!: () => void;
+  const resetGate = new Promise<void>((resolve) => {
+    finishReset = resolve;
+  });
+  const fake = driver();
+  fake.driver.reset = async () => {
+    await resetGate;
+  };
+  const withLoss = runtime(fake.driver);
+  const loadResources = withLoss.load.bind(withLoss);
+  withLoss.load = async (signal, options) => ({
+    ...(await loadResources(signal, options)),
+    deviceLost: lost,
+  });
+  const session = new Qwen35Session(withLoss);
+  await session.load({});
+
+  const resetting = session.reset();
+  await Promise.resolve();
+  lose();
+  await Promise.resolve();
+  finishReset();
+
+  await assert.rejects(resetting, { code: "device-lost" });
+  assert.equal(session.state, "failed");
+  assert.equal(session.getMetrics().deviceLostCount, 1);
+  await session.dispose();
+});
+
+test("dispose supersedes reset without a transient ready publication", async () => {
+  let finishReset!: () => void;
+  const resetGate = new Promise<void>((resolve) => {
+    finishReset = resolve;
+  });
+  const fake = driver();
+  fake.driver.reset = async () => {
+    await resetGate;
+  };
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+
+  const resetting = session.reset();
+  await Promise.resolve();
+  const disposing = session.dispose();
+  finishReset();
+
+  await assert.rejects(resetting, { code: "session-operation-superseded" });
+  assert.notEqual(session.state, "ready");
+  await disposing;
+  assert.equal(session.state, "disposed");
 });

@@ -63,7 +63,8 @@ export interface Qwen35ExecutionDriver {
   /** A rejected or cancelled prefill may be partial; reset must clear it fully. */
   prefill(input: Qwen35DriverPrefillInput): Promise<void>;
   generate(input: Qwen35DriverGenerateInput): AsyncIterable<number>;
-  cancel?(): Promise<void>;
+  /** Resolves only after active driver work is quiescent. */
+  cancel(): Promise<void>;
   reset(): Promise<void>;
   dispose(): Promise<void>;
 }
@@ -74,6 +75,10 @@ export interface Qwen35LoadedResources {
   readonly cacheHit: boolean;
   readonly trackedCpuBytes: number;
   readonly trackedGpuBytes: number;
+  readonly gpuByteMetrics?: () => {
+    readonly currentBytes: number;
+    readonly peakBytes: number;
+  };
   readonly deviceLost?: Promise<unknown>;
   dispose(): Promise<void>;
 }
@@ -104,6 +109,7 @@ export interface RuntimeMetrics {
   readonly cacheHit: boolean | null;
   readonly trackedCpuBytes: number;
   readonly trackedGpuBytes: number;
+  readonly peakTrackedGpuBytes: number;
   readonly contextTokens: number;
   readonly timeToFirstTokenMilliseconds: number | null;
   readonly prefillTokens: number;
@@ -124,6 +130,13 @@ interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
   reject(error: unknown): void;
+}
+
+interface GenerationOperation {
+  readonly settled: Deferred<void>;
+  driverIterator: AsyncIterator<number> | null;
+  cancellationPromise: Promise<void> | null;
+  retirementPromise: Promise<void> | null;
 }
 
 function deferred<T>(): Deferred<T> {
@@ -190,17 +203,19 @@ export class Qwen35Session {
   #lockPromise: Promise<void> | null = null;
   #lifetime: Deferred<void> | null = null;
   #disposePromise: Promise<void> | null = null;
+  #disposeRequested = false;
   #loadCancellationRequested = false;
   #operationController: AbortController | null = null;
   #operationSettled: Deferred<void> | null = null;
+  #generationOperation: GenerationOperation | null = null;
   #activeGenerate = false;
-  #generateStarted = false;
-  #operationCancellationRequested = false;
+  #operationCancellationPromise: Promise<void> | null = null;
   #sequenceTokenIds: readonly number[] | null = null;
   #contextTokens = 0;
   #cacheHit: boolean | null = null;
   #trackedCpuBytes = 0;
   #trackedGpuBytes = 0;
+  #peakTrackedGpuBytes = 0;
   #ttft: number | null = null;
   #prefillTokens = 0;
   #prefillMilliseconds = 0;
@@ -252,6 +267,7 @@ export class Qwen35Session {
           this.#cacheHit = resources.cacheHit;
           this.#trackedCpuBytes = resources.trackedCpuBytes;
           this.#trackedGpuBytes = resources.trackedGpuBytes;
+          this.#peakTrackedGpuBytes = resources.trackedGpuBytes;
           if (resources.deviceLost !== undefined) {
             void resources.deviceLost.then(
               () => this.#onDeviceLost(),
@@ -268,7 +284,18 @@ export class Qwen35Session {
         }
       },
       cleanup: async () => {
-        await this.#resources?.dispose();
+        const resources = this.#resources;
+        await resources?.dispose();
+        const gpuMetrics = resources?.gpuByteMetrics?.();
+        if (gpuMetrics !== undefined) {
+          this.#peakTrackedGpuBytes = Math.max(
+            this.#peakTrackedGpuBytes,
+            gpuMetrics.peakBytes,
+          );
+        }
+        // Successful cleanup releases every GPU allocation. Preserve only the
+        // high-water mark after resource ownership is gone.
+        this.#trackedGpuBytes = 0;
         this.#resources = null;
       },
     });
@@ -300,6 +327,12 @@ export class Qwen35Session {
 
   async prefill(input: TextOrImageConversation): Promise<SequenceState> {
     this.#requireReady();
+    if (this.#sequenceTokenIds !== null) {
+      throw diagnosticError(
+        "session-reset-required",
+        "Reset the session before replacing the prefetched conversation",
+      );
+    }
     if (
       input.some((message) =>
         Array.isArray(message.content) &&
@@ -324,7 +357,7 @@ export class Qwen35Session {
     }
     const controller = new AbortController();
     const operationSettled = deferred<void>();
-    this.#operationCancellationRequested = false;
+    this.#operationCancellationPromise = null;
     this.#operationController = controller;
     this.#operationSettled = operationSettled;
     this.#state = "prefilling";
@@ -347,23 +380,47 @@ export class Qwen35Session {
         remainingContextTokens: assembled.remainingContextTokens,
       });
     } catch (error) {
-      if (controller.signal.aborted && this.#operationCancellationRequested) {
+      if (controller.signal.aborted && this.#operationCancellationPromise !== null) {
+        let cancellationFailure: unknown;
+        let rollbackFailure: unknown;
         try {
-          // Prefill may commit a prefix before it observes abort. Clear that
-          // partial state before this session becomes reusable.
+          // Reset must not overlap driver cancellation. Every observer waits on
+          // this same promise before ownership can become ready or failed.
+          await this.#operationCancellationPromise;
+        } catch (error) {
+          cancellationFailure = error;
+        }
+        if (cancellationFailure !== undefined) {
+          if (!this.#disposeRequested) {
+            this.#state = "failed";
+          }
+          throw cancellationFailure;
+        }
+        try {
+          // A successful cancel proves the driver is quiescent. Only then may
+          // reset clear partial prefill state for reuse.
           await resources.driver.reset();
           this.#sequenceTokenIds = null;
           this.#contextTokens = 0;
-          this.#state = "ready";
-        } catch {
-          this.#state = "failed";
+        } catch (error) {
+          rollbackFailure = error;
+        }
+        if (rollbackFailure !== undefined) {
+          if (!this.#disposeRequested) {
+            this.#state = "failed";
+          }
           throw diagnosticError(
             "prefill-rollback-failed",
             "Cancelled prefill rollback did not complete",
           );
         }
+        if (!this.#disposeRequested) {
+          this.#state = "ready";
+        }
       } else {
-        this.#state = "failed";
+        if (!this.#disposeRequested) {
+          this.#state = "failed";
+        }
       }
       throw error;
     } finally {
@@ -411,14 +468,24 @@ export class Qwen35Session {
     }
 
     this.#activeGenerate = true;
-    this.#generateStarted = false;
-    this.#operationCancellationRequested = false;
+    this.#operationCancellationPromise = null;
     this.#ttft = null;
     this.#state = "generating";
     const controller = new AbortController();
-    this.#operationSettled = deferred<void>();
+    const operation: GenerationOperation = {
+      settled: deferred<void>(),
+      driverIterator: null,
+      cancellationPromise: null,
+      retirementPromise: null,
+    };
+    this.#operationSettled = operation.settled;
+    this.#generationOperation = operation;
     this.#operationController = controller;
-    return this.#generateIterator(maxNewTokens, controller);
+    return this.#generateIterator(
+      maxNewTokens,
+      controller,
+      operation,
+    );
   }
 
   async cancel(): Promise<void> {
@@ -432,43 +499,77 @@ export class Qwen35Session {
       return;
     }
     if (
+      this.#disposeRequested &&
+      this.#operationCancellationPromise !== null
+    ) {
+      try {
+        await this.#operationCancellationPromise;
+      } finally {
+        this.#settleCancelledGeneration();
+      }
+      return;
+    }
+    if (
       this.#state !== "prefilling" &&
       this.#state !== "generating" &&
       this.#state !== "cancelling"
     ) {
       return;
     }
-    await this.#requestOperationCancellation();
-    this.#settleUnstartedGeneration();
+    try {
+      await this.#requestOperationCancellation();
+    } finally {
+      this.#settleCancelledGeneration();
+    }
   }
 
   async reset(): Promise<void> {
     this.#requireReady();
     const started = this.#now();
+    const deviceLostCount = this.#deviceLostCount;
     const operationSettled = deferred<void>();
     this.#operationSettled = operationSettled;
     this.#state = "resetting";
     try {
       await this.#resources!.driver.reset();
+      if (this.#state !== "resetting") {
+        if (this.#deviceLostCount !== deviceLostCount) {
+          throw diagnosticError(
+            "device-lost",
+            "WebGPU device ownership was lost during reset",
+          );
+        }
+        throw diagnosticError(
+          "session-operation-superseded",
+          "Session reset was superseded by a terminal lifecycle operation",
+        );
+      }
       this.#sequenceTokenIds = null;
       this.#contextTokens = 0;
+      this.#operationCancellationPromise = null;
       this.#recordPhase("reset", started);
       this.#state = "ready";
     } catch (error) {
-      this.#state = "failed";
+      if (this.#state === "resetting") {
+        this.#state = "failed";
+      }
       throw error;
     } finally {
-      this.#operationSettled = null;
+      if (this.#operationSettled === operationSettled) {
+        this.#operationSettled = null;
+      }
       operationSettled.resolve(undefined);
     }
   }
 
   dispose(): Promise<void> {
+    this.#disposeRequested = true;
     this.#disposePromise ??= this.#dispose();
     return this.#disposePromise;
   }
 
   getMetrics(): RuntimeMetrics {
+    const gpuMetrics = this.#resources?.gpuByteMetrics?.();
     const phases = Object.fromEntries(
       [...this.#phases]
         .sort(([left], [right]) => left.localeCompare(right))
@@ -479,7 +580,9 @@ export class Qwen35Session {
       phases: Object.freeze(phases),
       cacheHit: this.#cacheHit,
       trackedCpuBytes: this.#trackedCpuBytes,
-      trackedGpuBytes: this.#trackedGpuBytes,
+      trackedGpuBytes: gpuMetrics?.currentBytes ?? this.#trackedGpuBytes,
+      peakTrackedGpuBytes:
+        gpuMetrics?.peakBytes ?? this.#peakTrackedGpuBytes,
       contextTokens: this.#contextTokens,
       timeToFirstTokenMilliseconds: this.#ttft,
       prefillTokens: this.#prefillTokens,
@@ -500,11 +603,12 @@ export class Qwen35Session {
   async *#generateIterator(
     maxNewTokens: number,
     controller: AbortController,
+    operation: GenerationOperation,
   ): AsyncGenerator<GeneratedToken> {
-    if (this.#operationController !== controller) {
+    if (this.#generationOperation !== operation) {
+      await operation.cancellationPromise;
       return;
     }
-    this.#generateStarted = true;
     const resources = this.#resources!;
     const decoder = resources.tokenizer.createStreamingDecoder({
       skipSpecialTokens: true,
@@ -523,8 +627,16 @@ export class Qwen35Session {
           count: resources.tokenizer.undecodableLogitRows,
         }),
       });
-      for await (const id of tokens) {
+      const iterator = tokens[Symbol.asyncIterator]();
+      operation.driverIterator = iterator;
+      while (true) {
+        // A session-side cancellation can detach this consumer while it is
+        // paused at yield. Check before asking the driver for more work.
         controller.signal.throwIfAborted();
+        const item = await iterator.next();
+        controller.signal.throwIfAborted();
+        if (item.done) break;
+        const id = item.value;
         if (generated >= maxNewTokens) {
           throw diagnosticError(
             "driver-token-count-exceeded",
@@ -558,41 +670,105 @@ export class Qwen35Session {
       completed = true;
     } catch (error) {
       const explicitlyCancelled =
-        this.#operationCancellationRequested &&
-        isAbortError(error);
+        this.#operationCancellationPromise !== null && isAbortError(error);
       generationFailed = !explicitlyCancelled;
       throw error;
     } finally {
+      let cancellationFailure: unknown;
+      const ownedAtEntry = this.#generationOperation === operation;
       if (!completed) {
-        await this.#requestOperationCancellation();
+        try {
+          if (ownedAtEntry) {
+            await this.#requestOperationCancellation();
+          } else {
+            await operation.cancellationPromise;
+          }
+        } catch (error) {
+          cancellationFailure = error;
+          generationFailed = true;
+        }
       }
-      const elapsed = this.#recordPhase("generate", started);
-      this.#generationMilliseconds += elapsed;
-      this.#activeGenerate = false;
-      this.#generateStarted = false;
-      this.#operationController = null;
-      this.#operationSettled?.resolve(undefined);
-      this.#operationSettled = null;
-      if (generationFailed) {
-        this.#state = "failed";
-      } else if (
-        this.#state === "generating" ||
-        this.#state === "cancelling"
-      ) {
-        this.#state = "ready";
+      const ownsOperation = this.#generationOperation === operation;
+      if (ownsOperation) {
+        const elapsed = this.#recordPhase("generate", started);
+        this.#generationMilliseconds += elapsed;
+        this.#activeGenerate = false;
+        this.#operationController = null;
+        operation.settled.resolve(undefined);
+        this.#operationSettled = null;
+        this.#generationOperation = null;
+        if (this.#disposeRequested) {
+          // Disposal owns the terminal state transition.
+        } else if (generationFailed) {
+          this.#state = "failed";
+        } else if (
+          this.#state === "generating" ||
+          this.#state === "cancelling"
+        ) {
+          this.#state = "ready";
+        }
+      }
+      if (cancellationFailure !== undefined) {
+        throw cancellationFailure;
       }
     }
   }
 
-  async #requestOperationCancellation(): Promise<void> {
-    if (this.#operationCancellationRequested) {
-      return;
+  #requestOperationCancellation(): Promise<void> {
+    if (this.#operationCancellationPromise !== null) {
+      return this.#operationCancellationPromise;
     }
-    this.#operationCancellationRequested = true;
     this.#cancellationCount += 1;
-    this.#state = "cancelling";
+    if (!this.#disposeRequested) {
+      this.#state = "cancelling";
+    }
     this.#operationController?.abort();
-    await this.#resources?.driver.cancel?.();
+    const generationOperation = this.#generationOperation;
+    this.#operationCancellationPromise = (async () => {
+      try {
+        await this.#resources!.driver.cancel();
+      } catch {
+        const error = diagnosticError(
+          "driver-cancel-failed",
+          "Execution driver cancellation did not complete",
+        );
+        if (!this.#disposeRequested) {
+          this.#state = "failed";
+        }
+        throw error;
+      }
+      if (generationOperation !== null) {
+        await this.#retireGenerationIterator(generationOperation);
+      }
+    })();
+    if (generationOperation !== null) {
+      generationOperation.cancellationPromise =
+        this.#operationCancellationPromise;
+    }
+    return this.#operationCancellationPromise;
+  }
+
+  #retireGenerationIterator(
+    operation: GenerationOperation,
+  ): Promise<void> {
+    if (operation.retirementPromise !== null) {
+      return operation.retirementPromise;
+    }
+    const iterator = operation.driverIterator;
+    operation.retirementPromise = (async () => {
+      try {
+        await iterator?.return?.();
+      } catch {
+        if (!this.#disposeRequested) {
+          this.#state = "failed";
+        }
+        throw diagnosticError(
+          "driver-iterator-retire-failed",
+          "Execution driver iterator retirement did not complete",
+        );
+      }
+    })();
+    return operation.retirementPromise;
   }
 
   async #dispose(): Promise<void> {
@@ -606,22 +782,35 @@ export class Qwen35Session {
     const started = this.#now();
     const wasLoading = this.#state === "loading";
     const wasFailed = this.#state === "failed";
+    let cancellationFailure: unknown;
     this.#state = "disposing";
     if (wasLoading) {
       this.#lock?.cancel();
-    } else if (this.#operationSettled !== null) {
+    } else {
+      if (this.#operationCancellationPromise !== null) {
+        try {
+          await this.#operationCancellationPromise;
+        } catch (error) {
+          cancellationFailure = error;
+        }
+      }
+    }
+    if (!wasLoading && this.#operationSettled !== null) {
       const operationSettled = this.#operationSettled;
       if (this.#operationController !== null) {
-        await this.#requestOperationCancellation();
-        this.#settleUnstartedGeneration();
+        try {
+          await this.#requestOperationCancellation();
+        } catch (error) {
+          cancellationFailure ??= error;
+        } finally {
+          this.#settleCancelledGeneration();
+        }
       }
       await operationSettled.promise;
     }
     this.#lifetime?.resolve(undefined);
     try {
       await this.#lockPromise;
-      this.#recordPhase("dispose", started);
-      this.#state = "disposed";
     } catch (error) {
       if (wasLoading && isAbortError(error)) {
         this.#recordPhase("dispose", started);
@@ -636,6 +825,12 @@ export class Qwen35Session {
       this.#state = "failed";
       throw error;
     }
+    this.#recordPhase("dispose", started);
+    if (cancellationFailure !== undefined) {
+      this.#state = "failed";
+      throw cancellationFailure;
+    }
+    this.#state = "disposed";
   }
 
   #requireReady(): void {
@@ -662,7 +857,11 @@ export class Qwen35Session {
   }
 
   #onDeviceLost(): void {
-    if (this.#state === "disposed" || this.#state === "disposing") {
+    if (
+      this.#disposeRequested ||
+      this.#state === "disposed" ||
+      this.#state === "disposing"
+    ) {
       return;
     }
     this.#deviceLostCount += 1;
@@ -670,15 +869,22 @@ export class Qwen35Session {
     this.#state = "failed";
   }
 
-  #settleUnstartedGeneration(): void {
-    if (!this.#activeGenerate || this.#generateStarted) {
+  #settleCancelledGeneration(): void {
+    if (!this.#activeGenerate) {
       return;
+    }
+    const operation = this.#generationOperation;
+    const operationSettled = operation?.settled ?? this.#operationSettled;
+    const cancellation = this.#operationCancellationPromise;
+    if (operation !== null && cancellation !== null) {
+      operation.cancellationPromise = cancellation;
     }
     this.#activeGenerate = false;
     this.#operationController = null;
-    this.#operationSettled?.resolve(undefined);
+    operationSettled?.resolve(undefined);
     this.#operationSettled = null;
-    if (this.#state === "cancelling") {
+    this.#generationOperation = null;
+    if (!this.#disposeRequested && this.#state === "cancelling") {
       this.#state = "ready";
     }
   }
