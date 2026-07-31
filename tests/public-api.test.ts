@@ -20,6 +20,16 @@ test("exports mixed tensor conversion and GEMV APIs from the package entrypoint"
   assert.equal(typeof runtime.createQwen35UniformArena, "function");
   assert.equal(typeof runtime.planQwen35DeltaNetLayerDispatch, "function");
   assert.equal(typeof runtime.assembleQwen35TiledLogitsCommands, "function");
+  assert.equal(typeof runtime.planQwen35FullAttentionLayerGeometry, "function");
+  assert.equal(typeof runtime.planQwen35FullAttentionLayerDispatch, "function");
+  assert.equal(typeof runtime.planQwen35FinalNormDispatch, "function");
+  assert.equal(typeof runtime.createQwen35AllocationClearer, "function");
+  assert.equal(typeof runtime.planQwen35GreedyUniformGeometry, "function");
+  assert.equal(typeof runtime.createQwen35GreedyTextDriver, "function");
+  assert.equal(
+    typeof runtime.createQwen35GreedyExecutionDriverFactory,
+    "function",
+  );
   assert.equal("streamQwen35CachedWeights" in runtime, false);
   assert.equal("compileTokenizerSource" in runtime, false);
 });

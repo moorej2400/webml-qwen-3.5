@@ -197,8 +197,8 @@ test("builds the exact deterministic 32-layer static program", () => {
     [3, 7, 11, 15, 19, 23, 27, 31],
   );
   assert.equal(attention.every((item) => item.runnable), true);
-  assert.equal(program.runnable, false);
-  assert.equal(program.blockedBy, "weight-orchestration");
+  assert.equal(program.runnable, true);
+  assert.equal("blockedBy" in program, false);
   assert.equal(program.invocations.at(-3)?.kind, "rms-norm");
   assert.deepEqual(program.invocations.at(-2), {
     kind: "tiled-tied-logits",

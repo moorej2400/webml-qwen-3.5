@@ -40,6 +40,7 @@ import {
   loadPinnedQwen35Tokenizer,
 } from "./qwen-tokenizer.js";
 import { QWEN35_4B_CONFIG } from "./qwen35-config.js";
+import { createQwen35GreedyExecutionDriverFactory } from "./qwen35-greedy-driver.js";
 import {
   buildQwen35Program,
   type Qwen35Program,
@@ -195,6 +196,7 @@ export interface Qwen35BrowserLoadOptions extends LoadOptions {
   readonly expectedPackageBaseUrl: string;
   readonly expectedManifestSha256: string;
   readonly compiledTokenizerUrl: string;
+  /** Optional test or experiment override; production uses the fixed greedy driver. */
   readonly executionDriverFactory?: Qwen35ExecutionDriverFactory;
   readonly fetchImplementation?: typeof fetch;
   readonly rangeFetch?: RangeFetch;
@@ -692,13 +694,9 @@ export async function loadQwen35BrowserResources(
   rawOptions: LoadOptions,
 ): Promise<Qwen35LoadedResources> {
   const options = browserLoadOptions(rawOptions);
-  const factory = options.executionDriverFactory;
-  if (factory === undefined) {
-    throw diagnosticError(
-      "qwen-execution-driver-not-installed",
-      "The Qwen3.5 execution driver is not installed",
-    );
-  }
+  const factory =
+    options.executionDriverFactory ??
+    createQwen35GreedyExecutionDriverFactory();
   // No caller-owned manifest reference crosses the first asynchronous
   // boundary. Every later cache, URL, and driver read uses this snapshot.
   const manifest = snapshotQwen35Manifest(options.manifest);

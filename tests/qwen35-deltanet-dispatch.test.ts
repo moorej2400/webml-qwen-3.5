@@ -224,9 +224,15 @@ function uniforms(
   })));
 }
 
+function runnableProgram(program: Qwen35Program): Qwen35Program {
+  const { blockedBy: _blockedBy, ...runtimeProgram } =
+    program as unknown as Record<string, unknown>;
+  return Object.freeze({ ...runtimeProgram, runnable: true }) as unknown as Qwen35Program;
+}
+
 function fixture() {
   const tensors = programDirectory();
-  const program = buildQwen35Program({ config: QWEN35_4B_CONFIG, tensors });
+  const program = runnableProgram(buildQwen35Program({ config: QWEN35_4B_CONFIG, tensors }));
   const invocation = program.invocations.find(
     (item): item is Extract<Qwen35Invocation, { kind: "gated-deltanet" }> =>
       item.kind === "gated-deltanet" && item.layer === 0,
@@ -263,6 +269,30 @@ async function planner(): Promise<(input: ReturnType<typeof fixture>) => {
   assert.equal(typeof module.planQwen35DeltaNetLayerDispatch, "function");
   return module.planQwen35DeltaNetLayerDispatch as never;
 }
+
+async function geometryPlanner(): Promise<(input: Pick<
+  ReturnType<typeof fixture>,
+  "program" | "invocation" | "weights"
+>) => {
+  readonly fixedUniformCount: 5;
+  readonly physicalGemvPieceCount: number;
+  readonly uniformCount: number;
+}> {
+  const module = await import("../src/qwen35-deltanet-dispatch.js");
+  assert.equal(typeof module.planQwen35DeltaNetLayerGeometry, "function");
+  return module.planQwen35DeltaNetLayerGeometry as never;
+}
+
+test("derives exact DeltaNet uniform geometry before allocating buffers", async () => {
+  const valid = fixture();
+  const geometry = (await geometryPlanner())(valid);
+  assert.deepEqual(geometry, {
+    fixedUniformCount: 5,
+    physicalGemvPieceCount: 8,
+    uniformCount: 13,
+  });
+  assert.equal(Object.isFrozen(geometry), true);
+});
 
 test("assembles the exact one-token DeltaNet command order and live buffers", async () => {
   const input = fixture();
@@ -345,7 +375,10 @@ test("preserves DeltaNet stage order across multiple physical matrix row views",
   const plan = (await planner())({
     ...valid,
     weights: weightDirectoryFromViews(fragmented),
-    uniforms: uniforms(14),
+    uniforms: uniforms((await geometryPlanner())({
+      ...valid,
+      weights: weightDirectoryFromViews(fragmented),
+    }).uniformCount),
   });
   const stages = plan.commands.map(({ stage }) => stage);
   const mathematicalStages = stages.filter(
@@ -411,6 +444,36 @@ test("rejects wrong invocation identity, layer kind, and direct tensor storage",
   const plan = await planner();
   const valid = fixture();
   const forgedInvocation = Object.freeze({ ...valid.invocation, layer: 1 });
+  assert.throws(
+    () => plan({
+      ...valid,
+      program: Object.freeze({
+        ...valid.program,
+        runnable: false,
+      }) as unknown as Qwen35Program,
+    }),
+    { code: "deltanet-program-invalid" },
+  );
+  assert.throws(
+    () => plan({
+      ...valid,
+      program: Object.freeze({
+        ...valid.program,
+        blockedBy: undefined,
+      }) as unknown as Qwen35Program,
+    }),
+    { code: "deltanet-program-invalid" },
+  );
+  assert.throws(
+    () => plan({
+      ...valid,
+      program: Object.freeze({
+        ...valid.program,
+        blockedBy: "weight-orchestration",
+      }) as unknown as Qwen35Program,
+    }),
+    { code: "deltanet-program-invalid" },
+  );
   assert.throws(
     () => plan({ ...valid, invocation: forgedInvocation as typeof valid.invocation }),
     /program|invocation|layer/i,
@@ -503,5 +566,42 @@ test("rejects activation views whose scalar contract is not F32", async () => {
   assert.throws(
     () => plan({ ...valid, workspace: invalidWorkspace }),
     /activation|workspace|F32/i,
+  );
+});
+
+test("sanitizes caller weight and workspace lookup failures", async () => {
+  const plan = await planner();
+  const valid = fixture();
+  const privateDetail = "private-deltanet-model-path";
+  assert.throws(
+    () => plan({
+      ...valid,
+      weights: Object.freeze({
+        ...valid.weights,
+        get() {
+          throw new Error(privateDetail);
+        },
+      }),
+    }),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, "deltanet-weight-invalid");
+      assert.doesNotMatch((error as Error).message, new RegExp(privateDetail, "i"));
+      return true;
+    },
+  );
+  assert.throws(
+    () => plan({
+      ...valid,
+      workspace: Object.freeze({
+        get() {
+          throw new Error(privateDetail);
+        },
+      }),
+    }),
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, "deltanet-workspace-invalid");
+      assert.doesNotMatch((error as Error).message, new RegExp(privateDetail, "i"));
+      return true;
+    },
   );
 });

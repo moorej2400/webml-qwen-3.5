@@ -80,6 +80,10 @@ test("the browser entrypoint exports authenticated runtime APIs but not Node com
   assert.equal(typeof browser.createQwen35UniformArena, "function");
   assert.equal(typeof browser.planQwen35DeltaNetLayerDispatch, "function");
   assert.equal(typeof browser.assembleQwen35TiledLogitsCommands, "function");
+  assert.equal(typeof browser.planQwen35FullAttentionLayerGeometry, "function");
+  assert.equal(typeof browser.planQwen35FullAttentionLayerDispatch, "function");
+  assert.equal(typeof browser.planQwen35FinalNormDispatch, "function");
+  assert.equal(typeof browser.createQwen35AllocationClearer, "function");
   assert.equal("streamQwen35CachedWeights" in browser, false);
   assert.equal("compileTokenizerSource" in browser, false);
   assert.equal("compileQwen35TokenizerSource" in browser, false);

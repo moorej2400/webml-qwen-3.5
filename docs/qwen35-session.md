@@ -40,11 +40,19 @@ and peak owned bytes, including driver scratch allocations.
 
 ## Current milestone boundary
 
-This milestone does not install the complete Qwen layer execution scheduler.
-Applications must provide a model-specific `Qwen35ExecutionDriverFactory`.
-Production loading fails with `qwen-execution-driver-not-installed` when that
-factory is absent. The runtime does not emit placeholder tokens or claim full
-inference support.
+Production loading installs the model-specific greedy text driver by default.
+Tests may still inject a `Qwen35ExecutionDriverFactory`. The production driver
+executes packed embedding, all 32 language layers, final normalization, tiled
+tied logits, and GPU top-1 reduction. It submits one model batch per processed
+token, retires the queue before advancing HybridState, and reads back only the
+selected u32 token.
+
+Prefill is serial and computes logits only for the final prompt token. A
+predicted token is cached until it is emitted. An emitted token remains pending
+until the next decode step ingests it, so generation can continue across a
+natural token limit or cancellation at a yield without repetition. If
+cancellation crosses submitted generation work, the driver fails closed and
+requires disposal instead of publishing reusable state.
 
 Text conversations use the authenticated tokenizer and exact Qwen chat
 template. The session enforces the 16,384-token total context without

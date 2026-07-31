@@ -87,6 +87,12 @@ export interface Qwen35DeltaNetLayerDispatchPlan {
   }>;
 }
 
+export interface Qwen35DeltaNetLayerGeometry {
+  readonly fixedUniformCount: 5;
+  readonly physicalGemvPieceCount: number;
+  readonly uniformCount: number;
+}
+
 export interface PlanQwen35DeltaNetLayerDispatchInput {
   readonly program: Qwen35Program;
   readonly invocation: Extract<Qwen35Invocation, { kind: "gated-deltanet" }>;
@@ -117,6 +123,15 @@ function fail(code: string, message: string): never {
   throw diagnosticError(code, message);
 }
 
+function isRunnableProgram(program: Qwen35Program): boolean {
+  const contract = program as unknown as {
+    readonly runnable?: unknown;
+    readonly blockedBy?: unknown;
+  };
+  // A blocker field, even with an undefined value, is not the driver's exact runnable contract.
+  return contract.runnable === true && !("blockedBy" in contract);
+}
+
 function sameValues(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
@@ -127,7 +142,7 @@ function requireLayerSequence(
 ): LayerSequence {
   if (
     program.model !== "qwen35-4b" ||
-    program.blockedBy !== "weight-orchestration" ||
+    !isRunnableProgram(program) ||
     !Number.isSafeInteger(invocation.layer) ||
     invocation.layer < 0 ||
     program.invocations.indexOf(invocation) < 1 ||
@@ -242,7 +257,13 @@ function requireWeight(
   name: string,
   shape: readonly number[],
 ): Qwen35TensorWeightView {
-  const tensor = weights.get(name);
+  let tensor: Qwen35TensorWeightView | undefined;
+  // The directory callback is caller-owned, so its thrown text cannot cross this boundary.
+  try {
+    tensor = weights.get(name);
+  } catch {
+    fail("deltanet-weight-invalid", "A Qwen3.5 DeltaNet weight is invalid");
+  }
   if (tensor === undefined || tensor.name !== name || !sameShape(tensor.shape, shape)) {
     fail("deltanet-weight-invalid", "A Qwen3.5 DeltaNet weight is invalid");
   }
@@ -342,8 +363,15 @@ function workspaceSlice(
   kind: Qwen35ActivationResourceKind,
   requiredBytes: number,
 ): Qwen35ForwardBufferSlice {
-  const view = workspace.get(kind);
+  let view: Qwen35ActivationResourceView | undefined;
+  // The workspace callback is caller-owned, so its thrown text cannot cross this boundary.
+  try {
+    view = workspace.get(kind);
+  } catch {
+    fail("deltanet-workspace-invalid", "A Qwen3.5 activation view is invalid");
+  }
   if (
+    view === undefined ||
     view.kind !== kind ||
     view.scalarType !== "f32" ||
     view.bytes !== BigInt(view.byteLength) ||
@@ -449,11 +477,78 @@ function f32Word(value: number): number {
   return new DataView(bytes).getUint32(0, true);
 }
 
+function deltaNetGeometryData(input: {
+  readonly program: Qwen35Program;
+  readonly invocation: Extract<Qwen35Invocation, { kind: "gated-deltanet" }>;
+  readonly weights: Qwen35WeightDirectoryView;
+}): {
+  readonly sequence: LayerSequence;
+  readonly matrixWeights: Readonly<{
+    readonly attentionGate: Qwen35TensorWeightView;
+    readonly qkv: Qwen35TensorWeightView;
+    readonly alpha: Qwen35TensorWeightView;
+    readonly beta: Qwen35TensorWeightView;
+    readonly output: Qwen35TensorWeightView;
+    readonly ffnGate: Qwen35TensorWeightView;
+    readonly ffnUp: Qwen35TensorWeightView;
+    readonly ffnDown: Qwen35TensorWeightView;
+  }>;
+  readonly geometry: Qwen35DeltaNetLayerGeometry;
+} {
+  const sequence = requireLayerSequence(input.program, input.invocation);
+  const tensorNames = input.invocation.tensors;
+  const matrixWeights = Object.freeze({
+    attentionGate: requireWeight(input.weights, tensorNames.gate, [HIDDEN, INNER]),
+    qkv: requireWeight(input.weights, tensorNames.qkv, [HIDDEN, QKV]),
+    alpha: requireWeight(input.weights, tensorNames.alpha, [HIDDEN, HEADS]),
+    beta: requireWeight(input.weights, tensorNames.beta, [HIDDEN, HEADS]),
+    output: requireWeight(input.weights, tensorNames.output, [INNER, HIDDEN]),
+    ffnGate: requireWeight(input.weights, sequence.ffnGateWeight, [HIDDEN, FFN]),
+    ffnUp: requireWeight(input.weights, sequence.ffnUpWeight, [HIDDEN, FFN]),
+    ffnDown: requireWeight(input.weights, sequence.ffnDownWeight, [FFN, HIDDEN]),
+  });
+  const physicalGemvPieceCount = Object.values(matrixWeights).reduce(
+    (count, tensor) => count + tensor.physicalRows.length,
+    0,
+  );
+  if (
+    !Number.isSafeInteger(physicalGemvPieceCount) ||
+    physicalGemvPieceCount < Object.keys(matrixWeights).length
+  ) {
+    fail(
+      "deltanet-weight-invalid",
+      "A Qwen3.5 DeltaNet matrix has invalid physical row coverage",
+    );
+  }
+  const geometry = Object.freeze({
+    fixedUniformCount: 5 as const,
+    physicalGemvPieceCount,
+    uniformCount: physicalGemvPieceCount + 5,
+  });
+  return Object.freeze({ sequence, matrixWeights, geometry });
+}
+
+/** Derives exact uniform capacity from physical weights without GPU buffers. */
+export function planQwen35DeltaNetLayerGeometry(input: {
+  readonly program: Qwen35Program;
+  readonly invocation: Extract<Qwen35Invocation, { kind: "gated-deltanet" }>;
+  readonly weights: Qwen35WeightDirectoryView;
+}): Qwen35DeltaNetLayerGeometry {
+  return deltaNetGeometryData(input).geometry;
+}
+
 /** Builds the fixed decode schedule; it does not submit or advance state. */
 export function planQwen35DeltaNetLayerDispatch(
   input: PlanQwen35DeltaNetLayerDispatchInput,
 ): Qwen35DeltaNetLayerDispatchPlan {
-  const sequence = requireLayerSequence(input.program, input.invocation);
+  const geometryData = deltaNetGeometryData(input);
+  const { sequence, matrixWeights } = geometryData;
+  if (input.uniforms.length !== geometryData.geometry.uniformCount) {
+    fail(
+      "deltanet-uniform-count-invalid",
+      "Qwen3.5 DeltaNet uniform count is invalid",
+    );
+  }
   requireLiveness(input.deltanetParameterLiveness);
   if (
     input.state.kind !== "gated-deltanet" ||
@@ -467,16 +562,6 @@ export function planQwen35DeltaNetLayerDispatch(
   }
 
   const tensorNames = input.invocation.tensors;
-  const matrixWeights = {
-    attentionGate: requireWeight(input.weights, tensorNames.gate, [HIDDEN, INNER]),
-    qkv: requireWeight(input.weights, tensorNames.qkv, [HIDDEN, QKV]),
-    alpha: requireWeight(input.weights, tensorNames.alpha, [HIDDEN, HEADS]),
-    beta: requireWeight(input.weights, tensorNames.beta, [HIDDEN, HEADS]),
-    output: requireWeight(input.weights, tensorNames.output, [INNER, HIDDEN]),
-    ffnGate: requireWeight(input.weights, sequence.ffnGateWeight, [HIDDEN, FFN]),
-    ffnUp: requireWeight(input.weights, sequence.ffnUpWeight, [HIDDEN, FFN]),
-    ffnDown: requireWeight(input.weights, sequence.ffnDownWeight, [FFN, HIDDEN]),
-  };
   const direct = {
     inputNorm: requireDirectF32Weight(
       input.weights, sequence.inputNormWeight, [HIDDEN], input.limits,

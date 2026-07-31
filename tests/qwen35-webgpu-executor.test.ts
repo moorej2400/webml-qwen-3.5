@@ -17,6 +17,8 @@ function fakeDevice(options: {
   readonly bufferError?: boolean;
   readonly compilationError?: boolean;
   readonly destroyError?: boolean;
+  readonly pushErrorScopeError?: boolean;
+  readonly shaderModuleError?: boolean;
   readonly validationError?: boolean;
   readonly pipelineGate?: Promise<void>;
   readonly validationGate?: Promise<void>;
@@ -61,6 +63,9 @@ function fakeDevice(options: {
       },
     },
     createShaderModule() {
+      if (options.shaderModuleError === true) {
+        throw new Error("private shader module marker");
+      }
       events.push("module");
       return {
         async getCompilationInfo() {
@@ -73,6 +78,9 @@ function fakeDevice(options: {
       };
     },
     pushErrorScope(filter) {
+      if (options.pushErrorScopeError === true) {
+        throw new Error("private error scope marker");
+      }
       events.push(`push:${filter}`);
     },
     async popErrorScope() {
@@ -96,6 +104,9 @@ function fakeDevice(options: {
     createCommandEncoder() {
       events.push("encoder");
       return {
+        clearBuffer(_buffer, offset = 0, size) {
+          events.push(`clear:${offset}:${size ?? "rest"}`);
+        },
         beginComputePass() {
           events.push("pass");
           return {
@@ -186,6 +197,62 @@ test("compiles each exact model kernel once and submits bound physical views", a
     events.filter((event) => event === "dispatch:7,2,1").length,
     2,
   );
+});
+
+test("shares pipeline and bind-group caches across identical cloned kernels", async () => {
+  const { device, events } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const buffer = { destroy() {} };
+  const makeRequest = () => ({
+    kernel: {
+      id: "qwen35-cloned-kernel",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [{ binding: 0, kind: "storage" as const, buffer, offset: 0, size: 16 }],
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+
+  await executor.dispatchBatch([makeRequest(), makeRequest()]);
+  await executor.dispatchBatch([makeRequest()]);
+
+  assert.equal(events.filter((event) => event === "module").length, 1);
+  assert.equal(events.filter((event) => event === "pipeline").length, 1);
+  assert.equal(events.filter((event) => event === "bind:1").length, 1);
+  assert.equal(events.filter((event) => event === "submit").length, 2);
+});
+
+test("bounds the fixed-program kernel cache at exactly 32 lifetime entries", async () => {
+  const { device, events } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const request = (index: number) => ({
+    kernel: {
+      id: `qwen35-capacity-${index}`,
+      source: `@compute @workgroup_size(1) fn kernel_${index}() {}`,
+      entryPoint: `kernel_${index}`,
+    },
+    bindings: [] as const,
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+
+  for (let index = 0; index < 32; index += 1) {
+    await executor.dispatch(request(index));
+  }
+  await assert.rejects(executor.dispatch(request(32)), {
+    code: "webgpu-kernel-capacity-exceeded",
+    message: "Qwen3.5 WebGPU kernel capacity was exceeded",
+  });
+
+  assert.equal(events.filter((event) => event === "module").length, 32);
+  assert.equal(events.filter((event) => event === "pipeline").length, 32);
+  assert.equal(events.filter((event) => event === "submit").length, 32);
+  await assert.rejects(executor.dispatch(request(0)), {
+    code: "webgpu-executor-poisoned",
+  });
+  await assert.doesNotReject(executor.dispose());
+  await assert.rejects(executor.dispatch(request(0)), {
+    code: "webgpu-executor-disposed",
+  });
 });
 
 test("encodes a model step as one compute pass and one queue submission", async () => {
@@ -371,6 +438,40 @@ test("fails closed on asynchronous WebGPU validation errors", async () => {
   assert.equal(events.filter((event) => event === "done").length, 2);
 });
 
+test("sanitizes dispatch error-scope setup throws", async () => {
+  const { device, events } = fakeDevice({ pushErrorScopeError: true });
+  const executor = new Qwen35WebGpuExecutor(device);
+  const request = {
+    kernel: {
+      id: "qwen35-private-scope-kernel",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [],
+    workgroups: { x: 1, y: 1, z: 1 },
+  } as const;
+
+  await assert.rejects(executor.dispatch(request), (error: unknown) => {
+    assert.equal(error instanceof Error, true);
+    assert.equal((error as Error).name, "RuntimeDiagnosticError");
+    assert.equal(
+      (error as Error & { code?: string }).code,
+      "webgpu-dispatch-validation-failed",
+    );
+    assert.equal(
+      (error as Error).message,
+      "Qwen3.5 WebGPU dispatch validation failed",
+    );
+    assert.equal(String(error).includes("private error scope marker"), false);
+    return true;
+  });
+  assert.equal(events.includes("encoder"), false);
+  await assert.rejects(executor.dispatch(request), {
+    code: "webgpu-executor-poisoned",
+  });
+  await executor.dispose();
+});
+
 test("pipeline identity includes WGSL source", async () => {
   const { device, events } = fakeDevice();
   const executor = new Qwen35WebGpuExecutor(device);
@@ -397,6 +498,55 @@ test("pipeline identity includes WGSL source", async () => {
   });
 
   assert.equal(events.filter((event) => event === "pipeline").length, 2);
+});
+
+test("pipeline identity includes the entry point", async () => {
+  const { device, events } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const source = [
+    "@compute @workgroup_size(1) fn first() {}",
+    "@compute @workgroup_size(1) fn second() {}",
+  ].join("\n");
+  const base = {
+    bindings: [] as const,
+    workgroups: { x: 1, y: 1, z: 1 },
+  };
+
+  await executor.dispatch({
+    ...base,
+    kernel: { id: "qwen35-entry-kernel", source, entryPoint: "first" },
+  });
+  await executor.dispatch({
+    ...base,
+    kernel: { id: "qwen35-entry-kernel", source, entryPoint: "second" },
+  });
+
+  assert.equal(events.filter((event) => event === "pipeline").length, 2);
+});
+
+test("rejects mutation of a previously observed kernel object", async () => {
+  const { device, events } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const kernel = {
+    id: "qwen35-mutable-kernel",
+    source: "@compute @workgroup_size(1) fn main() {}",
+    entryPoint: "main",
+  };
+  const base = {
+    bindings: [] as const,
+    workgroups: { x: 1, y: 1, z: 1 },
+  };
+
+  await executor.dispatch({ ...base, kernel });
+  kernel.source = "@compute @workgroup_size(2) fn main() {}";
+
+  await assert.rejects(executor.dispatch({ ...base, kernel }), {
+    code: "webgpu-kernel-mutated",
+    message: "Qwen3.5 WebGPU kernel identity changed",
+  });
+  assert.equal(events.filter((event) => event === "module").length, 1);
+  assert.equal(events.filter((event) => event === "pipeline").length, 1);
+  assert.equal(events.filter((event) => event === "submit").length, 1);
 });
 
 test("disposal waits for in-flight pipeline compilation", async () => {
@@ -483,6 +633,28 @@ test("reads back only the selected u32 and destroys its temporary buffer", async
   assert.equal(buffers.at(-1)?.destroyed, true);
 });
 
+test("sanitizes readback error-scope setup throws", async () => {
+  const { device } = fakeDevice({ pushErrorScopeError: true });
+  const executor = new Qwen35WebGpuExecutor(device);
+  const source = device.createBuffer({ label: "source", size: 4, usage: 0 });
+
+  await assert.rejects(executor.readU32(source, 0), (error: unknown) => {
+    assert.equal(error instanceof Error, true);
+    assert.equal((error as Error).name, "RuntimeDiagnosticError");
+    assert.equal(
+      (error as Error & { code?: string }).code,
+      "webgpu-readback-failed",
+    );
+    assert.equal((error as Error).message, "Qwen3.5 WebGPU readback failed");
+    assert.equal(String(error).includes("private error scope marker"), false);
+    return true;
+  });
+  await assert.rejects(executor.readU32(source, 0), {
+    code: "webgpu-executor-poisoned",
+  });
+  await executor.dispose();
+});
+
 test("does not report a selected token when readback cleanup fails", async () => {
   const { device } = fakeDevice({ destroyError: true });
   const executor = new Qwen35WebGpuExecutor(device);
@@ -521,4 +693,36 @@ test("sanitizes shader compiler failures and permanently blocks submissions afte
   await assert.rejects(executor.dispatch(request), {
     code: "webgpu-executor-disposed",
   });
+});
+
+test("sanitizes synchronous shader-module creation throws", async () => {
+  const { device, events } = fakeDevice({ shaderModuleError: true });
+  const executor = new Qwen35WebGpuExecutor(device);
+  const request = {
+    kernel: {
+      id: "qwen35-private-module-kernel",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [],
+    workgroups: { x: 1, y: 1, z: 1 },
+  } as const;
+
+  await assert.rejects(executor.dispatch(request), (error: unknown) => {
+    assert.equal(error instanceof Error, true);
+    assert.equal((error as Error).name, "RuntimeDiagnosticError");
+    assert.equal(
+      (error as Error & { code?: string }).code,
+      "webgpu-kernel-compile-failed",
+    );
+    assert.equal(
+      (error as Error).message,
+      "Qwen3.5 WebGPU kernel compilation failed",
+    );
+    assert.equal(String(error).includes("private shader module marker"), false);
+    return true;
+  });
+  assert.equal(events.includes("pipeline"), false);
+  assert.equal(events.includes("submit"), false);
+  await executor.dispose();
 });

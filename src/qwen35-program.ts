@@ -150,9 +150,8 @@ export interface Qwen35Program {
   readonly model: "qwen35-4b";
   readonly invocations: readonly Qwen35Invocation[];
   readonly tensorBindings: Qwen35TensorBindings;
-  /** Operator kernels exist, but model-weight scheduling is not wired yet. */
-  readonly runnable: false;
-  readonly blockedBy: "weight-orchestration";
+  /** The fixed program has a concrete model-weight scheduler and driver. */
+  readonly runnable: true;
 }
 
 const SUPPORTED_LAYOUTS = new Map<GgmlTypeValue, GemvLayout>([
@@ -312,8 +311,7 @@ function fullBindings(layer: number): FullAttentionTensorBindings {
 
 /**
  * Builds a fixed Qwen3.5 4B invocation list. Attention operators have direct
- * kernels and state contracts, while the complete program remains blocked on
- * model-weight orchestration.
+ * kernels, state contracts, and a concrete model-weight scheduler.
  */
 export function buildQwen35Program(input: {
   readonly config: Qwen35Config;
@@ -475,7 +473,6 @@ export function buildQwen35Program(input: {
     model: "qwen35-4b",
     invocations: Object.freeze(invocations),
     tensorBindings: immutableTensorBindings(tensorBindings),
-    runnable: false,
-    blockedBy: "weight-orchestration",
+    runnable: true,
   });
 }

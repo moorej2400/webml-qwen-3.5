@@ -5,6 +5,11 @@ const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
 const GPU_BUFFER_USAGE_MAP_READ = 0x0001;
 const GPU_MAP_MODE_READ = 0x0001;
 
+// This versioned scheduler limit covers the fixed ABI's 28 registered shader
+// sources. It bounds origin memory, not device or model feasibility, and must
+// be revised when page-aware or device-specific kernel families are added.
+const QWEN35_FIXED_ABI_KERNEL_CAPACITY = 32;
+
 /** Opaque buffer identity accepted for binding without transferring ownership. */
 export type Qwen35WebGpuBuffer = object;
 
@@ -32,8 +37,13 @@ interface Qwen35ComputePass {
   end(): void;
 }
 
-interface Qwen35CommandEncoder {
+export interface Qwen35CommandEncoder {
   beginComputePass(): Qwen35ComputePass;
+  clearBuffer(
+    buffer: Qwen35WebGpuBuffer,
+    offset?: number,
+    size?: number,
+  ): void;
   copyBufferToBuffer(
     source: Qwen35WebGpuBuffer,
     sourceOffset: number,
@@ -127,7 +137,7 @@ export interface Qwen35OwnedUniform {
 }
 
 interface Qwen35KernelSnapshot {
-  readonly identity: number;
+  readonly contentIdentity: number;
   readonly id: string;
   readonly source: string;
   readonly entryPoint: string;
@@ -196,11 +206,12 @@ export class Qwen35WebGpuExecutor {
   readonly #bindGroups = new Map<string, unknown>();
   readonly #bufferIds = new WeakMap<object, number>();
   readonly #kernelSnapshots = new WeakMap<object, Qwen35KernelSnapshot>();
+  readonly #kernelContentIdentities = new Map<string, number>();
   readonly #uniforms = new WeakSet<object>();
   readonly #ownedBuffers = new Set<Qwen35OwnedWebGpuBuffer>();
   readonly #operations = new Set<Promise<unknown>>();
   #nextBufferId = 1;
-  #nextKernelIdentity = 1;
+  #nextKernelContentIdentity = 1;
   #disposed = false;
   #poisoned = false;
   #disposePromise: Promise<void> | null = null;
@@ -303,7 +314,15 @@ export class Qwen35WebGpuExecutor {
       requests.map((request) => this.#pipeline(request.kernel)),
     );
     this.#assertUsable();
-    this.#device.pushErrorScope("validation");
+    try {
+      this.#device.pushErrorScope("validation");
+    } catch {
+      this.#poisoned = true;
+      throw diagnosticError(
+        "webgpu-dispatch-validation-failed",
+        "Qwen3.5 WebGPU dispatch validation failed",
+      );
+    }
     try {
       const encoder = this.#device.createCommandEncoder({
         label: "qwen35-model-step",
@@ -387,10 +406,10 @@ export class Qwen35WebGpuExecutor {
 
   #pipeline(kernel: Qwen35KernelSource): Promise<Qwen35ComputePipeline> {
     const snapshot = this.#kernelSnapshot(kernel);
-    const cached = this.#pipelines.get(snapshot.identity);
+    const cached = this.#pipelines.get(snapshot.contentIdentity);
     if (cached !== undefined) return cached;
     const compiling = this.#compile(snapshot);
-    this.#pipelines.set(snapshot.identity, compiling);
+    this.#pipelines.set(snapshot.contentIdentity, compiling);
     return compiling;
   }
 
@@ -410,13 +429,36 @@ export class Qwen35WebGpuExecutor {
       }
       return existing;
     }
+    // JSON array encoding is unambiguous even when WGSL contains separators.
+    // Interning keeps later bind-group keys small while retaining exactly one
+    // strong cache entry per semantic kernel in the fixed model program.
+    const contentKey = JSON.stringify([
+      kernel.id,
+      kernel.entryPoint,
+      kernel.source,
+    ]);
+    let contentIdentity = this.#kernelContentIdentities.get(contentKey);
+    if (contentIdentity === undefined) {
+      if (
+        this.#kernelContentIdentities.size >=
+          QWEN35_FIXED_ABI_KERNEL_CAPACITY
+      ) {
+        this.#poisoned = true;
+        throw diagnosticError(
+          "webgpu-kernel-capacity-exceeded",
+          "Qwen3.5 WebGPU kernel capacity was exceeded",
+        );
+      }
+      contentIdentity = this.#nextKernelContentIdentity;
+      this.#nextKernelContentIdentity += 1;
+      this.#kernelContentIdentities.set(contentKey, contentIdentity);
+    }
     const snapshot = Object.freeze({
-      identity: this.#nextKernelIdentity,
+      contentIdentity,
       id: kernel.id,
       source: kernel.source,
       entryPoint: kernel.entryPoint,
     });
-    this.#nextKernelIdentity += 1;
     this.#kernelSnapshots.set(object, snapshot);
     return snapshot;
   }
@@ -432,7 +474,7 @@ export class Qwen35WebGpuExecutor {
       binding.offset,
       binding.size,
     ].join(":"));
-    const key = `${this.#kernelSnapshot(request.kernel).identity}\u0000${bindings.join("|")}`;
+    const key = `${this.#kernelSnapshot(request.kernel).contentIdentity}\u0000${bindings.join("|")}`;
     const cached = this.#bindGroups.get(key);
     if (cached !== undefined) return cached;
     const bindGroup = this.#device.createBindGroup({
@@ -508,7 +550,15 @@ export class Qwen35WebGpuExecutor {
       );
     }
     let readback: Qwen35OwnedWebGpuBuffer | null = null;
-    this.#device.pushErrorScope("validation");
+    try {
+      this.#device.pushErrorScope("validation");
+    } catch {
+      this.#poisoned = true;
+      throw diagnosticError(
+        "webgpu-readback-failed",
+        "Qwen3.5 WebGPU readback failed",
+      );
+    }
     try {
       readback = this.#device.createBuffer({
         label: "qwen35-selected-u32",
@@ -614,6 +664,7 @@ export class Qwen35WebGpuExecutor {
     this.#ownedBuffers.clear();
     this.#bindGroups.clear();
     this.#pipelines.clear();
+    this.#kernelContentIdentities.clear();
     if (failed) {
       throw diagnosticError(
         "webgpu-cleanup-failed",
@@ -623,10 +674,18 @@ export class Qwen35WebGpuExecutor {
   }
 
   async #compile(kernel: Qwen35KernelSnapshot): Promise<Qwen35ComputePipeline> {
-    const module = this.#device.createShaderModule({
-      label: kernel.id,
-      code: kernel.source,
-    });
+    let module: Qwen35ShaderModule;
+    try {
+      module = this.#device.createShaderModule({
+        label: kernel.id,
+        code: kernel.source,
+      });
+    } catch {
+      throw diagnosticError(
+        "webgpu-kernel-compile-failed",
+        "Qwen3.5 WebGPU kernel compilation failed",
+      );
+    }
     let info: Awaited<ReturnType<Qwen35ShaderModule["getCompilationInfo"]>>;
     try {
       info = await module.getCompilationInfo();

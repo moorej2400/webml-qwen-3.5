@@ -409,7 +409,7 @@ test("builds one exact program tensor entry from segmented manifest storage", ()
   ]);
 });
 
-test("fails closed before package access when no Qwen driver is installed", async () => {
+test("installs the production Qwen driver before package validation", async () => {
   let manifestAccessed = false;
   const options = {
     get manifest() {
@@ -423,9 +423,9 @@ test("fails closed before package access when no Qwen driver is installed", asyn
       new AbortController().signal,
       options,
     ),
-    { code: "qwen-execution-driver-not-installed" },
+    /must not read/,
   );
-  assert.equal(manifestAccessed, false);
+  assert.equal(manifestAccessed, true);
 });
 
 test("requires the exact pinned language and tokenizer source identities", () => {

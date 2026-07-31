@@ -57,9 +57,10 @@ Layers 3, 7, 11, 15, 19, 23, 27, and 31 use full attention. The remaining 24
 layers use typed Gated DeltaNet operators. Each layer has a fixed invocation
 sequence: input RMSNorm, its exact attention operator, residual add,
 post-attention RMSNorm, gate and up projections, SwiGLU, down projection, and
-residual add. These attention operators are individually runnable, but the
-complete program remains explicitly non-runnable until model-weight
-orchestration connects every invocation.
+residual add. The complete program is runnable through one model-specific
+greedy driver. The driver derives its uniform geometry from the physical
+weight views before allocation and connects every invocation without a general
+tensor framework.
 
 The tensor-directory validator requires all 32 base layers with exact names and
 shapes, including linear-attention convolution weights shaped `[4, 8192]`. It
@@ -110,6 +111,21 @@ to Q/K head `h % 16`, computes beta and negative-`ssm_a` decay, and preserves
 the required decay, read, beta-delta, rank-one update, then query order. The
 serial prefill path is the correctness oracle for later bounded parallel scans.
 
+One text token executes the packed embedding, all 32 layers, and, when a token
+is requested, final RMSNorm plus tiled tied logits in one compute batch. The
+driver waits for queue retirement before it advances HybridState, then reads
+back only the selected u32 token. Uniform uploads follow each command's exact
+planner-assigned buffer and offset; they do not assume that command order and
+uniform allocation order are the same. Text decode uses M-RoPE positions
+`[position, position, position]`.
+
+Correctness-first prefill processes tokens serially and runs logits only for
+the final prompt token. Generation keeps the predicted token separate from the
+last emitted-but-not-yet-ingested token. This permits a later generation call
+to continue without repeating or skipping a token. Cancellation that crosses
+submitted generation state poisons the driver and fails closed. Cancellation
+while paused at a yielded token preserves the pending continuation.
+
 The source GGUF advertises a native maximum context of 262,144 tokens. The
 current product contract selects 16,384 tokens and stores the native maximum
 separately. This selection is a product limit, not a browser capability
@@ -122,9 +138,10 @@ components. A generic model loader is outside the production design. External
 inference frameworks may be used only as independent development references;
 they are not production dependencies.
 
-This program does not yet connect the hybrid operators to complete model-weight
-orchestration. Session lifecycle, OPFS persistence, vision, UI, and the control
-server remain later runtime phases.
+The language program, session lifecycle, origin lock, immutable OPFS cache,
+local control protocol, and greedy text driver are connected. Physical-device
+validation, vision execution, the final application UI, and public model-shard
+publication remain later runtime phases.
 
 ## Experimental feasibility
 
