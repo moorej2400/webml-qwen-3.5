@@ -9,10 +9,12 @@ import {
 import { IncrementalSha256 } from "../src/incremental-sha256.js";
 import type { ModelPackageManifest, PackageShard } from "../src/manifest.js";
 import {
+  BrowserOpfsStorage,
   ImmutableOpfsModelCache,
   ModelCacheError,
   modelCacheKey,
   type CacheAtomicWriter,
+  type CacheEnumerationLimits,
   type ModelCacheStorage,
 } from "../src/opfs-model-cache.js";
 
@@ -85,8 +87,17 @@ class MemoryCacheStorage implements ModelCacheStorage {
     return true;
   }
 
-  async list(prefix: string): Promise<readonly string[]> {
-    return [...this.files.keys()].filter((path) => path.startsWith(prefix));
+  async list(
+    prefix: string,
+    limits: CacheEnumerationLimits,
+  ): Promise<readonly string[]> {
+    const matches = [...this.files.keys()].filter((path) =>
+      path.startsWith(prefix),
+    );
+    if (matches.length > limits.maxEntries) {
+      throw new ModelCacheError("cache-enumeration-limit");
+    }
+    return matches;
   }
 }
 
@@ -287,7 +298,7 @@ test("a later run quarantines an interrupted temp and creates a new valid genera
   );
 });
 
-test("safe copy fallback publishes only after rehashing the final blob", async () => {
+test("no-move storage never retains duplicate multi-gigabyte part data", async () => {
   const bytes = fixtureBytes();
   const storage = new MemoryCacheStorage(false);
   const cache = new ImmutableOpfsModelCache(storage, readerFor(bytes), {
@@ -299,11 +310,34 @@ test("safe copy fallback publishes only after rehashing the final blob", async (
   assert.equal(result.cacheHit, false);
   assert.ok(storage.files.has(result.shards[0]!.storagePath));
   assert.equal(hash(storage.files.get(result.shards[0]!.storagePath)!), hash(bytes));
-  assert.equal(
+  const fullWeightFiles = [...storage.files.values()].filter(
+    (value) => value.byteLength === bytes.byteLength,
+  );
+  assert.equal(fullWeightFiles.length, 1);
+  assert.ok(
     storage.committed.indexOf(result.shards[0]!.storagePath) <
       storage.committed.findIndex((path) => path.startsWith("ready/")),
-    true,
   );
+});
+
+test("an attempt-id collision cannot overwrite an existing immutable blob", async () => {
+  const bytes = fixtureBytes();
+  const storage = new MemoryCacheStorage(false);
+  const sha256 = hash(bytes);
+  const existingPath = `blobs/${sha256}/attempt-a-00000.bin`;
+  const existing = new Uint8Array([9, 8, 7]);
+  storage.files.set(existingPath, existing);
+  const cache = new ImmutableOpfsModelCache(storage, readerFor(bytes), {
+    attemptId: () => "attempt-a",
+  });
+
+  await assert.rejects(
+    cache.ensure(manifestFor(bytes), resolver),
+    (error: unknown) =>
+      error instanceof ModelCacheError &&
+      error.code === "cache-attempt-collision",
+  );
+  assert.deepEqual(storage.files.get(existingPath), existing);
 });
 
 test("corrupt ready data is ignored and replaced by a separate valid generation", async () => {
@@ -357,4 +391,114 @@ test("hash timing measures incremental update work instead of network or storage
   // Seven 16-byte HTTP ranges are hashed during download. The in-memory OPFS
   // reader then verifies the promoted file in sixteen 7-byte pieces.
   assert.equal(cache.metrics.hashMilliseconds, 23);
+});
+
+interface FakeDirectoryHandle {
+  kind: "directory";
+  entries(): AsyncIterableIterator<[string, FakeDirectoryHandle | FakeFileHandle]>;
+  getDirectoryHandle(name: string): Promise<FakeDirectoryHandle>;
+}
+
+interface FakeFileHandle {
+  kind: "file";
+}
+
+function fakeTree(
+  entries: Readonly<Record<string, FakeDirectoryHandle | FakeFileHandle>>,
+  onYield?: () => void,
+): FakeDirectoryHandle {
+  return {
+    kind: "directory",
+    async *entries() {
+      for (const entry of Object.entries(entries)) {
+        onYield?.();
+        yield entry;
+      }
+    },
+    async getDirectoryHandle(name: string) {
+      const child = entries[name];
+      if (child?.kind !== "directory") {
+        throw new DOMException("not found", "NotFoundError");
+      }
+      return child;
+    },
+  };
+}
+
+test("OPFS enumeration stops as soon as the total-entry limit is exceeded", async () => {
+  let yielded = 0;
+  const entries = Object.fromEntries(
+    Array.from({ length: 100 }, (_, index) => [
+      `part-${index}`,
+      { kind: "file" as const },
+    ]),
+  );
+  const root = fakeTree(entries, () => {
+    yielded += 1;
+  });
+  const storage = BrowserOpfsStorage.fromRoot(
+    root as unknown as FileSystemDirectoryHandle,
+  );
+
+  await assert.rejects(
+    storage.list("", { maxDepth: 4, maxEntries: 3 }),
+    (error: unknown) =>
+      error instanceof ModelCacheError &&
+      error.code === "cache-enumeration-limit",
+  );
+  assert.equal(yielded, 4);
+});
+
+test("OPFS enumeration rejects excessive tree depth before entering it", async () => {
+  let deepestDirectoryRead = false;
+  const tooDeep: FakeDirectoryHandle = {
+    kind: "directory",
+    async *entries() {
+      deepestDirectoryRead = true;
+    },
+    async getDirectoryHandle() {
+      throw new DOMException("not found", "NotFoundError");
+    },
+  };
+  const levelTwo = fakeTree({ three: tooDeep });
+  const levelOne = fakeTree({ two: levelTwo });
+  const root = fakeTree({ one: levelOne });
+  const storage = BrowserOpfsStorage.fromRoot(
+    root as unknown as FileSystemDirectoryHandle,
+  );
+
+  await assert.rejects(
+    storage.list("", { maxDepth: 2, maxEntries: 100 }),
+    (error: unknown) =>
+      error instanceof ModelCacheError &&
+      error.code === "cache-enumeration-depth",
+  );
+  assert.equal(deepestDirectoryRead, false);
+});
+
+test("OPFS enumeration counts the requested prefix against the depth limit", async () => {
+  let deepestDirectoryRead = false;
+  const tooDeep: FakeDirectoryHandle = {
+    kind: "directory",
+    async *entries() {
+      deepestDirectoryRead = true;
+    },
+    async getDirectoryHandle() {
+      throw new DOMException("not found", "NotFoundError");
+    },
+  };
+  const levelTwo = fakeTree({ three: tooDeep });
+  const levelOne = fakeTree({ two: levelTwo });
+  const root = fakeTree({ one: levelOne });
+  const storage = BrowserOpfsStorage.fromRoot(
+    root as unknown as FileSystemDirectoryHandle,
+  );
+
+  await assert.rejects(
+    storage.list("one/two/three", { maxDepth: 2, maxEntries: 100 }),
+    (error: unknown) =>
+      error instanceof ModelCacheError &&
+      error.code === "cache-enumeration-depth",
+  );
+  assert.equal(deepestDirectoryRead, false);
 });

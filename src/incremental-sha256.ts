@@ -39,6 +39,9 @@ function rotateRight(value: number, shift: number): number {
 export class IncrementalSha256 {
   private readonly state = INITIAL_STATE.slice();
   private readonly pending = new Uint8Array(64);
+  // One schedule belongs to one synchronous hasher. Reusing it avoids a
+  // 256-byte allocation for every 64-byte block of multi-gigabyte shards.
+  private readonly schedule = new Uint32Array(64);
   private pendingLength = 0;
   private byteLength = 0n;
   private finalized = false;
@@ -104,7 +107,7 @@ export class IncrementalSha256 {
   }
 
   private compress(block: Uint8Array): void {
-    const schedule = new Uint32Array(64);
+    const schedule = this.schedule;
     const view = new DataView(block.buffer, block.byteOffset, 64);
     for (let index = 0; index < 16; index += 1) {
       schedule[index] = view.getUint32(index * 4, false);

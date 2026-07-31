@@ -246,3 +246,28 @@ test("work cancellation cannot abort cleanup or release ownership early", async 
   await secondRun;
   assert.equal(secondModelWork, 1);
 });
+
+test("throwing undefined still rejects after cleanup completes", async () => {
+  const manager = new FakeExclusiveLockManager();
+  const lock = new OriginModelLock(manager);
+  let cleanupCompleted = false;
+  let rejected = false;
+
+  try {
+    await lock.runExclusive({
+      run: async () => {
+        throw undefined;
+      },
+      cleanup: async () => {
+        cleanupCompleted = true;
+      },
+    });
+  } catch (error) {
+    rejected = true;
+    assert.equal(error, undefined);
+  }
+
+  assert.equal(rejected, true);
+  assert.equal(cleanupCompleted, true);
+  assert.equal(lock.state, "released");
+});

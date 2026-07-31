@@ -17,6 +17,10 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const REVISION = /^[a-f0-9]{40}$/;
 const MAX_READY_RECORD_BYTES = 1024 * 1024;
 const MAX_READY_GENERATIONS = 1_024;
+const CACHE_ENUMERATION_LIMITS: CacheEnumerationLimits = Object.freeze({
+  maxDepth: 8,
+  maxEntries: 4_096,
+});
 
 export interface CacheAtomicWriter {
   write(chunk: Uint8Array): Promise<void>;
@@ -35,7 +39,15 @@ export interface ModelCacheStorage {
   openAtomicWriter(path: string): Promise<CacheAtomicWriter>;
   openRead(path: string): Promise<AsyncIterable<Uint8Array> | null>;
   move(source: string, destination: string): Promise<boolean>;
-  list(prefix: string): Promise<readonly string[]>;
+  list(
+    prefix: string,
+    limits: CacheEnumerationLimits,
+  ): Promise<readonly string[]>;
+}
+
+export interface CacheEnumerationLimits {
+  maxDepth: number;
+  maxEntries: number;
 }
 
 export interface ShardByteStreamer {
@@ -114,9 +126,10 @@ export function modelCacheKey(manifest: ModelPackageManifest): string {
 /**
  * Publishes immutable OPFS generations by writing the ready record last.
  *
- * Interrupted files remain under tmp/ or stale/. Cache discovery reads only
- * fully parsed ready records whose source identity and shard hashes still
- * match, so an orphan can never become a cache hit.
+ * Interrupted weights remain as unreferenced attempt-unique blobs; staging
+ * metadata remains under tmp/ or stale/. Cache discovery reads only fully
+ * parsed ready records whose identities and hashes match, so an orphan can
+ * never become a cache hit or require a quota-doubling copy.
  */
 export class ImmutableOpfsModelCache {
   private readonly makeAttemptId: () => string;
@@ -168,15 +181,23 @@ export class ImmutableOpfsModelCache {
     if (!SAFE_PATH_SEGMENT.test(attempt)) {
       throw new ModelCacheError("attempt-id-invalid");
     }
-    await this.recoverTemps(key, attempt);
     const attemptPrefix = `tmp/${key}/${attempt}`;
-    await this.writeStagingManifest(manifest, key, attemptPrefix);
+    await this.recoverTemps(key, attempt);
+    const planned = manifest.shards.map((shard, index) => ({
+      storagePath: `blobs/${shard.sha256}/${attempt}-${index
+        .toString()
+        .padStart(5, "0")}.bin`,
+      byteLength: safeByteLength(shard.length),
+      sha256: shard.sha256,
+    }));
+    await this.requireUnusedAttempt(attemptPrefix, planned);
+    await this.writeStagingManifest(
+      manifest,
+      key,
+      attemptPrefix,
+      planned,
+    );
 
-    const temporary: Array<{
-      path: string;
-      byteLength: number;
-      sha256: string;
-    }> = [];
     try {
       for (const [index, shard] of manifest.shards.entries()) {
         signal.throwIfAborted();
@@ -185,40 +206,19 @@ export class ImmutableOpfsModelCache {
         if (source.byteLength !== expectedLength) {
           throw new ModelCacheError("source-length-mismatch");
         }
-        const path = `${attemptPrefix}/part-${index
-          .toString()
-          .padStart(5, "0")}.bin`;
-        await this.downloadTemp(
-          path,
+        await this.downloadImmutablePart(
+          planned[index]!.storagePath,
           source,
           expectedLength,
           shard.sha256,
           signal,
         );
-        temporary.push({
-          path,
-          byteLength: expectedLength,
-          sha256: shard.sha256,
-        });
       }
 
       const promoted: CachedShard[] = [];
-      for (const [index, part] of temporary.entries()) {
+      for (const part of planned) {
         signal.throwIfAborted();
-        const storagePath = `blobs/${part.sha256}/${attempt}-${index
-          .toString()
-          .padStart(5, "0")}.bin`;
-        const moved = await this.storage.move(part.path, storagePath);
-        if (!moved) {
-          await this.copyValidated(
-            part.path,
-            storagePath,
-            part.byteLength,
-            part.sha256,
-            signal,
-          );
-        }
-        const verified = await this.verifyFile(storagePath, signal);
+        const verified = await this.verifyFile(part.storagePath, signal);
         if (
           verified.byteLength !== part.byteLength ||
           verified.sha256 !== part.sha256
@@ -226,7 +226,7 @@ export class ImmutableOpfsModelCache {
           throw new ModelCacheError("published-part-invalid");
         }
         promoted.push({
-          storagePath,
+          storagePath: part.storagePath,
           byteLength: part.byteLength,
           sha256: part.sha256,
         });
@@ -279,7 +279,12 @@ export class ImmutableOpfsModelCache {
     key: string,
     signal: AbortSignal,
   ): Promise<Omit<CachedModelPackage, "cacheHit"> | null> {
-    const paths = (await this.storage.list(`ready/${key}/`))
+    const paths = (
+      await this.storage.list(
+        `ready/${key}/`,
+        CACHE_ENUMERATION_LIMITS,
+      )
+    )
       .filter((path) => path.endsWith(".json"))
       .sort()
       .slice(0, MAX_READY_GENERATIONS);
@@ -328,6 +333,7 @@ export class ImmutableOpfsModelCache {
     manifest: ModelPackageManifest,
     key: string,
     attemptPrefix: string,
+    planned: readonly CachedShard[],
   ): Promise<void> {
     const staging = encoder.encode(
       JSON.stringify({
@@ -338,12 +344,31 @@ export class ImmutableOpfsModelCache {
         sourceSha256: manifest.source.sha256,
         sourceSize: manifest.source.size,
         partCount: manifest.shards.length,
+        parts: planned,
       }),
     );
     await this.writeAtomic(`${attemptPrefix}/manifest.json`, [staging]);
   }
 
-  private async downloadTemp(
+  private async requireUnusedAttempt(
+    attemptPrefix: string,
+    planned: readonly CachedShard[],
+  ): Promise<void> {
+    const existingTemp = await this.storage.list(
+      `${attemptPrefix}/`,
+      CACHE_ENUMERATION_LIMITS,
+    );
+    if (existingTemp.length > 0) {
+      throw new ModelCacheError("cache-attempt-collision");
+    }
+    for (const part of planned) {
+      if ((await this.storage.openRead(part.storagePath)) !== null) {
+        throw new ModelCacheError("cache-attempt-collision");
+      }
+    }
+  }
+
+  private async downloadImmutablePart(
     path: string,
     source: ImmutableRangeSource,
     expectedLength: number,
@@ -377,40 +402,6 @@ export class ImmutableOpfsModelCache {
       actualSha256 !== expectedSha256
     ) {
       throw new ModelCacheError("shard-hash-mismatch");
-    }
-  }
-
-  private async copyValidated(
-    sourcePath: string,
-    destinationPath: string,
-    expectedLength: number,
-    expectedSha256: string,
-    signal: AbortSignal,
-  ): Promise<void> {
-    const source = await this.storage.openRead(sourcePath);
-    if (source === null) {
-      throw new ModelCacheError("copy-source-missing");
-    }
-    const writer = await this.storage.openAtomicWriter(destinationPath);
-    const hasher = new IncrementalSha256();
-    let byteLength = 0;
-    try {
-      for await (const chunk of source) {
-        signal.throwIfAborted();
-        this.updateHash(hasher, chunk);
-        await writer.write(chunk);
-        byteLength += chunk.byteLength;
-        this.bytesWritten += chunk.byteLength;
-      }
-      const sha256 = hasher.digestHex();
-      if (byteLength !== expectedLength || sha256 !== expectedSha256) {
-        await writer.preserveIncomplete();
-        throw new ModelCacheError("copy-hash-mismatch");
-      }
-      await writer.commit();
-    } catch (error) {
-      await writer.preserveIncomplete();
-      throw error;
     }
   }
 
@@ -458,7 +449,10 @@ export class ImmutableOpfsModelCache {
 
   private async recoverTemps(key: string, currentAttempt: string): Promise<void> {
     const prefix = `tmp/${key}/`;
-    for (const source of await this.storage.list(prefix)) {
+    for (const source of await this.storage.list(
+      prefix,
+      CACHE_ENUMERATION_LIMITS,
+    )) {
       const relative = source.slice(prefix.length);
       if (relative.startsWith(`${currentAttempt}/`)) {
         continue;
@@ -475,7 +469,10 @@ export class ImmutableOpfsModelCache {
     key: string,
     attempt: string,
   ): Promise<void> {
-    for (const source of await this.storage.list(`${attemptPrefix}/`)) {
+    for (const source of await this.storage.list(
+      `${attemptPrefix}/`,
+      CACHE_ENUMERATION_LIMITS,
+    )) {
       const relative = source.slice(attemptPrefix.length + 1);
       const destination = `stale/${key}/${attempt}/${relative}`;
       if (await this.storage.move(source, destination)) {
@@ -606,6 +603,12 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
     return new BrowserOpfsStorage(await storageManager.getDirectory());
   }
 
+  static fromRoot(
+    root: FileSystemDirectoryHandle,
+  ): BrowserOpfsStorage {
+    return new BrowserOpfsStorage(root);
+  }
+
   async openAtomicWriter(path: string): Promise<CacheAtomicWriter> {
     const { directory, name } = await this.parent(path, true);
     const handle = await directory.getFileHandle(name, { create: true });
@@ -676,8 +679,15 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
     return true;
   }
 
-  async list(prefix: string): Promise<readonly string[]> {
+  async list(
+    prefix: string,
+    limits: CacheEnumerationLimits,
+  ): Promise<readonly string[]> {
+    validateEnumerationLimits(limits);
     const segments = safeSegments(prefix);
+    if (segments.length > limits.maxDepth) {
+      throw new ModelCacheError("cache-enumeration-depth");
+    }
     let directory = this.root;
     try {
       for (const segment of segments) {
@@ -692,7 +702,15 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
     const normalizedPrefix =
       segments.length === 0 ? "" : `${segments.join("/")}/`;
     const output: string[] = [];
-    await walkDirectory(directory, normalizedPrefix, output);
+    const counter = { entries: 0 };
+    await walkDirectory(
+      directory,
+      normalizedPrefix,
+      output,
+      limits,
+      counter,
+      segments.length,
+    );
     return output;
   }
 
@@ -714,7 +732,11 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
 }
 
 function safeSegments(path: string): string[] {
-  const segments = path.replace(/\/+$/, "").split("/");
+  const normalized = path.replace(/\/+$/, "");
+  if (normalized.length === 0) {
+    return [];
+  }
+  const segments = normalized.split("/");
   if (
     segments.length === 0 ||
     segments.some((segment) => !SAFE_PATH_SEGMENT.test(segment))
@@ -728,11 +750,18 @@ async function walkDirectory(
   directory: FileSystemDirectoryHandle,
   prefix: string,
   output: string[],
+  limits: CacheEnumerationLimits,
+  counter: { entries: number },
+  depth: number,
 ): Promise<void> {
   const iterableDirectory = directory as FileSystemDirectoryHandle & {
     entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
   };
   for await (const [name, handle] of iterableDirectory.entries()) {
+    counter.entries += 1;
+    if (counter.entries > limits.maxEntries) {
+      throw new ModelCacheError("cache-enumeration-limit");
+    }
     if (!SAFE_PATH_SEGMENT.test(name)) {
       continue;
     }
@@ -740,12 +769,31 @@ async function walkDirectory(
     if (handle.kind === "file") {
       output.push(path);
     } else {
+      if (depth >= limits.maxDepth) {
+        throw new ModelCacheError("cache-enumeration-depth");
+      }
       await walkDirectory(
         handle as FileSystemDirectoryHandle,
         `${path}/`,
         output,
+        limits,
+        counter,
+        depth + 1,
       );
     }
+  }
+}
+
+function validateEnumerationLimits(limits: CacheEnumerationLimits): void {
+  if (
+    !Number.isSafeInteger(limits.maxDepth) ||
+    limits.maxDepth < 0 ||
+    limits.maxDepth > CACHE_ENUMERATION_LIMITS.maxDepth ||
+    !Number.isSafeInteger(limits.maxEntries) ||
+    limits.maxEntries < 1 ||
+    limits.maxEntries > CACHE_ENUMERATION_LIMITS.maxEntries
+  ) {
+    throw new ModelCacheError("cache-enumeration-bounds-invalid");
   }
 }
 

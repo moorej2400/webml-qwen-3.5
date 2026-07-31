@@ -101,9 +101,11 @@ export class OriginModelLock {
           this.transition("acquired");
           let value: T | undefined;
           let workFailure: unknown;
+          let workFailed = false;
           try {
             value = await work.run(this.controller.signal);
           } catch (error) {
+            workFailed = true;
             workFailure = error;
           }
 
@@ -121,7 +123,7 @@ export class OriginModelLock {
           if (cleanupFailed) {
             throw new OriginModelLockCleanupError();
           }
-          if (workFailure !== undefined) {
+          if (workFailed) {
             throw workFailure;
           }
           return value as T;
