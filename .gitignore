@@ -1,0 +1,37 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileconfig
+
+# Dependencies, builds, caches, and generated output
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+.parcel-cache/
+.vite/
+*.log
+*.sqlite
+*.sqlite3
+
+# Model files
+*.gguf
+*.onnx
+*.safetensors
+*.bin
+
+# Editor and operating-system state
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local AI-agent and session state
+.agents/
+.codex/
