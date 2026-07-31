@@ -10,6 +10,8 @@ import {
   repackNativeQ8_0,
 } from "../dist/src/mixed-quant.js";
 import { repackNativeQ3K } from "../dist/src/q3k.js";
+import { QWEN_PRIMITIVE_KERNELS } from "../dist/src/qwen-primitives.js";
+import { PACKED_EMBEDDING_KERNELS } from "../dist/src/qwen-embedding.js";
 import { validateParity } from "./webgpu-parity.mjs";
 
 function deterministicBytes(length, seed) {
@@ -211,6 +213,27 @@ async function runKernel(device, kernel) {
   };
 }
 
+async function compilePrimitive(device, kernel) {
+  const module = device.createShaderModule({
+    label: `primitive-compile-${kernel.id}`,
+    code: kernel.source,
+  });
+  const compilation = await module.getCompilationInfo();
+  const errors = Array.from(compilation.messages).filter(
+    (message) => message.type === "error",
+  );
+  if (errors.length > 0) {
+    throw new Error(
+      `${kernel.id}: ${errors.map((message) => message.message).join("; ")}`,
+    );
+  }
+  await device.createComputePipelineAsync({
+    layout: "auto",
+    compute: { module, entryPoint: "main" },
+  });
+  return { id: kernel.id, status: "compiled" };
+}
+
 export async function runWebGpuKernelHarness() {
   if (!navigator.gpu) {
     throw new Error("WebGPU is not available in this browser");
@@ -221,6 +244,12 @@ export async function runWebGpuKernelHarness() {
   const results = [];
   for (const kernel of LANGUAGE_GEMV_KERNELS) {
     results.push(await runKernel(device, kernel));
+  }
+  for (const kernel of QWEN_PRIMITIVE_KERNELS) {
+    results.push(await compilePrimitive(device, kernel));
+  }
+  for (const kernel of PACKED_EMBEDDING_KERNELS) {
+    results.push(await compilePrimitive(device, kernel));
   }
   device.destroy();
   return results;

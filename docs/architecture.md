@@ -39,12 +39,54 @@ row, distinct row data, a 2D grid, and sentinel slots around an output offset.
 The parity check rejects non-finite CPU or GPU output before it applies the
 numeric tolerance.
 
+## Qwen3.5 4B program
+
+The language program is static and model-specific. Its immutable configuration
+validates the parsed GGUF metadata for 32 base layers, hidden width 2,560, FFN
+width 9,216, vocabulary 248,320, 16 query heads, four KV heads, and 256-value
+query/key/value heads. It also validates the Gated DeltaNet dimensions, RMSNorm
+epsilon, partial rotary dimensions, and four M-RoPE position sections.
+
+Layers 3, 7, 11, 15, 19, 23, 27, and 31 use full attention. The remaining 24
+layers use typed Gated DeltaNet placeholders. Each layer has a fixed invocation
+sequence: input RMSNorm, its exact attention placeholder, residual add,
+post-attention RMSNorm, gate and up projections, SwiGLU, down projection, and
+residual add. Full attention and DeltaNet recurrence remain explicit
+non-runnable operators until their own runtime phases are implemented.
+
+The tensor-directory validator requires all 32 base layers with exact names and
+shapes. It rejects unknown base tensors and the `blk.32.*` MTP block. Tensor
+storage is selected independently from the six manifest layouts; quantization
+does not change a logical tensor shape.
+
+Embedding decodes one packed vocabulary row after checking token and table
+bounds. It never expands the 248,320 by 2,560 table. The same
+`token_embd.weight` allocation owns output logits: logits are tiled,
+row-sharded GEMV consumers, not a duplicate output matrix. The GPU embedding
+family shares the GEMV register decoders for all six layouts and dispatches
+only the selected row.
+
+Reusable correctness kernels cover FP32-accumulating RMSNorm, residual add,
+SiLU, fused SwiGLU, attention output gating, per-head Q/K RMSNorm, partial
+M-RoPE, and stable tiled top-k. Partial M-RoPE rotates only the first 64 values
+of each 256-value head and preserves the non-rotary suffix. Top-k rejects
+non-finite candidates and breaks equal-score ties by vocabulary index.
+
+The source GGUF advertises a native maximum context of 262,144 tokens. The
+current product contract selects 16,384 tokens and stores the native maximum
+separately. This selection is a product limit, not a browser capability
+ceiling.
+
 ## Scope
 
 This project targets one Qwen model family and its required multimodal
 components. A generic model loader is outside the production design. External
 inference frameworks may be used only as independent development references;
 they are not production dependencies.
+
+This program does not yet implement full-attention score/KV math, Gated
+DeltaNet recurrence, tokenization, session lifecycle, OPFS persistence, vision,
+UI, or a control server.
 
 ## Experimental feasibility
 

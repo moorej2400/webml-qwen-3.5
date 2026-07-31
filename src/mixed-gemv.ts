@@ -215,6 +215,33 @@ fn weight_value(block_word: u32, element: u32) -> f32 {
   },
 ] as const;
 
+export interface PackedWeightDecoder {
+  readonly ggmlType: GgmlType;
+  readonly layout: GemvLayout;
+  readonly bytesPerBlock: number;
+  readonly valuesPerBlock: number;
+  /** Requires `packed_weights` and `packed_byte` in the containing shader. */
+  readonly source: string;
+}
+
+/**
+ * Shares the exact register decoder between GEMV and other direct packed-row
+ * kernels so quantization field order cannot drift across shader families.
+ */
+export function packedWeightDecoder(layout: GemvLayout): PackedWeightDecoder {
+  const shape = WGSL_SHAPES.find((candidate) => candidate.layout === layout);
+  if (shape === undefined) {
+    throw new Error("Unsupported packed weight decoder layout");
+  }
+  return Object.freeze({
+    ggmlType: shape.ggmlType,
+    layout: shape.layout,
+    bytesPerBlock: shape.bytesPerBlock,
+    valuesPerBlock: shape.valuesPerBlock,
+    source: shape.weightValue,
+  });
+}
+
 function shaderSource(shape: KernelShape): string {
   return /* wgsl */ `
 const WORDS_PER_BLOCK: u32 = ${shape.bytesPerBlock / 4}u;

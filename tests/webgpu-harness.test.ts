@@ -30,7 +30,12 @@ test("ships a deterministic browser compile and CPU parity harness", async () =>
 
   assert.match(html, /webgpu-kernel-harness\.mjs/);
   assert.match(script, /LANGUAGE_GEMV_KERNELS/);
+  assert.match(script, /QWEN_PRIMITIVE_KERNELS/);
+  assert.match(script, /PACKED_EMBEDDING_KERNELS/);
   assert.match(script, /for \(const kernel of LANGUAGE_GEMV_KERNELS\)/);
+  assert.match(script, /for \(const kernel of QWEN_PRIMITIVE_KERNELS\)/);
+  assert.match(script, /for \(const kernel of PACKED_EMBEDDING_KERNELS\)/);
+  assert.match(script, /primitive-compile/);
   assert.match(script, /results\.push\(await runKernel\(device, kernel\)\)/);
   assert.match(script, /getCompilationInfo/);
   assert.match(script, /gemvCpu/);

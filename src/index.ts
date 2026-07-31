@@ -10,4 +10,8 @@ export * from "./mixed-gemv.js";
 export * from "./mixed-quant.js";
 export * from "./q3k-gemv.js";
 export * from "./q3k.js";
+export * from "./qwen-embedding.js";
+export * from "./qwen-primitives.js";
+export * from "./qwen35-config.js";
+export * from "./qwen35-program.js";
 export * from "./tensor-policy.js";

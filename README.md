@@ -15,6 +15,10 @@ foundation and mixed-quant compute layer:
 - explicit F32, Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K WebGPU layouts;
 - exact block repacking without full-tensor dequantization;
 - direct packed-weight GEMV kernels with row-aware shard dispatch;
+- an immutable Qwen3.5 4B configuration and exact 32-layer tensor validator;
+- a typed static program with explicit attention and DeltaNet placeholders;
+- FP32 CPU and WGSL references for reusable vector math, M-RoPE, and top-k;
+- single-row packed embedding decode and tied row-sharded output projection;
 - deterministic CPU references and a browser WebGPU parity harness; and
 - generated binary fixtures that do not include model data.
 
@@ -34,8 +38,9 @@ npm run test:converter
 ```
 
 After `npm run build`, serve the repository over HTTPS or localhost and open
-`tools/webgpu-kernel-harness.html` to compile all six shader families and
-compare deterministic GPU rows with CPU references.
+`tools/webgpu-kernel-harness.html` to compile the six GEMV layouts and reusable
+Qwen primitive and packed-embedding shaders, then compare deterministic GEMV
+rows with CPU references.
 
 See [Architecture](docs/architecture.md) for the artifact and feasibility
 rules. See [Third-party notices](THIRD_PARTY_NOTICES.md) for quantization
