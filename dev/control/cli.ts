@@ -41,6 +41,7 @@ const operatorServer = createOperatorServer({
   controlPlane,
   operatorToken: config.operatorToken,
   runsDirectory: path.join(projectRoot, ".local", "runs"),
+  journalHealth: () => journal.getHealth(),
 });
 
 await Promise.all([

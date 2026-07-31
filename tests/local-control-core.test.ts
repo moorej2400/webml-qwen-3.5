@@ -314,6 +314,50 @@ test("warm reload completes only after a replacement document reports ready", ()
   assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "completed");
 });
 
+test("disconnect before reload start cannot prove replacement completion", () => {
+  const plane = new ControlPlane({ clock: new FakeClock(), reloadTimeoutMs: 5_000 });
+  const stale = connect(plane, identity("document_0123456789abcdef"));
+  plane.disconnect(stale.connectionId, { kind: "socket_loss" });
+  const current = connect(plane, identity("document_0123456789abcdef"));
+  plane.issueCommand({
+    deviceId: identity("").deviceId,
+    tabId: identity("").tabId,
+    commandId: "command_0123456789abcdef",
+    command: "warmReload",
+  });
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+  ] as const) {
+    plane.receive(current.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...identity("document_0123456789abcdef"),
+      eventSeq,
+      commandId: "command_0123456789abcdef",
+      state,
+    });
+  }
+  const premature = connect(plane, identity("document_1123456789abcdef"));
+  plane.receive(premature.connectionId, {
+    schemaVersion: 1,
+    type: "ready",
+    ...identity("document_1123456789abcdef"),
+    eventSeq: 1,
+  });
+  assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "started");
+
+  plane.disconnect(current.connectionId, { kind: "page_lifecycle", lifecycle: "navigation" });
+  const replacement = connect(plane, identity("document_2123456789abcdef"));
+  plane.receive(replacement.connectionId, {
+    schemaVersion: 1,
+    type: "ready",
+    ...identity("document_2123456789abcdef"),
+    eventSeq: 1,
+  });
+  assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "completed");
+});
+
 test("replacement ready cannot complete reload until the old document disconnects", () => {
   const plane = new ControlPlane({ clock: new FakeClock(), reloadTimeoutMs: 5_000 });
   const original = connect(plane, identity("document_0123456789abcdef"));
@@ -588,4 +632,59 @@ test("sequence gaps and replays are rejected without applying state", () => {
     classification: "replay",
     expected: 2,
   });
+});
+
+test("control state enforces caps, expiry, timer retirement, and payload retirement", () => {
+  const clock = new FakeClock();
+  const sentCommands: Extract<ServerToPhoneMessage, { type: "command" }>[] = [];
+  const plane = new ControlPlane({
+    clock,
+    commandTimeoutMs: 10,
+    retentionMs: 20,
+    maxCommands: 2,
+    maxDisconnectRecords: 2,
+  });
+  const phone = plane.connect(identity("document_0123456789abcdef"), (message) => {
+    if (message.type === "command") sentCommands.push(message);
+    return true;
+  });
+  const request = (suffix: string) => ({
+    deviceId: identity("").deviceId,
+    tabId: identity("").tabId,
+    commandId: `command_${suffix.padEnd(16, "0")}`,
+    command: "runPrompt" as const,
+    payload: { prompt: `private-${suffix}` },
+  });
+  plane.issueCommand(request("a"));
+  plane.receive(phone, {
+    schemaVersion: 1,
+    type: "commandState",
+    ...identity("document_0123456789abcdef"),
+    eventSeq: 1,
+    commandId: request("a").commandId,
+    state: "accepted",
+  });
+  assert.equal(sentCommands[0]?.payload, undefined);
+  assert.doesNotThrow(() => plane.issueCommand(request("a")));
+  assert.throws(
+    () => plane.issueCommand({ ...request("a"), payload: { prompt: "different" } }),
+    /different work/i,
+  );
+  plane.issueCommand(request("b"));
+  assert.throws(() => plane.issueCommand(request("c")), /capacity/i);
+  clock.advance(10);
+  assert.equal(plane.getControlMetrics().activeTimers, 0);
+  clock.advance(21);
+  assert.doesNotThrow(() => plane.issueCommand(request("c")));
+
+  for (let index = 0; index < 3; index += 1) {
+    const connection = connect(
+      plane,
+      identity(`document_disconnect_${String(index).padStart(2, "0")}`),
+    );
+    plane.disconnect(connection.connectionId, { kind: "socket_loss" });
+  }
+  assert.equal(plane.getDisconnectEvidence().length, 2);
+  clock.advance(21);
+  assert.equal(plane.getDisconnectEvidence().length, 0);
 });

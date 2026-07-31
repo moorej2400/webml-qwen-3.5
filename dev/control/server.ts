@@ -7,15 +7,26 @@ import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import { createBrowserAgentSource } from "./browser-agent-source.js";
-import { ControlPlane, type IssueCommandRequest } from "./control-plane.js";
+import {
+  ControlPlane,
+  type IssueCommandRequest,
+  type ServerToPhoneMessage,
+} from "./control-plane.js";
 import { PairingAuthority } from "./pairing.js";
-import { CONTROL_SCHEMA_VERSION, validateProtocolId, type PhoneIdentity } from "./protocol.js";
-import { listRunSummaries } from "./run-journal.js";
+import {
+  CONTROL_COMMANDS,
+  CONTROL_SCHEMA_VERSION,
+  validateProtocolId,
+  type ControlCommand,
+  type PhoneIdentity,
+} from "./protocol.js";
+import { listRunSummaries, type RunJournalHealth } from "./run-journal.js";
 import { assertHighEntropyCredential } from "./security.js";
 
 export { assertHighEntropyCredential } from "./security.js";
 
 const MAX_OPERATOR_BODY_BYTES = 65_536;
+const CONTROL_COMMAND_SET = new Set<string>(CONTROL_COMMANDS);
 
 const constantTimeEqual = (left: string, right: string): boolean => {
   const leftBuffer = Buffer.from(left);
@@ -43,6 +54,22 @@ export const authenticatePhoneProtocols = (
   } catch {
     return { accepted: false };
   }
+};
+
+export const connectAuthenticatedPhone = (
+  controlPlane: ControlPlane,
+  authenticatedIdentity: PhoneIdentity,
+  hello: PhoneIdentity,
+  send: (message: ServerToPhoneMessage) => boolean,
+): string => {
+  if (
+    authenticatedIdentity.deviceId !== hello.deviceId ||
+    authenticatedIdentity.tabId !== hello.tabId ||
+    authenticatedIdentity.documentId !== hello.documentId
+  ) {
+    throw new Error("hello identity does not match WSS ticket");
+  }
+  return controlPlane.connect(hello, send);
 };
 
 const resolveLocalFile = async (projectRoot: string, relativePath: string): Promise<string> => {
@@ -107,10 +134,22 @@ const readJsonBody = async (request: IncomingMessage): Promise<Record<string, un
   return parsed as Record<string, unknown>;
 };
 
+const parseIssueCommandRequest = (body: Record<string, unknown>): IssueCommandRequest => {
+  if (
+    !Object.hasOwn(body, "command") ||
+    typeof body.command !== "string" ||
+    !CONTROL_COMMAND_SET.has(body.command)
+  ) {
+    throw new Error("operator command is not allowed");
+  }
+  return { ...body, command: body.command as ControlCommand } as unknown as IssueCommandRequest;
+};
+
 export interface OperatorServerOptions {
   controlPlane: ControlPlane;
   operatorToken: string;
   runsDirectory?: string;
+  journalHealth?: () => Readonly<RunJournalHealth>;
 }
 
 export const createOperatorRequestHandler = (
@@ -128,6 +167,10 @@ export const createOperatorRequestHandler = (
         sendJson(response, 200, {
           devices: options.controlPlane.getConnectedState(),
           disconnectEvidence: options.controlPlane.getDisconnectEvidence(),
+          metrics: {
+            control: options.controlPlane.getControlMetrics(),
+            journal: options.journalHealth?.() ?? { state: "healthy", writeFailures: 0 },
+          },
         });
         return;
       }
@@ -164,7 +207,7 @@ export const createOperatorRequestHandler = (
       }
       if (request.method === "POST" && url.pathname === "/v1/commands") {
         const body = await readJsonBody(request);
-        const issued = options.controlPlane.issueCommand(body as unknown as IssueCommandRequest);
+        const issued = options.controlPlane.issueCommand(parseIssueCommandRequest(body));
         sendJson(response, 202, issued);
         return;
       }
@@ -314,19 +357,17 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
         if (connectionId === undefined) {
           const hello = parseHello(parsed);
           const authenticatedIdentity = authenticatedIdentities.get(websocket);
-          if (
-            authenticatedIdentity === undefined ||
-            authenticatedIdentity.deviceId !== hello.deviceId ||
-            authenticatedIdentity.tabId !== hello.tabId ||
-            authenticatedIdentity.documentId !== hello.documentId
-          ) {
-            throw new Error("hello identity does not match WSS ticket");
-          }
-          connectionId = options.controlPlane.connect(hello, (message) => {
-            if (websocket.readyState !== websocket.OPEN) return false;
-            websocket.send(JSON.stringify(message));
-            return true;
-          });
+          if (authenticatedIdentity === undefined) throw new Error("missing WSS ticket identity");
+          connectionId = connectAuthenticatedPhone(
+            options.controlPlane,
+            authenticatedIdentity,
+            hello,
+            (message) => {
+              if (websocket.readyState !== websocket.OPEN) return false;
+              websocket.send(JSON.stringify(message));
+              return true;
+            },
+          );
           return;
         }
         options.controlPlane.receive(connectionId, parsed);

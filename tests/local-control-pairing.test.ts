@@ -35,6 +35,7 @@ test("injected browser agent retains and replays bounded unacknowledged events",
   assert.match(source, /synchronize\(message\)/);
   assert.match(source, /replayFrom\(message\.expectedSeq\)/);
   assert.match(source, /resendState\(command\.commandId, local\)/);
+  assert.match(source, /Object\.hasOwn\(handlers, message\.command\)/);
   const candidate = source.indexOf("const eventSeq = sequence + 1");
   const retained = source.indexOf("outbox.set(eventSeq, frame)");
   const committed = source.indexOf("sequence = eventSeq");

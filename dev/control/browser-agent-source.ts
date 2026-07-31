@@ -7,6 +7,9 @@ export const createBrowserAgentSource = (): string => `(() => {
   "use strict";
   const VERSION = 1;
   const OUTBOX_LIMIT = 256;
+  const ALLOWED_COMMANDS = new Set([
+    "load", "dispose", "runPrompt", "cancelPrompt", "getState", "warmReload", "coldAppReload"
+  ]);
   const safeId = (prefix) => prefix + "_" + crypto.randomUUID().replaceAll("-", "");
   const durable = (storage, key, prefix) => {
     let value = storage.getItem(key);
@@ -23,6 +26,7 @@ export const createBrowserAgentSource = (): string => `(() => {
   let sequence = 0;
   let socket;
   let reconnectDelay = 250;
+  let connectPromise;
   let tabClaimed = false;
   let tabCollision = false;
   const records = new Map();
@@ -217,6 +221,7 @@ export const createBrowserAgentSource = (): string => `(() => {
     dialog.showModal();
   };
   const handleCommand = async (message) => {
+    if (!ALLOWED_COMMANDS.has(message.command)) return;
     const previous = records.get(message.commandId);
     if (previous) {
       resendState(message.commandId, previous);
@@ -234,7 +239,9 @@ export const createBrowserAgentSource = (): string => `(() => {
     }
     try {
       const handlers = globalThis.__QWEN_LOCAL_CONTROL__;
-      const handler = handlers && handlers[message.command];
+      const handler = handlers && Object.hasOwn(handlers, message.command)
+        ? handlers[message.command]
+        : undefined;
       if (typeof handler !== "function") throw new Error("handler_unavailable");
       const value = await handler(message.payload);
       transition(
@@ -251,7 +258,7 @@ export const createBrowserAgentSource = (): string => `(() => {
       );
     }
   };
-  const connect = async () => {
+  const connectOnce = async () => {
     const capability = sessionStorage.getItem("qwen.control.session");
     if (!capability) {
       dispatchEvent(new CustomEvent("qwen-control-pairing-required"));
@@ -313,6 +320,17 @@ export const createBrowserAgentSource = (): string => `(() => {
       dispatchEvent(new CustomEvent("qwen-control-pairing-required"));
       showPairing();
     }
+  };
+  const connect = () => {
+    if (connectPromise) return connectPromise;
+    if (
+      socket &&
+      (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)
+    ) return Promise.resolve();
+    connectPromise = connectOnce().finally(() => {
+      connectPromise = undefined;
+    });
+    return connectPromise;
   };
   globalThis.__QWEN_LOCAL_PAIR__ = async (pairingCode) => {
     const paired = await requestJson("/.local-pair", { pairingCode, ...identity() });

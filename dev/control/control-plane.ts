@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   CONTROL_SCHEMA_VERSION,
@@ -62,8 +62,15 @@ interface StoredCommand {
   message: Extract<ServerToPhoneMessage, { type: "command" }>;
   dispatched: boolean;
   phoneReceived: boolean;
-  originalDocumentId?: string;
+  payloadFingerprint: string;
+  reloadProof?: {
+    connectionId: string;
+    documentId: string;
+    startedAtMs: number;
+    disconnectedAtMs?: number;
+  };
   timer?: number | NodeJS.Timeout;
+  retireAtMs?: number;
 }
 
 interface DisconnectRecord {
@@ -90,6 +97,10 @@ export interface ControlPlaneOptions {
   commandTimeoutMs?: number;
   reloadTimeoutMs?: number;
   suspectedCrashTimeoutMs?: number;
+  retentionMs?: number;
+  maxCommands?: number;
+  maxDisconnectRecords?: number;
+  maxSequenceDocuments?: number;
   onTelemetry?: (event: Record<string, unknown>) => void | Promise<void>;
 }
 
@@ -106,17 +117,22 @@ const isTerminal = (state: CommandSnapshot["state"]): state is TerminalCommandSt
   state === "timed_out" ||
   state === "indeterminate";
 
+const payloadFingerprint = (payload: Record<string, unknown> | undefined): string =>
+  createHash("sha256").update(JSON.stringify(payload ?? null)).digest("hex");
+
 export class ControlPlane {
   readonly #clock: Clock;
   readonly #commandTimeoutMs: number;
   readonly #reloadTimeoutMs: number;
   readonly #suspectedCrashTimeoutMs: number;
+  readonly #retentionMs: number;
+  readonly #maxCommands: number;
+  readonly #maxDisconnectRecords: number;
   readonly #onTelemetry?: ControlPlaneOptions["onTelemetry"];
   readonly #connections = new Map<string, Connection>();
   readonly #connectionByTab = new Map<string, string>();
-  readonly #disconnectedDocuments = new Set<string>();
   readonly #commands = new Map<string, StoredCommand>();
-  readonly #sequences = new EventSequenceTracker();
+  readonly #sequences: EventSequenceTracker;
   readonly #disconnects: DisconnectRecord[] = [];
 
   constructor(options: ControlPlaneOptions = {}) {
@@ -124,15 +140,33 @@ export class ControlPlane {
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 120_000;
     this.#reloadTimeoutMs = options.reloadTimeoutMs ?? 30_000;
     this.#suspectedCrashTimeoutMs = options.suspectedCrashTimeoutMs ?? 10_000;
+    this.#retentionMs = options.retentionMs ?? 15 * 60_000;
+    this.#maxCommands = options.maxCommands ?? 1_024;
+    this.#maxDisconnectRecords = options.maxDisconnectRecords ?? 1_024;
+    for (const [value, label] of [
+      [this.#retentionMs, "retention"],
+      [this.#maxCommands, "command capacity"],
+      [this.#maxDisconnectRecords, "disconnect capacity"],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${label} must be positive`);
+    }
+    this.#sequences = new EventSequenceTracker({
+      maxDocuments: options.maxSequenceDocuments ?? 1_024,
+      retentionMs: this.#retentionMs,
+      now: () => this.#clock.now(),
+    });
     this.#onTelemetry = options.onTelemetry;
   }
 
   connect(identityInput: PhoneIdentity, send: Connection["send"]): string {
+    this.#prune();
     const identity = {
       deviceId: validateProtocolId(identityInput.deviceId, "deviceId"),
       tabId: validateProtocolId(identityInput.tabId, "tabId"),
       documentId: validateProtocolId(identityInput.documentId, "documentId"),
     };
+    // Reserve bounded sequence ownership before publishing the connection.
+    const expectedSeq = this.#sequences.expected(identity.documentId);
     const key = tabKey(identity);
     const connectionId = `connection_${randomUUID()}`;
     const connection = { connectionId, identity, send };
@@ -145,7 +179,10 @@ export class ControlPlane {
         disconnect.classification === "socket_loss"
       ) {
         disconnect.reconnectedAtMs = this.#clock.now();
-        if (disconnect.timer !== undefined) this.#clock.clearTimeout(disconnect.timer);
+        if (disconnect.timer !== undefined) {
+          this.#clock.clearTimeout(disconnect.timer);
+          delete disconnect.timer;
+        }
       }
     }
 
@@ -153,7 +190,7 @@ export class ControlPlane {
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "sequenceSync",
       documentId: identity.documentId,
-      expectedSeq: this.#sequences.expected(identity.documentId),
+      expectedSeq,
     });
 
     const commands = [...this.#commands.values()]
@@ -176,6 +213,7 @@ export class ControlPlane {
   }
 
   disconnect(connectionId: string, evidence?: DisconnectEvidence): void {
+    this.#prune();
     const connection = this.#connections.get(connectionId);
     if (connection === undefined) return;
     const resolvedEvidence = evidence ?? connection.lastEvidence ?? { kind: "socket_loss" };
@@ -183,7 +221,15 @@ export class ControlPlane {
     if (this.#connectionByTab.get(tabKey(connection.identity)) === connectionId) {
       this.#connectionByTab.delete(tabKey(connection.identity));
     }
-    this.#disconnectedDocuments.add(connection.identity.documentId);
+    for (const stored of this.#commands.values()) {
+      if (
+        stored.reloadProof?.connectionId === connectionId &&
+        stored.reloadProof.disconnectedAtMs === undefined &&
+        stored.tracker.snapshot().state === "started"
+      ) {
+        stored.reloadProof.disconnectedAtMs = this.#clock.now();
+      }
+    }
     const disconnectRecord: DisconnectRecord = {
       atMs: this.#clock.now(),
       identity: connection.identity,
@@ -191,6 +237,7 @@ export class ControlPlane {
     };
     if (resolvedEvidence.kind === "socket_loss") {
       disconnectRecord.timer = this.#clock.setTimeout(() => {
+        delete disconnectRecord.timer;
         if (disconnectRecord.reconnectedAtMs !== undefined) return;
         disconnectRecord.classification = "suspected_crash";
         if (!disconnectRecord.evidence.includes("reconnect_timeout")) {
@@ -198,10 +245,15 @@ export class ControlPlane {
         }
       }, this.#suspectedCrashTimeoutMs);
     }
+    while (this.#disconnects.length >= this.#maxDisconnectRecords) {
+      const removed = this.#disconnects.shift();
+      if (removed?.timer !== undefined) this.#clock.clearTimeout(removed.timer);
+    }
     this.#disconnects.push(disconnectRecord);
   }
 
   issueCommand(request: IssueCommandRequest): CommandSnapshot {
+    this.#prune();
     const commandId = validateProtocolId(request.commandId, "commandId");
     const deviceId = validateProtocolId(request.deviceId, "deviceId");
     const tabId = validateProtocolId(request.tabId, "tabId");
@@ -211,13 +263,14 @@ export class ControlPlane {
         existing.message.command === request.command &&
         existing.target.deviceId === deviceId &&
         existing.target.tabId === tabId &&
-        JSON.stringify(existing.message.payload ?? null) === JSON.stringify(request.payload ?? null);
+        existing.payloadFingerprint === payloadFingerprint(request.payload);
       if (!same) throw new Error("commandId is already assigned to different work");
       if (!existing.dispatched && !isTerminal(existing.tracker.snapshot().state)) {
         this.#attemptDispatch(existing);
       }
       return existing.tracker.snapshot();
     }
+    if (this.#commands.size >= this.#maxCommands) throw new Error("command capacity reached");
 
     const tracker = new CommandTracker({
       commandId,
@@ -243,6 +296,7 @@ export class ControlPlane {
       message,
       dispatched: false,
       phoneReceived: false,
+      payloadFingerprint: payloadFingerprint(request.payload),
     };
     // Publish tracker ownership before transport delivery because in-memory
     // tests and future local transports can synchronously acknowledge a send.
@@ -260,6 +314,7 @@ export class ControlPlane {
       if (!isReload(request.command)) {
         this.#promoteSuspectedCrash(target, "command_timeout");
       }
+      this.#retireTerminal(stored);
     }, timeoutMs);
     this.#attemptDispatch(stored);
     return tracker.snapshot();
@@ -283,11 +338,11 @@ export class ControlPlane {
     if (selected === undefined || tabKey(selected.identity) !== tabKey(stored.target)) return false;
     if (!this.#tryQueue(selected, stored.message)) return false;
     stored.dispatched = true;
-    stored.originalDocumentId = selected.identity.documentId;
     return true;
   }
 
   receive(connectionId: string, input: unknown): SequenceResult {
+    this.#prune();
     const connection = this.#connections.get(connectionId);
     if (connection === undefined) throw new Error("unknown phone connection");
     const message = parsePhoneMessage(input);
@@ -311,7 +366,7 @@ export class ControlPlane {
       return sequence;
     }
 
-    if (message.type === "commandState") this.#applyCommandState(message);
+    if (message.type === "commandState") this.#applyCommandState(message, connection);
     if (message.type === "ready") this.#completeReplacementReload(message);
     if (message.type === "telemetry") {
       const evidence = disconnectEvidenceFromTelemetry(message.event);
@@ -340,7 +395,10 @@ export class ControlPlane {
     return sequence;
   }
 
-  #applyCommandState(message: Extract<PhoneToServerMessage, { type: "commandState" }>): void {
+  #applyCommandState(
+    message: Extract<PhoneToServerMessage, { type: "commandState" }>,
+    connection: Connection,
+  ): void {
     const stored = this.#commands.get(message.commandId);
     if (stored === undefined) throw new Error("unknown commandId");
     if (tabKey(stored.target) !== tabKey(message)) throw new Error("command target mismatch");
@@ -354,8 +412,16 @@ export class ControlPlane {
     }
     stored.tracker.transition(message.state, this.#clock.now(), message.reason, message.result);
     stored.phoneReceived = true;
-    if (isTerminal(stored.tracker.snapshot().state) && stored.timer !== undefined) {
-      this.#clock.clearTimeout(stored.timer);
+    if (stored.message.command === "runPrompt") delete stored.message.payload;
+    if (isReload(stored.message.command) && message.state === "started") {
+      stored.reloadProof = {
+        connectionId: connection.connectionId,
+        documentId: message.documentId,
+        startedAtMs: this.#clock.now(),
+      };
+    }
+    if (isTerminal(stored.tracker.snapshot().state)) {
+      this.#retireTerminal(stored);
     }
   }
 
@@ -366,25 +432,27 @@ export class ControlPlane {
         isReload(snapshot.command) &&
         snapshot.state === "started" &&
         tabKey(stored.target) === tabKey(message) &&
-        stored.originalDocumentId !== undefined &&
-        this.#disconnectedDocuments.has(stored.originalDocumentId) &&
-        stored.originalDocumentId !== message.documentId
+        stored.reloadProof?.disconnectedAtMs !== undefined &&
+        stored.reloadProof.documentId !== message.documentId
       ) {
         stored.tracker.transition("completed", this.#clock.now());
-        if (stored.timer !== undefined) this.#clock.clearTimeout(stored.timer);
+        this.#retireTerminal(stored);
       }
     }
   }
 
   getCommand(commandId: string): CommandSnapshot | undefined {
+    this.#prune();
     return this.#commands.get(commandId)?.tracker.snapshot();
   }
 
   getConnectedState(): PhoneIdentity[] {
+    this.#prune();
     return [...this.#connections.values()].map(({ identity }) => structuredClone(identity));
   }
 
   getBenchmark(benchmarkId: string): CommandSnapshot[] {
+    this.#prune();
     return [...this.#commands.values()]
       .map(({ tracker }) => tracker.snapshot())
       .filter((snapshot) => snapshot.benchmarkId === benchmarkId);
@@ -397,9 +465,59 @@ export class ControlPlane {
     evidence: string[];
     confirmedCrash: false;
   }>[] {
+    this.#prune();
     return this.#disconnects.map(({ timer: _timer, reconnectedAtMs: _reconnectedAtMs, ...record }) =>
       structuredClone(record),
     );
+  }
+
+  getControlMetrics(): Readonly<{
+    commands: number;
+    disconnectRecords: number;
+    sequenceDocuments: number;
+    activeTimers: number;
+    reloadProofs: number;
+  }> {
+    this.#prune();
+    return Object.freeze({
+      commands: this.#commands.size,
+      disconnectRecords: this.#disconnects.length,
+      sequenceDocuments: this.#sequences.size,
+      activeTimers:
+        [...this.#commands.values()].filter((stored) => stored.timer !== undefined).length +
+        this.#disconnects.filter((record) => record.timer !== undefined).length,
+      reloadProofs: [...this.#commands.values()].filter(
+        (stored) => stored.reloadProof !== undefined,
+      ).length,
+    });
+  }
+
+  #retireTerminal(stored: StoredCommand): void {
+    if (stored.timer !== undefined) {
+      this.#clock.clearTimeout(stored.timer);
+      delete stored.timer;
+    }
+    if (stored.message.command === "runPrompt") delete stored.message.payload;
+    delete stored.reloadProof;
+    stored.retireAtMs = this.#clock.now() + this.#retentionMs;
+  }
+
+  #prune(): void {
+    const now = this.#clock.now();
+    for (const [commandId, stored] of this.#commands) {
+      if (stored.retireAtMs !== undefined && stored.retireAtMs < now) {
+        if (stored.timer !== undefined) this.#clock.clearTimeout(stored.timer);
+        this.#commands.delete(commandId);
+      }
+    }
+    const cutoff = now - this.#retentionMs;
+    for (let index = this.#disconnects.length - 1; index >= 0; index -= 1) {
+      const record = this.#disconnects[index];
+      if (record !== undefined && record.atMs < cutoff) {
+        if (record.timer !== undefined) this.#clock.clearTimeout(record.timer);
+        this.#disconnects.splice(index, 1);
+      }
+    }
   }
 
   #promoteSuspectedCrash(

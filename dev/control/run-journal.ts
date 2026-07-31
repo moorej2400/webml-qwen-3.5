@@ -133,6 +133,14 @@ export interface RunJournalOptions {
   runId: string;
   maxSegmentBytes?: number;
   maxSegments?: number;
+  now?: () => number;
+  appendLine?: (filePath: string, line: string) => Promise<void>;
+}
+
+export interface RunJournalHealth {
+  state: "healthy" | "degraded";
+  writeFailures: number;
+  lastFailureAtMs?: number;
 }
 
 export class RunJournal {
@@ -140,10 +148,15 @@ export class RunJournal {
   readonly #runId: string;
   readonly #maxSegmentBytes: number;
   readonly #maxSegments: number;
+  readonly #now: () => number;
+  readonly #appendLine: (filePath: string, line: string) => Promise<void>;
+  readonly #prepareDirectory: () => Promise<void>;
   #segmentIndex = 0;
   #segmentBytes = 0;
   #capped = false;
   #pending = Promise.resolve();
+  #writeFailures = 0;
+  #lastFailureAtMs?: number;
 
   constructor(options: RunJournalOptions) {
     const runId = validateProtocolId(options.runId, "runId");
@@ -151,6 +164,16 @@ export class RunJournal {
     this.#runId = runId;
     this.#maxSegmentBytes = options.maxSegmentBytes ?? 8 * 1024 * 1024;
     this.#maxSegments = options.maxSegments ?? 8;
+    this.#now = options.now ?? Date.now;
+    this.#appendLine =
+      options.appendLine ??
+      (async (filePath, line) => {
+        await appendFile(filePath, line, { encoding: "utf8", mode: 0o600 });
+      });
+    this.#prepareDirectory =
+      options.appendLine === undefined
+        ? async () => mkdir(this.#runsDirectory, { recursive: true, mode: 0o700 }).then(() => undefined)
+        : async () => undefined;
     if (!Number.isSafeInteger(this.#maxSegmentBytes) || this.#maxSegmentBytes < 256) {
       throw new RangeError("maxSegmentBytes must be at least 256");
     }
@@ -174,9 +197,9 @@ export class RunJournal {
     if (lineBytes > this.#maxSegmentBytes) {
       return Promise.reject(new Error("sanitized event exceeds journal segment cap"));
     }
-    this.#pending = this.#pending.then(async () => {
+    const operation = this.#pending.then(async () => {
       if (this.#capped) return;
-      await mkdir(this.#runsDirectory, { recursive: true, mode: 0o700 });
+      await this.#prepareDirectory();
       if (this.#segmentBytes > 0 && this.#segmentBytes + lineBytes > this.#maxSegmentBytes) {
         if (this.#segmentIndex + 1 >= this.#maxSegments) {
           // Stop this run at its hard cap; overwriting local evidence would
@@ -187,14 +210,29 @@ export class RunJournal {
         this.#segmentIndex += 1;
         this.#segmentBytes = 0;
       }
-      await appendFile(this.#segmentPath(), line, { encoding: "utf8", mode: 0o600 });
+      await this.#appendLine(this.#segmentPath(), line);
       this.#segmentBytes += lineBytes;
     });
-    return this.#pending;
+    const reported = operation.catch(() => {
+      this.#writeFailures += 1;
+      this.#lastFailureAtMs = this.#now();
+      throw new Error("journal append failed");
+    });
+    // A failed append rejects its caller but cannot poison later serialized writes.
+    this.#pending = reported.catch(() => undefined);
+    return reported;
   }
 
   close(): Promise<void> {
     return this.#pending;
+  }
+
+  getHealth(): Readonly<RunJournalHealth> {
+    return Object.freeze({
+      state: this.#writeFailures === 0 ? "healthy" : "degraded",
+      writeFailures: this.#writeFailures,
+      ...(this.#lastFailureAtMs === undefined ? {} : { lastFailureAtMs: this.#lastFailureAtMs }),
+    });
   }
 
   #segmentPath(): string {

@@ -80,3 +80,21 @@ test("event sequence tracker detects replay and gaps per document", () => {
     classification: "gap",
   });
 });
+
+test("event sequence tracker bounds and expires document state", () => {
+  let nowMs = 0;
+  const tracker = new EventSequenceTracker({
+    maxDocuments: 2,
+    retentionMs: 10,
+    now: () => nowMs,
+  });
+  tracker.accept("document_0123456789abcdef", 1);
+  tracker.accept("document_1123456789abcdef", 1);
+  assert.throws(
+    () => tracker.accept("document_2123456789abcdef", 1),
+    /capacity/i,
+  );
+  nowMs = 11;
+  tracker.accept("document_2123456789abcdef", 1);
+  assert.equal(tracker.size, 1);
+});

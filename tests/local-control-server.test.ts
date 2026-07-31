@@ -4,6 +4,7 @@ import { chmod, mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 
 import {
@@ -16,6 +17,7 @@ import {
 } from "../dev/control/server.js";
 import { ControlPlane } from "../dev/control/control-plane.js";
 import { PairingAuthority } from "../dev/control/pairing.js";
+import { CONTROL_COMMANDS } from "../dev/control/protocol.js";
 
 test("credentials must be high entropy and are not accepted as short secrets", () => {
   assert.throws(() => assertHighEntropyCredential("password", "credential"), /entropy/i);
@@ -198,4 +200,99 @@ test("operator command query returns sanitized getState result", async () => {
   assert.equal(status, 200);
   const snapshot = JSON.parse(responseBody) as { result: Record<string, unknown> };
   assert.deepEqual(snapshot.result, { modelState: "loaded" });
+});
+
+test("operator command endpoint accepts only the explicit command allowlist", async () => {
+  const token = randomBytes(32).toString("base64url");
+  const issued: string[] = [];
+  const handler = createOperatorRequestHandler({
+    controlPlane: {
+      issueCommand(request: { command: string }) {
+        issued.push(request.command);
+        return { command: request.command };
+      },
+    } as unknown as ControlPlane,
+    operatorToken: token,
+  });
+  const invoke = async (command: string): Promise<number> => {
+    const request = Readable.from([
+      JSON.stringify({
+        deviceId: "device_0123456789abcdef",
+        tabId: "tab_0123456789abcdef",
+        commandId: `command_${String(issued.length).padStart(16, "0")}`,
+        command,
+      }),
+    ]);
+    Object.assign(request, {
+      headers: { authorization: `Bearer ${token}` },
+      method: "POST",
+      url: "/v1/commands",
+    });
+    let status = 0;
+    await handler(
+      request as unknown as IncomingMessage,
+      {
+        writeHead(code: number) {
+          status = code;
+          return this;
+        },
+        end() {
+          return this;
+        },
+      } as unknown as ServerResponse,
+    );
+    return status;
+  };
+
+  for (const command of CONTROL_COMMANDS) assert.equal(await invoke(command), 202);
+  for (const command of ["__proto__", "constructor", "unknownCommand"]) {
+    assert.equal(await invoke(command), 400);
+  }
+  assert.deepEqual(issued, [...CONTROL_COMMANDS]);
+});
+
+test("operator state exposes bounded control and journal health without raw errors", async () => {
+  const token = randomBytes(32).toString("base64url");
+  const handler = createOperatorRequestHandler({
+    controlPlane: {
+      getConnectedState: () => [],
+      getDisconnectEvidence: () => [],
+      getControlMetrics: () => ({
+        commands: 1,
+        disconnectRecords: 0,
+        sequenceDocuments: 1,
+        activeTimers: 1,
+        reloadProofs: 0,
+      }),
+    } as unknown as ControlPlane,
+    operatorToken: token,
+    journalHealth: () => ({ state: "degraded", writeFailures: 1, lastFailureAtMs: 1234 }),
+  });
+  let status = 0;
+  let body = "";
+  await handler(
+    {
+      headers: { authorization: `Bearer ${token}` },
+      method: "GET",
+      url: "/v1/state",
+    } as IncomingMessage,
+    {
+      writeHead(code: number) {
+        status = code;
+        return this;
+      },
+      end(chunk?: string) {
+        body += chunk ?? "";
+        return this;
+      },
+    } as unknown as ServerResponse,
+  );
+
+  assert.equal(status, 200);
+  assert.deepEqual(JSON.parse(body).metrics.journal, {
+    state: "degraded",
+    writeFailures: 1,
+    lastFailureAtMs: 1234,
+  });
+  assert.doesNotMatch(body, /private|path|stack|errorMessage/i);
 });

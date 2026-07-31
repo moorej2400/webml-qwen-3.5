@@ -256,20 +256,70 @@ export type SequenceResult =
   | { accepted: true; expected: number }
   | { accepted: false; expected: number; classification: "gap" | "replay" };
 
+export interface EventSequenceTrackerOptions {
+  maxDocuments?: number;
+  retentionMs?: number;
+  now?: () => number;
+}
+
 export class EventSequenceTracker {
-  readonly #nextByDocument = new Map<string, number>();
+  readonly #documents = new Map<string, { next: number; lastSeenAtMs: number }>();
+  readonly #maxDocuments: number;
+  readonly #retentionMs: number;
+  readonly #now: () => number;
+
+  constructor(options: EventSequenceTrackerOptions = {}) {
+    this.#maxDocuments = options.maxDocuments ?? 1_024;
+    this.#retentionMs = options.retentionMs ?? 15 * 60_000;
+    this.#now = options.now ?? Date.now;
+    if (!Number.isSafeInteger(this.#maxDocuments) || this.#maxDocuments < 1) {
+      throw new RangeError("sequence document capacity must be positive");
+    }
+    if (!Number.isSafeInteger(this.#retentionMs) || this.#retentionMs < 1) {
+      throw new RangeError("sequence retention must be positive");
+    }
+  }
 
   accept(documentId: string, sequence: number): SequenceResult {
     validateProtocolId(documentId, "documentId");
-    const expected = this.#nextByDocument.get(documentId) ?? 1;
+    const record = this.#getOrCreate(documentId);
+    const expected = record.next;
     if (sequence < expected) return { accepted: false, expected, classification: "replay" };
     if (sequence > expected) return { accepted: false, expected, classification: "gap" };
-    this.#nextByDocument.set(documentId, expected + 1);
+    record.next = expected + 1;
+    record.lastSeenAtMs = this.#now();
     return { accepted: true, expected };
   }
 
   expected(documentId: string): number {
     validateProtocolId(documentId, "documentId");
-    return this.#nextByDocument.get(documentId) ?? 1;
+    return this.#getOrCreate(documentId).next;
+  }
+
+  get size(): number {
+    this.#prune();
+    return this.#documents.size;
+  }
+
+  #getOrCreate(documentId: string): { next: number; lastSeenAtMs: number } {
+    this.#prune();
+    const existing = this.#documents.get(documentId);
+    if (existing !== undefined) {
+      existing.lastSeenAtMs = this.#now();
+      return existing;
+    }
+    if (this.#documents.size >= this.#maxDocuments) {
+      throw new Error("sequence document capacity reached");
+    }
+    const created = { next: 1, lastSeenAtMs: this.#now() };
+    this.#documents.set(documentId, created);
+    return created;
+  }
+
+  #prune(): void {
+    const cutoff = this.#now() - this.#retentionMs;
+    for (const [documentId, record] of this.#documents) {
+      if (record.lastSeenAtMs < cutoff) this.#documents.delete(documentId);
+    }
   }
 }

@@ -106,3 +106,42 @@ test("journal rotates at its configured cap and summaries aggregate safe metrics
     last: 34,
   });
 });
+
+test("journal recovers after one write failure and exposes bounded health", async () => {
+  let calls = 0;
+  const written: string[] = [];
+  const journal = new RunJournal({
+    runsDirectory: "ignored-by-injected-writer",
+    runId: "run_0123456789abcdef",
+    now: () => 1234,
+    appendLine: async (_filePath: string, line: string) => {
+      calls += 1;
+      if (calls === 1) throw new Error("private path and raw write failure");
+      written.push(line);
+    },
+  });
+  const event = (eventSeq: number) => ({
+    schemaVersion: 1,
+    category: "generation",
+    name: "token_rate",
+    timestampMs: eventSeq,
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    documentId: "document_0123456789abcdef",
+    eventSeq,
+    metrics: { tokensPerSecond: 30 },
+  });
+
+  await assert.rejects(journal.append(event(1)), /journal append failed/i);
+  await journal.append(event(2));
+  await journal.close();
+
+  assert.equal(written.length, 1);
+  const health = journal.getHealth();
+  assert.deepEqual(health, {
+    state: "degraded",
+    writeFailures: 1,
+    lastFailureAtMs: 1234,
+  });
+  assert.doesNotMatch(JSON.stringify(health), /private|path|raw|write failure/i);
+});
