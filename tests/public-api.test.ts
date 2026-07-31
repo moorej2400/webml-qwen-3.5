@@ -16,5 +16,7 @@ test("exports mixed tensor conversion and GEMV APIs from the package entrypoint"
   assert.equal(typeof runtime.Qwen35Tokenizer, "function");
   assert.equal(typeof runtime.loadPinnedQwen35Tokenizer, "function");
   assert.equal(typeof runtime.renderQwen35Chat, "function");
+  assert.equal(typeof runtime.Qwen35Session, "function");
+  assert.equal("streamQwen35CachedWeights" in runtime, false);
   assert.equal("compileTokenizerSource" in runtime, false);
 });

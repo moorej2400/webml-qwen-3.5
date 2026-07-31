@@ -20,4 +20,9 @@ export * from "./qwen-primitives.js";
 export * from "./qwen-tokenizer.js";
 export * from "./qwen35-config.js";
 export * from "./qwen35-program.js";
+export * from "./qwen35-session.js";
+export type {
+  Qwen35BrowserLoadOptions,
+  Qwen35ExecutionDriverFactory,
+} from "./qwen35-model-loader.js";
 export * from "./tensor-policy.js";

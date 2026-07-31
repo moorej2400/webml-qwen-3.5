@@ -6,3 +6,8 @@
  */
 export * from "./qwen-chat-template.js";
 export * from "./qwen-tokenizer.js";
+export * from "./qwen35-session.js";
+export type {
+  Qwen35BrowserLoadOptions,
+  Qwen35ExecutionDriverFactory,
+} from "./qwen35-model-loader.js";
