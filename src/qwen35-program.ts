@@ -1,6 +1,7 @@
 import { GgmlType, type GgmlType as GgmlTypeValue } from "./gguf.js";
 import type { GemvLayout } from "./mixed-gemv.js";
 import { isMtpTensorName } from "./tensor-policy.js";
+import { QWEN35_NO_SELECTED_TOKEN } from "./qwen35-logits-reduction.js";
 import {
   assertQwen35Config,
   type Qwen35Config,
@@ -103,13 +104,29 @@ export type Qwen35Invocation =
       kind: "tiled-tied-logits";
       weight: "token_embd.weight";
       tiedWeightOwner: "embedding";
-      rows: 248_320;
+      modelRows: 248_320;
+      decodableRows: 248_070;
       columns: 2_560;
+      logicalTileRows: 1_024;
+      /** Physical row views may split a tile; reductions remain per logical tile. */
+      mathematicalTileCount: 243;
+      finalTileRows: 262;
     }>
   | Readonly<{
-      kind: "top-k-placeholder";
-      inputRows: 248_320;
-      runnable: false;
+      kind: "greedy-logits-reduction";
+      kernels: readonly ["logits-tile-top-1", "indexed-top-1"];
+      mathematicalTileCount: 243;
+      candidatesPerTile: 1;
+      candidateCount: 243;
+      candidateCapacity: 256;
+      selectedTokenReadback: Readonly<{
+        resource: "selected-token";
+        scalarType: "u32";
+        elementCount: 1;
+        byteOffset: 0;
+        noSelectionSentinel: typeof QWEN35_NO_SELECTED_TOKEN;
+      }>;
+      runnable: true;
     }>;
 
 export interface Qwen35TensorBinding {
@@ -414,13 +431,31 @@ export function buildQwen35Program(input: {
       kind: "tiled-tied-logits",
       weight: "token_embd.weight",
       tiedWeightOwner: "embedding",
-      rows: 248_320,
+      modelRows: 248_320,
+      decodableRows: 248_070,
       columns: 2_560,
+      logicalTileRows: 1_024,
+      mathematicalTileCount: 243,
+      finalTileRows: 262,
     }),
     Object.freeze({
-      kind: "top-k-placeholder",
-      inputRows: 248_320,
-      runnable: false,
+      kind: "greedy-logits-reduction",
+      kernels: Object.freeze([
+        "logits-tile-top-1",
+        "indexed-top-1",
+      ] as const),
+      mathematicalTileCount: 243,
+      candidatesPerTile: 1,
+      candidateCount: 243,
+      candidateCapacity: 256,
+      selectedTokenReadback: Object.freeze({
+        resource: "selected-token",
+        scalarType: "u32",
+        elementCount: 1,
+        byteOffset: 0,
+        noSelectionSentinel: QWEN35_NO_SELECTED_TOKEN,
+      }),
+      runnable: true,
     }),
   );
   consume("output_norm.weight", "final-norm");

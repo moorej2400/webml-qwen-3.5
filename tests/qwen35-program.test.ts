@@ -204,11 +204,50 @@ test("builds the exact deterministic 32-layer static program", () => {
     kind: "tiled-tied-logits",
     weight: "token_embd.weight",
     tiedWeightOwner: "embedding",
-    rows: 248_320,
+    modelRows: 248_320,
+    decodableRows: 248_070,
     columns: 2_560,
+    logicalTileRows: 1_024,
+    mathematicalTileCount: 243,
+    finalTileRows: 262,
   });
-  assert.equal(program.invocations.at(-1)?.kind, "top-k-placeholder");
-  assert.equal(program.tensorBindings.get("token_embd.weight")?.consumers.length, 2);
+  assert.deepEqual(program.invocations.at(-1), {
+    kind: "greedy-logits-reduction",
+    kernels: ["logits-tile-top-1", "indexed-top-1"],
+    mathematicalTileCount: 243,
+    candidatesPerTile: 1,
+    candidateCount: 243,
+    candidateCapacity: 256,
+    selectedTokenReadback: {
+      resource: "selected-token",
+      scalarType: "u32",
+      elementCount: 1,
+      byteOffset: 0,
+      noSelectionSentinel: 0xffff_ffff,
+    },
+    runnable: true,
+  });
+  assert.deepEqual(
+    program.tensorBindings.get("token_embd.weight")?.consumers,
+    ["embedding", "tiled-logits"],
+  );
+});
+
+test("freezes the complete greedy logits and readback contract", () => {
+  const program = buildQwen35Program({
+    config: QWEN35_4B_CONFIG,
+    tensors: directory(),
+  });
+  const logits = program.invocations.at(-2)!;
+  const reduction = program.invocations.at(-1)!;
+
+  assert.equal(Object.isFrozen(program.invocations), true);
+  assert.equal(Object.isFrozen(logits), true);
+  assert.equal(Object.isFrozen(reduction), true);
+  assert.equal(reduction.kind, "greedy-logits-reduction");
+  if (reduction.kind !== "greedy-logits-reduction") return;
+  assert.equal(Object.isFrozen(reduction.kernels), true);
+  assert.equal(Object.isFrozen(reduction.selectedTokenReadback), true);
 });
 
 test("rejects forged Qwen3.5 configuration drift at the program boundary", () => {

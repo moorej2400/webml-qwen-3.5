@@ -6,6 +6,9 @@
  */
 export * from "./qwen-chat-template.js";
 export * from "./qwen-tokenizer.js";
+export * from "./qwen35-activation-workspace.js";
+export * from "./qwen35-forward-dispatch.js";
+export * from "./qwen35-logits-reduction.js";
 export * from "./qwen35-session.js";
 export * from "./qwen35-webgpu-executor.js";
 export type {
