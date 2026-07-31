@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  DEFAULT_INITIAL_ARENA_BYTES,
+  DEFAULT_BUFFER_SHARD_CAP_BYTES,
   DEFAULT_UPLOAD_LANE_BYTES,
   probeDeviceProfile,
 } from "../src/device-profile.js";
@@ -57,7 +57,10 @@ test("probes sanitized facts and requests only declared requirements", async () 
       requiredLimits: { maxStorageBufferBindingSize: 128 * MIB },
     },
   ]);
-  assert.equal(profile.arenaCapBytes, DEFAULT_INITIAL_ARENA_BYTES);
+  assert.equal(
+    profile.bufferShardCapBytes,
+    DEFAULT_BUFFER_SHARD_CAP_BYTES,
+  );
   assert.equal(profile.uploadLaneBytes, DEFAULT_UPLOAD_LANE_BYTES);
   assert.equal(profile.facts.jsHeapLimitBytes, 768 * MIB);
   assert.deepEqual(profile.facts.features, [
@@ -82,16 +85,16 @@ test("keeps missing Safari heap telemetry null and supports evidence profiles", 
   });
 
   const profile128 = await probeDeviceProfile(constrained.surface, {
-    arenaPolicy: "evidence-128",
+    bufferShardPolicy: "evidence-128",
   });
   const profile64 = await probeDeviceProfile(constrained.surface, {
-    arenaPolicy: "evidence-64",
+    bufferShardPolicy: "evidence-64",
   });
 
-  assert.equal(profile128.arenaCapBytes, 128 * MIB);
-  assert.equal(profile64.arenaCapBytes, 64 * MIB);
+  assert.equal(profile128.bufferShardCapBytes, 128 * MIB);
+  assert.equal(profile64.bufferShardCapBytes, 64 * MIB);
   assert.equal(profile128.facts.jsHeapLimitBytes, null);
-  assert.equal(profile128.policyIsCapabilityCeiling, false);
+  assert.equal(profile128.bufferShardCapIsCapabilityCeiling, false);
 });
 
 test("rejects unavailable requirements and either limiting buffer dimension", async () => {

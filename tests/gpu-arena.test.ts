@@ -45,7 +45,9 @@ function fakeDevice(options?: {
 test("splits allocations by both live device limits and explicit alignment", () => {
   const fake = fakeDevice();
   const ledger = new AllocationLedger(128n);
-  const arena = new GpuArena(fake.device, ledger, { arenaCapBytes: 128n });
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 128n,
+  });
 
   const allocation = arena.allocate({
     id: "private-tensor-name",
@@ -76,7 +78,9 @@ test("uses maxBufferSize when it is lower than the storage binding limit", () =>
     maxStorageBufferBindingSize: 64,
   });
   const ledger = new AllocationLedger(96n);
-  const arena = new GpuArena(fake.device, ledger, { arenaCapBytes: 96n });
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 96n,
+  });
 
   const allocation = arena.allocate({
     id: "buffer-limited",
@@ -96,7 +100,9 @@ test("uses maxBufferSize when it is lower than the storage binding limit", () =>
 test("rolls back created buffers and ledger ownership after partial failure", () => {
   const fake = fakeDevice({ failAt: 1 });
   const ledger = new AllocationLedger(128n);
-  const arena = new GpuArena(fake.device, ledger, { arenaCapBytes: 128n });
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 128n,
+  });
 
   assert.throws(
     () =>
@@ -114,14 +120,14 @@ test("rolls back created buffers and ledger ownership after partial failure", ()
   ledger.assertAllReleased();
 });
 
-test("enforces the selected arena cap and rejects unsafe numeric conversion", () => {
+test("rejects unsafe numeric conversion before reserving the ledger", () => {
   const fake = fakeDevice({
     maxBufferSize: Number.MAX_SAFE_INTEGER,
     maxStorageBufferBindingSize: Number.MAX_SAFE_INTEGER,
   });
   const ledger = new AllocationLedger(BigInt(Number.MAX_SAFE_INTEGER) + 16n);
   const arena = new GpuArena(fake.device, ledger, {
-    arenaCapBytes: BigInt(Number.MAX_SAFE_INTEGER) + 16n,
+    bufferShardCapBytes: BigInt(Number.MAX_SAFE_INTEGER),
   });
 
   assert.throws(
@@ -135,28 +141,70 @@ test("enforces the selected arena cap and rejects unsafe numeric conversion", ()
       }),
     /safe integer/i,
   );
-
-  const cappedLedger = new AllocationLedger(64n);
-  const capped = new GpuArena(fake.device, cappedLedger, {
-    arenaCapBytes: 64n,
-  });
-  assert.throws(
-    () =>
-      capped.allocate({
-        id: "too-large",
-        category: "model",
-        byteLength: 68n,
-        usage: 128,
-        alignment: 4,
-      }),
-    /arena cap|limit/i,
-  );
+  ledger.assertAllReleased();
 });
 
-test("enforces the arena cap across multiple live allocations", () => {
+test("splits one logical allocation that exceeds the buffer shard cap", () => {
+  const fake = fakeDevice({
+    maxBufferSize: 64,
+    maxStorageBufferBindingSize: 64,
+  });
+  const ledger = new AllocationLedger(160n);
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 32n,
+  });
+
+  const allocation = arena.allocate({
+    id: "large-logical-tensor",
+    category: "model",
+    byteLength: 80n,
+    usage: 128,
+    alignment: 16,
+  });
+
+  assert.deepEqual(
+    fake.descriptors.map(({ size }) => size),
+    [32, 32, 16],
+  );
+  assert.equal(ledger.snapshot().currentBytes, 80n);
+  allocation.destroy();
+});
+
+test("permits multiple allocations whose total exceeds the buffer shard cap", () => {
   const fake = fakeDevice();
   const ledger = new AllocationLedger(256n);
-  const arena = new GpuArena(fake.device, ledger, { arenaCapBytes: 96n });
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 64n,
+  });
+  const first = arena.allocate({
+    id: "first",
+    category: "model",
+    byteLength: 64n,
+    usage: 128,
+    alignment: 16,
+  });
+
+  const second = arena.allocate({
+    id: "second",
+    category: "activation",
+    byteLength: 48n,
+    usage: 128,
+    alignment: 16,
+  });
+
+  assert.equal(ledger.snapshot().currentBytes, 112n);
+  assert.ok(fake.descriptors.every(({ size }) => size <= 64));
+  second.destroy();
+  first.destroy();
+  ledger.assertAllReleased();
+});
+
+test("uses only the ledger as the cumulative allocation budget", () => {
+  const fake = fakeDevice();
+  const ledger = new AllocationLedger(96n);
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 32n,
+  });
   const first = arena.allocate({
     id: "first",
     category: "model",
@@ -168,14 +216,15 @@ test("enforces the arena cap across multiple live allocations", () => {
   assert.throws(
     () =>
       arena.allocate({
-        id: "second",
+        id: "over-ledger",
         category: "activation",
         byteLength: 48n,
         usage: 128,
         alignment: 16,
       }),
-    /arena cap/i,
+    /ledger limit/i,
   );
+  assert.equal(ledger.snapshot().currentBytes, 64n);
   first.destroy();
   ledger.assertAllReleased();
 });
@@ -186,7 +235,9 @@ test("rejects invalid usage, alignment, and device limit combinations", () => {
     maxStorageBufferBindingSize: 2,
   });
   const ledger = new AllocationLedger(64n);
-  const arena = new GpuArena(bad.device, ledger, { arenaCapBytes: 64n });
+  const arena = new GpuArena(bad.device, ledger, {
+    bufferShardCapBytes: 64n,
+  });
 
   assert.throws(
     () =>

@@ -67,22 +67,19 @@ function destroyEveryBuffer(buffers: readonly GpuBufferLike[]): unknown {
 export class GpuArena {
   readonly #device: GpuArenaDevice;
   readonly #ledger: AllocationLedger;
-  readonly #arenaCapBytes: bigint;
+  readonly #bufferShardCapBytes: bigint;
 
   constructor(
     device: GpuArenaDevice,
     ledger: AllocationLedger,
-    options: { readonly arenaCapBytes: bigint },
+    options: { readonly bufferShardCapBytes: bigint },
   ) {
-    if (options.arenaCapBytes <= 0n) {
-      throw new Error("GPU arena cap must be greater than zero");
-    }
-    if (options.arenaCapBytes > ledger.snapshot().limitBytes) {
-      throw new Error("GPU arena cap cannot exceed the allocation ledger limit");
+    if (options.bufferShardCapBytes <= 0n) {
+      throw new Error("GPU buffer shard cap must be greater than zero");
     }
     this.#device = device;
     this.#ledger = ledger;
-    this.#arenaCapBytes = options.arenaCapBytes;
+    this.#bufferShardCapBytes = options.bufferShardCapBytes;
   }
 
   allocate(request: GpuAllocationRequest): GpuAllocation {
@@ -108,28 +105,29 @@ export class GpuArena {
     const alignment = BigInt(request.alignment);
     const allocatedBytes =
       ((request.byteLength + alignment - 1n) / alignment) * alignment;
-    if (allocatedBytes > this.#arenaCapBytes) {
-      throw new Error("GPU allocation exceeds the selected arena cap");
-    }
-    if (
-      this.#ledger.snapshot().currentBytes + allocatedBytes >
-      this.#arenaCapBytes
-    ) {
-      throw new Error("GPU allocation would exceed the selected arena cap");
-    }
     if (allocatedBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error("GPU allocation cannot be converted to a safe integer");
     }
 
-    const liveBufferLimit = Math.min(
-      this.#device.limits.maxBufferSize,
-      this.#device.limits.maxStorageBufferBindingSize,
-    );
+    // The policy cap shapes each buffer, never the allocation or model total.
+    // AllocationLedger is the independent cumulative budget and may be several
+    // gigabytes when physical-device evidence supports that experiment.
+    const liveBufferLimit = [
+      BigInt(this.#device.limits.maxBufferSize),
+      BigInt(this.#device.limits.maxStorageBufferBindingSize),
+      this.#bufferShardCapBytes,
+    ].reduce((smallest, value) => (value < smallest ? value : smallest));
     const alignedChunkLimit =
-      Math.floor(liveBufferLimit / request.alignment) * request.alignment;
-    if (alignedChunkLimit < request.alignment) {
+      (liveBufferLimit / alignment) * alignment;
+    if (alignedChunkLimit < alignment) {
       throw new Error(
-        "GPU device limits are smaller than the requested alignment",
+        "GPU buffer shard cap or device limits are smaller than the requested alignment",
+      );
+    }
+    const alignedChunkLimitNumber = Number(alignedChunkLimit);
+    if (!Number.isSafeInteger(alignedChunkLimitNumber)) {
+      throw new Error(
+        "GPU buffer shard size cannot be converted to a safe integer",
       );
     }
 
@@ -142,7 +140,7 @@ export class GpuArena {
     try {
       let remaining = Number(allocatedBytes);
       while (remaining > 0) {
-        const size = Math.min(remaining, alignedChunkLimit);
+        const size = Math.min(remaining, alignedChunkLimitNumber);
         buffers.push(
           this.#device.createBuffer({
             size,

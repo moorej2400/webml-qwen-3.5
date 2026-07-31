@@ -1,7 +1,7 @@
-export const DEFAULT_INITIAL_ARENA_BYTES = 256 * 1024 * 1024;
+export const DEFAULT_BUFFER_SHARD_CAP_BYTES = 256 * 1024 * 1024;
 export const DEFAULT_UPLOAD_LANE_BYTES = 32 * 1024 * 1024;
 
-export type ArenaPolicy = "default" | "evidence-128" | "evidence-64";
+export type BufferShardPolicy = "default" | "evidence-128" | "evidence-64";
 
 export interface GpuLimitsLike {
   readonly maxBufferSize: number;
@@ -36,18 +36,18 @@ export interface WebGpuProbeSurface {
 export interface DeviceProfileOptions {
   readonly requiredFeatures?: readonly string[];
   readonly requiredLimits?: Readonly<Record<string, number>>;
-  readonly arenaPolicy?: ArenaPolicy;
+  readonly bufferShardPolicy?: BufferShardPolicy;
 }
 
 export interface DeviceProfile {
   readonly device: GpuDeviceProfileDevice;
-  readonly arenaCapBytes: number;
-  readonly uploadLaneBytes: number;
   /**
-   * Policy caps are starting points for allocation experiments, not claims
-   * about the maximum model or workload that a browser can execute.
+   * Per-buffer shaping policy. This value never limits total resident model
+   * bytes or claims a browser capability ceiling.
    */
-  readonly policyIsCapabilityCeiling: false;
+  readonly bufferShardCapBytes: number;
+  readonly uploadLaneBytes: number;
+  readonly bufferShardCapIsCapabilityCeiling: false;
   readonly facts: {
     readonly features: readonly string[];
     readonly limits: {
@@ -58,8 +58,8 @@ export interface DeviceProfile {
   };
 }
 
-const ARENA_POLICY_BYTES: Readonly<Record<ArenaPolicy, number>> = {
-  default: DEFAULT_INITIAL_ARENA_BYTES,
+const BUFFER_SHARD_POLICY_BYTES: Readonly<Record<BufferShardPolicy, number>> = {
+  default: DEFAULT_BUFFER_SHARD_CAP_BYTES,
   "evidence-128": 128 * 1024 * 1024,
   "evidence-64": 64 * 1024 * 1024,
 };
@@ -149,9 +149,10 @@ export async function probeDeviceProfile(
 
   return {
     device,
-    arenaCapBytes: ARENA_POLICY_BYTES[options.arenaPolicy ?? "default"],
+    bufferShardCapBytes:
+      BUFFER_SHARD_POLICY_BYTES[options.bufferShardPolicy ?? "default"],
     uploadLaneBytes: DEFAULT_UPLOAD_LANE_BYTES,
-    policyIsCapabilityCeiling: false,
+    bufferShardCapIsCapabilityCeiling: false,
     facts: {
       features,
       limits: {
