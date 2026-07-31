@@ -634,6 +634,117 @@ test("sequence gaps and replays are rejected without applying state", () => {
   });
 });
 
+test("a quiet connected document keeps its next event sequence past retention", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, retentionMs: 10 });
+  const phone = connect(plane, identity("document_0123456789abcdef"));
+
+  assert.deepEqual(
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "ready",
+      ...identity("document_0123456789abcdef"),
+      eventSeq: 1,
+    }),
+    { accepted: true, expected: 1 },
+  );
+  clock.advance(11);
+
+  assert.deepEqual(
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "telemetry",
+      ...identity("document_0123456789abcdef"),
+      eventSeq: 2,
+      event: { category: "generation", name: "quiet_resume" },
+    }),
+    { accepted: true, expected: 2 },
+  );
+});
+
+test("closing one of two connections cannot expire their shared document sequence", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, retentionMs: 10 });
+  const first = connect(plane, identity("document_0123456789abcdef"));
+  const second = connect(plane, identity("document_0123456789abcdef"));
+
+  plane.receive(first.connectionId, {
+    schemaVersion: 1,
+    type: "ready",
+    ...identity("document_0123456789abcdef"),
+    eventSeq: 1,
+  });
+  plane.disconnect(first.connectionId, { kind: "socket_loss" });
+  clock.advance(11);
+
+  assert.deepEqual(
+    plane.receive(second.connectionId, {
+      schemaVersion: 1,
+      type: "telemetry",
+      ...identity("document_0123456789abcdef"),
+      eventSeq: 2,
+      event: { category: "generation", name: "shared_connection_resume" },
+    }),
+    { accepted: true, expected: 2 },
+  );
+});
+
+test("document retention starts when its final connection closes", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, retentionMs: 10 });
+  const first = connect(plane, identity("document_0123456789abcdef"));
+  const second = connect(plane, identity("document_0123456789abcdef"));
+
+  plane.receive(first.connectionId, {
+    schemaVersion: 1,
+    type: "ready",
+    ...identity("document_0123456789abcdef"),
+    eventSeq: 1,
+  });
+  clock.advance(9);
+  plane.disconnect(first.connectionId, { kind: "socket_loss" });
+  plane.disconnect(second.connectionId, { kind: "socket_loss" });
+  clock.advance(9);
+
+  const withinRetention = connect(plane, identity("document_0123456789abcdef"));
+  assert.deepEqual(withinRetention.sent[0], {
+    schemaVersion: 1,
+    type: "sequenceSync",
+    documentId: "document_0123456789abcdef",
+    expectedSeq: 2,
+  });
+  plane.disconnect(withinRetention.connectionId, { kind: "socket_loss" });
+  clock.advance(11);
+
+  const afterRetention = connect(plane, identity("document_0123456789abcdef"));
+  assert.deepEqual(afterRetention.sent[0], {
+    schemaVersion: 1,
+    type: "sequenceSync",
+    documentId: "document_0123456789abcdef",
+    expectedSeq: 1,
+  });
+});
+
+test("sequence capacity never evicts active documents", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, retentionMs: 10, maxSequenceDocuments: 2 });
+  const first = connect(plane, identity("document_0123456789abcdef"));
+  connect(plane, identity("document_1123456789abcdef", "tab_1123456789abcdef"));
+  clock.advance(11);
+
+  assert.throws(
+    () => connect(plane, identity("document_2123456789abcdef", "tab_2123456789abcdef")),
+    /capacity/i,
+  );
+  assert.equal(plane.getConnectedState().length, 2);
+
+  plane.disconnect(first.connectionId, { kind: "socket_loss" });
+  clock.advance(11);
+  assert.doesNotThrow(() =>
+    connect(plane, identity("document_2123456789abcdef", "tab_2123456789abcdef")),
+  );
+});
+
 test("control state enforces caps, expiry, timer retirement, and payload retirement", () => {
   const clock = new FakeClock();
   const sentCommands: Extract<ServerToPhoneMessage, { type: "command" }>[] = [];

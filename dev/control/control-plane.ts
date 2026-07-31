@@ -165,11 +165,11 @@ export class ControlPlane {
       tabId: validateProtocolId(identityInput.tabId, "tabId"),
       documentId: validateProtocolId(identityInput.documentId, "documentId"),
     };
-    // Reserve bounded sequence ownership before publishing the connection.
-    const expectedSeq = this.#sequences.expected(identity.documentId);
     const key = tabKey(identity);
     const connectionId = `connection_${randomUUID()}`;
     const connection = { connectionId, identity, send };
+    // Reserve bounded sequence ownership before publishing the connection.
+    const expectedSeq = this.#sequences.acquire(identity.documentId);
     this.#connections.set(connectionId, connection);
     this.#connectionByTab.set(key, connectionId);
     for (const disconnect of this.#disconnects) {
@@ -218,6 +218,7 @@ export class ControlPlane {
     if (connection === undefined) return;
     const resolvedEvidence = evidence ?? connection.lastEvidence ?? { kind: "socket_loss" };
     this.#connections.delete(connectionId);
+    this.#sequences.release(connection.identity.documentId);
     if (this.#connectionByTab.get(tabKey(connection.identity)) === connectionId) {
       this.#connectionByTab.delete(tabKey(connection.identity));
     }

@@ -262,8 +262,14 @@ export interface EventSequenceTrackerOptions {
   now?: () => number;
 }
 
+interface EventSequenceRecord {
+  next: number;
+  activeConnections: number;
+  inactiveSinceMs: number;
+}
+
 export class EventSequenceTracker {
-  readonly #documents = new Map<string, { next: number; lastSeenAtMs: number }>();
+  readonly #documents = new Map<string, EventSequenceRecord>();
   readonly #maxDocuments: number;
   readonly #retentionMs: number;
   readonly #now: () => number;
@@ -287,7 +293,6 @@ export class EventSequenceTracker {
     if (sequence < expected) return { accepted: false, expected, classification: "replay" };
     if (sequence > expected) return { accepted: false, expected, classification: "gap" };
     record.next = expected + 1;
-    record.lastSeenAtMs = this.#now();
     return { accepted: true, expected };
   }
 
@@ -296,22 +301,40 @@ export class EventSequenceTracker {
     return this.#getOrCreate(documentId).next;
   }
 
+  acquire(documentId: string): number {
+    validateProtocolId(documentId, "documentId");
+    const record = this.#getOrCreate(documentId);
+    record.activeConnections += 1;
+    return record.next;
+  }
+
+  release(documentId: string): void {
+    validateProtocolId(documentId, "documentId");
+    this.#prune();
+    const record = this.#documents.get(documentId);
+    if (record === undefined || record.activeConnections === 0) {
+      throw new Error("sequence document has no active connection ownership");
+    }
+    record.activeConnections -= 1;
+    if (record.activeConnections === 0) record.inactiveSinceMs = this.#now();
+  }
+
   get size(): number {
     this.#prune();
     return this.#documents.size;
   }
 
-  #getOrCreate(documentId: string): { next: number; lastSeenAtMs: number } {
+  #getOrCreate(documentId: string): EventSequenceRecord {
     this.#prune();
     const existing = this.#documents.get(documentId);
     if (existing !== undefined) {
-      existing.lastSeenAtMs = this.#now();
+      if (existing.activeConnections === 0) existing.inactiveSinceMs = this.#now();
       return existing;
     }
     if (this.#documents.size >= this.#maxDocuments) {
       throw new Error("sequence document capacity reached");
     }
-    const created = { next: 1, lastSeenAtMs: this.#now() };
+    const created = { next: 1, activeConnections: 0, inactiveSinceMs: this.#now() };
     this.#documents.set(documentId, created);
     return created;
   }
@@ -319,7 +342,11 @@ export class EventSequenceTracker {
   #prune(): void {
     const cutoff = this.#now() - this.#retentionMs;
     for (const [documentId, record] of this.#documents) {
-      if (record.lastSeenAtMs < cutoff) this.#documents.delete(documentId);
+      // A quiet live tab still owns its next sequence. Resetting it would make
+      // every later frame a permanent gap after acknowledged frames are gone.
+      if (record.activeConnections === 0 && record.inactiveSinceMs < cutoff) {
+        this.#documents.delete(documentId);
+      }
     }
   }
 }
