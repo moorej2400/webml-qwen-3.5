@@ -75,9 +75,9 @@ const SAFE_NAME = /^[^\u0000-\u001f\u007f]+$/;
 const MAX_UINT64 = (1n << 64n) - 1n;
 const MAX_DECIMAL_DIGITS = 20;
 const MAX_MANIFEST_STRING_BYTES = 65_535;
-const MAX_SHARDS = 4_096;
-const MAX_TENSOR_SEGMENTS = 100_000;
-const MAX_EXCLUDED_TENSORS = 100_000;
+export const MAX_SHARDS = 4_096;
+export const MAX_TENSOR_SEGMENTS = 100_000;
+export const MAX_EXCLUDED_TENSORS = 100_000;
 const textEncoder = new TextEncoder();
 const GGML_TYPE_NAMES = new Map<GgmlType, string>([
   [GgmlType.F32, "F32"],

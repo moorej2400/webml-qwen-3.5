@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  MAX_EXCLUDED_TENSORS,
+  MAX_SHARDS,
+  MAX_TENSOR_SEGMENTS,
+} from "../src/manifest.js";
 import { PINNED_LANGUAGE_BLOCK_POLICY } from "../src/tensor-policy.js";
 
 test("pins the public source identities and inspected language inventory", async () => {
@@ -50,4 +55,13 @@ test("pins the public source identities and inspected language inventory", async
     baseBlockCount: descriptor.language.excludedBlock,
     excludedBlock: descriptor.language.excludedBlock,
   });
+  const tensorCount = Object.values<number>(
+    descriptor.language.tensorTypeCounts,
+  ).reduce((total, count) => total + count, 0);
+  const shardCount = Math.ceil(
+    descriptor.language.size / (128 * 1024 * 1024),
+  );
+  assert.ok(shardCount < MAX_SHARDS);
+  assert.ok(tensorCount + shardCount < MAX_TENSOR_SEGMENTS);
+  assert.ok(tensorCount < MAX_EXCLUDED_TENSORS);
 });

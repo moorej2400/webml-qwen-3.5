@@ -30,11 +30,20 @@ test("ships a deterministic browser compile and CPU parity harness", async () =>
 
   assert.match(html, /webgpu-kernel-harness\.mjs/);
   assert.match(script, /LANGUAGE_GEMV_KERNELS/);
+  assert.match(script, /for \(const kernel of LANGUAGE_GEMV_KERNELS\)/);
+  assert.match(script, /results\.push\(await runKernel\(device, kernel\)\)/);
   assert.match(script, /getCompilationInfo/);
   assert.match(script, /gemvCpu/);
   assert.match(script, /dispatchWorkgroups/);
   assert.match(script, /packedByteOffset\s*=\s*32/);
   assert.match(script, /weightWordOffset/);
+  assert.match(script, /blocksPerRow\s*=\s*2/);
+  assert.match(script, /rowIndex/);
+  assert.match(script, /blockIndex/);
+  assert.match(script, /outputRowOffset\s*=\s*[1-9]/);
+  assert.match(script, /sentinel/);
+  assert.match(script, /maxWorkgroupsPerDimension\s*:\s*2/);
+  assert.match(script, /workgroups\.y\s*!==\s*2/);
   assert.match(script, /Math\.imul/);
   assert.match(script, /validateParity/);
   assert.doesNotMatch(script, /Math\.random/);

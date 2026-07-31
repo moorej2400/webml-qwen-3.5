@@ -12,7 +12,13 @@ import {
   type RandomAccessWriter,
 } from "../src/converter.js";
 import { GgmlType, type ParsedGguf } from "../src/gguf.js";
-import { stringifyManifest, type ImmutableArtifactIdentity } from "../src/manifest.js";
+import {
+  MAX_EXCLUDED_TENSORS,
+  MAX_SHARDS,
+  MAX_TENSOR_SEGMENTS,
+  stringifyManifest,
+  type ImmutableArtifactIdentity,
+} from "../src/manifest.js";
 import { NATIVE_Q3_K_BLOCK_BYTES } from "../src/q3k.js";
 import {
   NATIVE_Q6_K_BLOCK_BYTES,
@@ -370,6 +376,102 @@ test("rejects a shard limit that cannot hold one complete matrix row", () => {
         { maxShardBytes: 223n, tensorAlignment: 16 },
       ),
     /cannot hold one complete.*row/i,
+  );
+});
+
+test("rejects plan collections before appending past shared manifest bounds", () => {
+  const tensor = (
+    name: string,
+    dimensions: readonly bigint[] = [1n],
+  ): ParsedGguf["tensors"][number] => ({
+    name,
+    dimensions,
+    type: GgmlType.F32,
+    offset: 0n,
+  });
+
+  assert.throws(
+    () =>
+      planConversion(
+        fixtureGguf([
+          tensor("matrix.shared-limit.weight", [1n, BigInt(MAX_SHARDS + 1)]),
+        ]),
+        {
+          maxShardBytes: 4n,
+          tensorAlignment: 4,
+        },
+      ),
+    /shard count.*bound/i,
+  );
+
+  assert.throws(
+    () =>
+      planConversion(fixtureGguf([tensor("matrix.weight", [1n, 3n])]), {
+        maxShardBytes: 4n,
+        tensorAlignment: 4,
+        planningLimits: {
+          maxShards: 2,
+          maxTensorSegments: MAX_TENSOR_SEGMENTS,
+          maxExcludedTensors: MAX_EXCLUDED_TENSORS,
+        },
+      }),
+    /shard count.*bound/i,
+  );
+
+  assert.throws(
+    () =>
+      planConversion(
+        fixtureGguf([
+          tensor("a.weight"),
+          tensor("b.weight"),
+          tensor("c.weight"),
+        ]),
+        {
+          maxShardBytes: 64n,
+          tensorAlignment: 4,
+          planningLimits: {
+            maxShards: MAX_SHARDS,
+            maxTensorSegments: 2,
+            maxExcludedTensors: MAX_EXCLUDED_TENSORS,
+          },
+        },
+      ),
+    /tensor segment count.*bound/i,
+  );
+
+  assert.throws(
+    () =>
+      planConversion(
+        fixtureGguf([
+          tensor("mtp.a.weight"),
+          tensor("mtp.b.weight"),
+          tensor("mtp.c.weight"),
+        ]),
+        {
+          maxShardBytes: 64n,
+          tensorAlignment: 4,
+          planningLimits: {
+            maxShards: MAX_SHARDS,
+            maxTensorSegments: MAX_TENSOR_SEGMENTS,
+            maxExcludedTensors: 2,
+          },
+        },
+      ),
+    /excluded tensor count.*bound/i,
+  );
+
+  assert.throws(
+    () =>
+      planConversion(fixtureGguf([tensor("a.weight")]), {
+        maxShardBytes: 64n,
+        tensorAlignment: 4,
+        planningLimits: {
+          maxShards: MAX_SHARDS + 1,
+          maxTensorSegments: MAX_TENSOR_SEGMENTS,
+          maxExcludedTensors: MAX_EXCLUDED_TENSORS,
+        },
+      }),
+    /planning limit.*manifest bound/i,
   );
 });
 

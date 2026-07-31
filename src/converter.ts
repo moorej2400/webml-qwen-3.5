@@ -7,6 +7,9 @@ import {
   type RandomAccessReader,
 } from "./gguf.js";
 import {
+  MAX_EXCLUDED_TENSORS,
+  MAX_SHARDS,
+  MAX_TENSOR_SEGMENTS,
   validateModelPackageManifest,
   type ImmutableArtifactIdentity,
   type ModelPackageManifest,
@@ -32,6 +35,12 @@ export const MAX_STREAM_READ_BYTES = 8 * 1024 * 1024;
 export interface ConverterOptions {
   readonly maxShardBytes: bigint;
   readonly tensorAlignment: number;
+  /** Optional stricter limits; values cannot exceed the manifest bounds. */
+  readonly planningLimits?: {
+    readonly maxShards: number;
+    readonly maxTensorSegments: number;
+    readonly maxExcludedTensors: number;
+  };
 }
 
 export interface TensorTypeInventory {
@@ -146,6 +155,19 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function planningLimit(
+  value: number,
+  manifestBound: number,
+  label: string,
+): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > manifestBound) {
+    throw new Error(
+      `${label} planning limit must be positive and cannot exceed the manifest bound`,
+    );
+  }
+  return value;
+}
+
 /**
  * Creates a byte-range plan from the GGUF directory. Source payloads are not
  * read during planning, and every segment contains complete contiguous rows.
@@ -167,6 +189,28 @@ export function planConversion(
       "tensorAlignment must be a positive power of two within the configured bound",
     );
   }
+  const requestedLimits = options.planningLimits ?? {
+    maxShards: MAX_SHARDS,
+    maxTensorSegments: MAX_TENSOR_SEGMENTS,
+    maxExcludedTensors: MAX_EXCLUDED_TENSORS,
+  };
+  const limits = {
+    maxShards: planningLimit(
+      requestedLimits.maxShards,
+      MAX_SHARDS,
+      "Shard count",
+    ),
+    maxTensorSegments: planningLimit(
+      requestedLimits.maxTensorSegments,
+      MAX_TENSOR_SEGMENTS,
+      "Tensor segment count",
+    ),
+    maxExcludedTensors: planningLimit(
+      requestedLimits.maxExcludedTensors,
+      MAX_EXCLUDED_TENSORS,
+      "Excluded tensor count",
+    ),
+  };
 
   const inventoryByType = new Map<
     GgmlType,
@@ -193,11 +237,23 @@ export function planConversion(
     inventoryByType.set(tensor.type, inventory);
 
     if (isMtpTensorName(tensor.name)) {
+      if (excludedTensors.length >= limits.maxExcludedTensors) {
+        throw new Error(
+          "Conversion plan excluded tensor count exceeds the configured bound",
+        );
+      }
       excludedTensors.push({
         name: tensor.name,
         reason: MTP_EXCLUSION_REASON,
       });
     } else {
+      // Every included tensor needs at least one segment, so this check avoids
+      // building an input list that cannot fit in a valid manifest.
+      if (included.length >= limits.maxTensorSegments) {
+        throw new Error(
+          "Conversion plan tensor segment count exceeds the configured bound",
+        );
+      }
       included.push({ tensor, layout, blockCount });
     }
   }
@@ -225,6 +281,11 @@ export function planConversion(
     while (consumedRows < rowCount) {
       let shard = shards.at(-1);
       if (shard === undefined) {
+        if (shards.length >= limits.maxShards) {
+          throw new Error(
+            "Conversion plan shard count exceeds the configured bound",
+          );
+        }
         shard = { index: 0, length: 0n };
         shards.push(shard);
       }
@@ -234,6 +295,11 @@ export function planConversion(
       // A non-aligned shard limit can place alignedOffset past the limit;
       // negative BigInt division is not zero and must not create a segment.
       if (available <= 0n || fittingRows <= 0n) {
+        if (shards.length >= limits.maxShards) {
+          throw new Error(
+            "Conversion plan shard count exceeds the configured bound",
+          );
+        }
         shard = { index: shards.length, length: 0n };
         shards.push(shard);
         continue;
@@ -251,6 +317,11 @@ export function planConversion(
       const outputLength = segmentRows * rowOutputBytes;
       if (sourceLength <= 0n || outputLength <= 0n) {
         throw new Error(`Planner produced an empty byte range for ${tensor.name}`);
+      }
+      if (segments.length >= limits.maxTensorSegments) {
+        throw new Error(
+          "Conversion plan tensor segment count exceeds the configured bound",
+        );
       }
       segments.push({
         tensorName: tensor.name,

@@ -25,9 +25,11 @@ function setHalf(bytes, offset, bits = 0x3c00) {
   new DataView(bytes.buffer, bytes.byteOffset).setUint16(offset, bits, true);
 }
 
-function packedFixture(layout) {
+function packedFixture(layout, rowIndex, blockIndex) {
   if (layout === "f32") {
-    const values = Float32Array.of(-3.25);
+    const values = Float32Array.of(
+      (rowIndex + 1) * 2.5 + (blockIndex + 1) * 0.75,
+    );
     return new Uint8Array(values.buffer.slice(0));
   }
   const nativeBytes = {
@@ -37,7 +39,9 @@ function packedFixture(layout) {
     "q5-k-176": 176,
     "q6-k-212": 210,
   }[layout];
-  const native = deterministicBytes(nativeBytes, nativeBytes * 101);
+  const seed =
+    nativeBytes * 101 + (rowIndex + 1) * 1009 + (blockIndex + 1) * 917;
+  const native = deterministicBytes(nativeBytes, seed);
   if (layout === "q8-0-36") {
     setHalf(native, 0, 0x3800);
     return repackNativeQ8_0(native);
@@ -86,15 +90,22 @@ async function runKernel(device, kernel) {
     );
   }
 
-  const rows = 2;
-  const columns = kernel.abi.valuesPerBlock;
-  const oneRow = packedFixture(kernel.layout);
+  const rows = 3;
+  const blocksPerRow = 2;
+  const columns = kernel.abi.valuesPerBlock * blocksPerRow;
   const packedByteOffset = 32;
   const packed = new Uint8Array(
-    packedByteOffset + oneRow.byteLength * rows,
+    packedByteOffset + kernel.abi.bytesPerBlock * blocksPerRow * rows,
   );
-  packed.set(oneRow, packedByteOffset);
-  packed.set(oneRow, packedByteOffset + oneRow.byteLength);
+  for (let rowIndex = 0; rowIndex < rows; rowIndex += 1) {
+    for (let blockIndex = 0; blockIndex < blocksPerRow; blockIndex += 1) {
+      const block = packedFixture(kernel.layout, rowIndex, blockIndex);
+      const blockOffset =
+        packedByteOffset +
+        (rowIndex * blocksPerRow + blockIndex) * kernel.abi.bytesPerBlock;
+      packed.set(block, blockOffset);
+    }
+  }
   const activation = Float32Array.from(
     { length: columns },
     (_, index) => ((index * 17 + 3) % 29 - 14) / 16,
@@ -104,12 +115,25 @@ async function runKernel(device, kernel) {
     columns,
     packedByteOffset,
   });
+  if (new Set(expected).size !== rows) {
+    throw new Error(`${kernel.id}: row fixtures did not produce distinct output`);
+  }
+  const outputRowOffset = 2;
   const plan = planGemvDispatch({
     layout: kernel.layout,
     localRows: rows,
     columns,
     packedByteOffset,
+    outputRowOffset,
+    maxWorkgroupsPerDimension: 2,
   });
+  if (plan.workgroups.x !== 2 || plan.workgroups.y !== 2) {
+    throw new Error(`${kernel.id}: harness did not force a 2D dispatch`);
+  }
+  const sentinel = -12_345.5;
+  const outputSlots = outputRowOffset + rows + 1;
+  const expectedOutput = new Float32Array(outputSlots).fill(sentinel);
+  expectedOutput.set(expected, outputRowOffset);
 
   const pipeline = await device.createComputePipelineAsync({
     layout: "auto",
@@ -125,10 +149,12 @@ async function runKernel(device, kernel) {
     new Uint8Array(activation.buffer),
     GPUBufferUsage.STORAGE,
   );
-  const output = device.createBuffer({
-    size: rows * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
+  const initialOutput = new Float32Array(outputSlots).fill(sentinel);
+  const output = storageBuffer(
+    device,
+    new Uint8Array(initialOutput.buffer),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
   const uniforms = storageBuffer(
     device,
     new Uint8Array(
@@ -137,13 +163,13 @@ async function runKernel(device, kernel) {
         columns,
         plan.uniforms.blocksPerRow,
         plan.uniforms.weightWordOffset,
-        0,
+        plan.uniforms.outputRowOffset,
       ).buffer,
     ),
     GPUBufferUsage.UNIFORM,
   );
   const readback = device.createBuffer({
-    size: rows * 4,
+    size: outputSlots * 4,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
   const bindGroup = device.createBindGroup({
@@ -165,7 +191,7 @@ async function runKernel(device, kernel) {
     plan.workgroups.z,
   );
   pass.end();
-  encoder.copyBufferToBuffer(output, 0, readback, 0, rows * 4);
+  encoder.copyBufferToBuffer(output, 0, readback, 0, outputSlots * 4);
   device.queue.submit([encoder.finish()]);
   await readback.mapAsync(GPUMapMode.READ);
   const actual = new Float32Array(readback.getMappedRange().slice(0));
@@ -174,10 +200,13 @@ async function runKernel(device, kernel) {
   for (const buffer of [weights, inputs, output, uniforms, readback]) {
     buffer.destroy();
   }
-  validateParity(kernel.id, expected, actual);
+  validateParity(kernel.id, expectedOutput, actual);
   return {
     id: kernel.id,
-    expected: Array.from(expected),
+    blocksPerRow,
+    outputRowOffset,
+    workgroups: plan.workgroups,
+    expected: Array.from(expectedOutput),
     actual: Array.from(actual),
   };
 }

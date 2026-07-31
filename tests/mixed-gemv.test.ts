@@ -190,6 +190,34 @@ test("plans safe row-aware offsets and complete matrix shard coverage", () => {
   }
 });
 
+test("guards two-dimensional row flattening before u32 arithmetic can wrap", () => {
+  const dispatch = planGemvDispatch({
+    layout: "f32",
+    localRows: 4_000_000_000,
+    columns: 1,
+    maxWorkgroupsPerDimension: 3_000_000_000,
+  });
+  assert.deepEqual(dispatch.workgroups, {
+    x: 3_000_000_000,
+    y: 2,
+    z: 1,
+  });
+
+  for (const kernel of LANGUAGE_GEMV_KERNELS) {
+    const guard = kernel.source.indexOf(
+      "if (invocation.y > (0xffffffffu - invocation.x) / grid.x)",
+    );
+    const flatten = kernel.source.indexOf(
+      "let row = invocation.y * grid.x + invocation.x",
+    );
+    assert.ok(guard >= 0, `${kernel.layout} is missing the overflow guard`);
+    assert.ok(
+      guard < flatten,
+      `${kernel.layout} computes a wrapped row before the guard`,
+    );
+  }
+});
+
 test("reads matrices from a u32-aligned non-block-multiple shard offset", () => {
   for (const kernel of LANGUAGE_GEMV_KERNELS) {
     const fixture = packedFixture(kernel.layout);

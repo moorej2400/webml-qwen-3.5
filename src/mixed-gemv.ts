@@ -245,6 +245,10 @@ fn packed_gemv(
   @builtin(global_invocation_id) invocation: vec3<u32>,
   @builtin(num_workgroups) grid: vec3<u32>,
 ) {
+  // Reject surplus 2D invocations before flattening can wrap u32.
+  if (invocation.y > (0xffffffffu - invocation.x) / grid.x) {
+    return;
+  }
   let row = invocation.y * grid.x + invocation.x;
   if (row >= params.local_rows) {
     return;
@@ -410,6 +414,7 @@ export function planGemvDispatch(input: {
   requireU32(maxWorkgroups, "GEMV maximum workgroups per dimension");
   const x = Math.min(input.localRows, maxWorkgroups);
   const y = Math.ceil(input.localRows / x);
+  // The generated shader rejects surplus grid cells before it flattens x/y.
   if (y > maxWorkgroups) {
     throw new Error("GEMV dispatch exceeds the two-dimensional device limit");
   }
