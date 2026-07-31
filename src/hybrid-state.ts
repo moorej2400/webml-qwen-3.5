@@ -1,4 +1,8 @@
-export type Qwen35HybridResourceKind = "kv-pair" | "conv" | "recurrent";
+export type Qwen35HybridResourceKind =
+  | "key"
+  | "value"
+  | "conv"
+  | "recurrent";
 
 export interface Qwen35HybridResourcePlan {
   readonly layer: number;
@@ -21,6 +25,44 @@ export interface Qwen35HybridStateResource
   readonly id: string;
 }
 
+/**
+ * A binding view preserves the physical buffer identity but omits allocation
+ * ownership methods. Only Qwen35HybridState may destroy the buffer.
+ */
+export interface Qwen35HybridBufferView {
+  /** Opaque GPUBuffer identity; ownership methods are not part of this API. */
+  readonly buffer: object;
+  /** Offset within this logical state resource, not within the model package. */
+  readonly logicalByteOffset: bigint;
+  readonly logicalByteLength: bigint;
+  /** Physical buffer extent, including any alignment padding. */
+  readonly allocatedByteLength: bigint;
+}
+
+export interface Qwen35HybridResourceView
+  extends Qwen35HybridStateResource {
+  readonly byteLength: bigint;
+  /**
+   * Physical pages for a page-aware scheduler. Existing single-page kernels
+   * must not treat this list as one bindable range.
+   */
+  readonly shards: readonly Qwen35HybridBufferView[];
+}
+
+export type Qwen35HybridLayerResources =
+  | Readonly<{
+      layer: number;
+      kind: "full-attention";
+      key: Qwen35HybridResourceView;
+      value: Qwen35HybridResourceView;
+    }>
+  | Readonly<{
+      layer: number;
+      kind: "gated-deltanet";
+      conv: Qwen35HybridResourceView;
+      recurrent: Qwen35HybridResourceView;
+    }>;
+
 export interface CreateQwen35HybridStateOptions {
   readonly arena: Qwen35HybridStateArena;
   readonly capacity: number;
@@ -37,8 +79,10 @@ export const QWEN35_FULL_ATTENTION_LAYERS = Object.freeze([
 const QWEN35_LAYER_COUNT = 32;
 const KV_HEAD_COUNT = 4n;
 const ATTENTION_HEAD_DIMENSION = 256n;
-const K_AND_V = 2n;
 const FP16_BYTES = 2n;
+const KV_TOKEN_ROW_BYTES = KV_HEAD_COUNT * ATTENTION_HEAD_DIMENSION * FP16_BYTES;
+const DELTANET_CONV_ROW_BYTES = 4n * 4n;
+const DELTANET_RECURRENT_ROW_BYTES = 128n * 4n;
 const DELTANET_CONV_BYTES = 8_192n * 4n * 4n;
 const DELTANET_RECURRENT_BYTES = 32n * 128n * 128n * 4n;
 
@@ -49,8 +93,8 @@ function requireCapacity(capacity: number): void {
 }
 
 /**
- * Plans only persistent Qwen3.5 state. Full-attention layers own one packed
- * K/V pair; linear layers own FP32 convolution and recurrent resources.
+ * Plans only persistent Qwen3.5 state. Full-attention layers own independently
+ * bindable K and V allocations; linear layers own FP32 state allocations.
  */
 export function planQwen35HybridState(
   capacity: number,
@@ -58,20 +102,14 @@ export function planQwen35HybridState(
   requireCapacity(capacity);
   const fullLayers = new Set<number>(QWEN35_FULL_ATTENTION_LAYERS);
   const resources: Qwen35HybridResourcePlan[] = [];
-  const kvPairBytes =
-    BigInt(capacity) *
-    KV_HEAD_COUNT *
-    ATTENTION_HEAD_DIMENSION *
-    K_AND_V *
-    FP16_BYTES;
+  const kvBytes = BigInt(capacity) * KV_TOKEN_ROW_BYTES;
 
   for (let layer = 0; layer < QWEN35_LAYER_COUNT; layer += 1) {
     if (fullLayers.has(layer)) {
-      resources.push(Object.freeze({
-        layer,
-        kind: "kv-pair",
-        bytes: kvPairBytes,
-      }));
+      resources.push(
+        Object.freeze({ layer, kind: "key", bytes: kvBytes }),
+        Object.freeze({ layer, kind: "value", bytes: kvBytes }),
+      );
       continue;
     }
     resources.push(
@@ -98,6 +136,7 @@ export function planQwen35HybridState(
 interface OwnedHybridResource {
   readonly plan: Qwen35HybridStateResource;
   readonly allocation: GpuAllocation;
+  readonly view: Qwen35HybridResourceView;
 }
 
 const GPU_STORAGE_AND_COPY_DST = 0x0080 | 0x0008;
@@ -106,10 +145,55 @@ function resourceId(resource: Qwen35HybridResourcePlan): string {
   return `hybrid-state-layer-${resource.layer}-${resource.kind}`;
 }
 
+function resourceKey(layer: number, kind: Qwen35HybridResourceKind): string {
+  return `${layer}:${kind}`;
+}
+
+function createResourceView(
+  plan: Qwen35HybridStateResource,
+  allocation: GpuAllocation,
+): Qwen35HybridResourceView {
+  if (allocation.logicalBytes !== plan.bytes) {
+    throw new Error("Hybrid state allocation does not match its resource plan");
+  }
+  let expectedOffset = 0n;
+  let allocatedBytes = 0n;
+  const shards = allocation.shards.map((shard) => {
+    if (
+      shard.logicalByteOffset !== expectedOffset ||
+      shard.logicalByteLength <= 0n ||
+      shard.allocatedByteLength < shard.logicalByteLength
+    ) {
+      throw new Error("Hybrid state allocation has an invalid shard layout");
+    }
+    expectedOffset += shard.logicalByteLength;
+    allocatedBytes += shard.allocatedByteLength;
+    return Object.freeze({
+      buffer: shard.buffer as object,
+      logicalByteOffset: shard.logicalByteOffset,
+      logicalByteLength: shard.logicalByteLength,
+      allocatedByteLength: shard.allocatedByteLength,
+    });
+  });
+  if (
+    expectedOffset !== plan.bytes ||
+    allocatedBytes !== allocation.allocatedBytes
+  ) {
+    throw new Error("Hybrid state allocation has incomplete shard coverage");
+  }
+  return Object.freeze({
+    ...plan,
+    byteLength: plan.bytes,
+    shards: Object.freeze(shards),
+  });
+}
+
 export class Qwen35HybridState {
   readonly #capacity: number;
   readonly #byteLength: bigint;
   readonly #resources: readonly OwnedHybridResource[];
+  readonly #resourceViews: ReadonlyMap<string, Qwen35HybridResourceView>;
+  readonly #layerViews: readonly Qwen35HybridLayerResources[];
   readonly #clearAllocation: CreateQwen35HybridStateOptions["clearAllocation"];
   #position = 0;
   #disposed = false;
@@ -124,6 +208,30 @@ export class Qwen35HybridState {
     this.#byteLength = plan.totalBytes;
     this.#resources = resources;
     this.#clearAllocation = clearAllocation;
+    this.#resourceViews = new Map(
+      resources.map(({ plan: resource, view }) => [
+        resourceKey(resource.layer, resource.kind),
+        view,
+      ]),
+    );
+    const fullLayers = new Set<number>(QWEN35_FULL_ATTENTION_LAYERS);
+    this.#layerViews = Object.freeze(
+      Array.from({ length: QWEN35_LAYER_COUNT }, (_, layer) =>
+        fullLayers.has(layer)
+          ? Object.freeze({
+              layer,
+              kind: "full-attention" as const,
+              key: this.#requiredResourceView(layer, "key"),
+              value: this.#requiredResourceView(layer, "value"),
+            })
+          : Object.freeze({
+              layer,
+              kind: "gated-deltanet" as const,
+              conv: this.#requiredResourceView(layer, "conv"),
+              recurrent: this.#requiredResourceView(layer, "recurrent"),
+            }),
+      ),
+    );
   }
 
   get capacity(): number {
@@ -140,6 +248,25 @@ export class Qwen35HybridState {
 
   get resourceCount(): number {
     return this.#resources.length;
+  }
+
+  getResource(
+    layer: number,
+    kind: Qwen35HybridResourceKind,
+  ): Qwen35HybridResourceView {
+    this.#assertLive();
+    requireLayer(layer);
+    const resource = this.#resourceViews.get(resourceKey(layer, kind));
+    if (resource === undefined) {
+      throw new Error("Hybrid state resource does not exist for this layer");
+    }
+    return resource;
+  }
+
+  getLayerResources(layer: number): Qwen35HybridLayerResources {
+    this.#assertLive();
+    requireLayer(layer);
+    return this.#layerViews[layer]!;
   }
 
   advance(tokens: number): { readonly start: number; readonly end: number } {
@@ -199,11 +326,28 @@ export class Qwen35HybridState {
       throw new Error("Hybrid state is poisoned and must be disposed");
     }
   }
+
+  #requiredResourceView(
+    layer: number,
+    kind: Qwen35HybridResourceKind,
+  ): Qwen35HybridResourceView {
+    const resource = this.#resourceViews.get(resourceKey(layer, kind));
+    if (resource === undefined) {
+      throw new Error("Hybrid state plan is incomplete");
+    }
+    return resource;
+  }
+}
+
+function requireLayer(layer: number): void {
+  if (!Number.isSafeInteger(layer) || layer < 0 || layer >= QWEN35_LAYER_COUNT) {
+    throw new Error("Hybrid state layer must be from 0 through 31");
+  }
 }
 
 /**
- * Allocates each logical state independently so GpuArena can shard any large
- * K/V pair without inventing dummy resources for the other layer family.
+ * Allocates each logical state independently so GpuArena can adapt physical
+ * shards without coupling K and V or inventing unused layer resources.
  */
 export async function createQwen35HybridState(
   options: CreateQwen35HybridStateOptions,
@@ -219,15 +363,35 @@ export async function createQwen35HybridState(
       const allocation = await options.arena.allocate({
         id: plannedResource.id,
         category:
-          resource.kind === "kv-pair" ? "kv-cache" : "activation",
+          resource.kind === "key" || resource.kind === "value"
+            ? "kv-cache"
+            : "activation",
         byteLength: resource.bytes,
         usage: GPU_STORAGE_AND_COPY_DST,
         alignment: 4,
-        requiredShardQuantumBytes: 4n,
+        requiredShardQuantumBytes:
+          resource.kind === "key" || resource.kind === "value"
+            ? KV_TOKEN_ROW_BYTES
+            : resource.kind === "conv"
+              ? DELTANET_CONV_ROW_BYTES
+              : DELTANET_RECURRENT_ROW_BYTES,
       });
+      let view: Qwen35HybridResourceView;
+      try {
+        view = createResourceView(plannedResource, allocation);
+      } catch {
+        try {
+          allocation.destroy();
+        } catch {
+          // The state cannot expose a malformed allocation, and its ownership
+          // still ends here even when the device reports a cleanup failure.
+        }
+        throw new Error("Hybrid state allocation has invalid shard metadata");
+      }
       owned.push(Object.freeze({
         plan: plannedResource,
         allocation,
+        view,
       }));
     }
   } catch {
