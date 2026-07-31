@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
@@ -250,4 +251,36 @@ test("rejects an oversized tensor alignment before planning padding", () => {
       }),
     /alignment.*bound/i,
   );
+});
+
+test("starts a new shard when alignment crosses a non-aligned shard limit", () => {
+  const script = `
+    import { planConversion } from "./src/converter.js";
+    import { GgmlType } from "./src/gguf.js";
+    const plan = planConversion({
+      version: 3,
+      metadata: {},
+      alignment: 8,
+      dataOffset: 0n,
+      tensors: [
+        { name: "a.weight", dimensions: [113n], type: GgmlType.I8, offset: 0n },
+        { name: "b.weight", dimensions: [1n], type: GgmlType.F32, offset: 120n },
+      ],
+    }, { maxShardBytes: 113n, tensorAlignment: 16 });
+    if (plan.shards.length !== 2 || plan.segments.some((segment) => segment.blockCount <= 0n)) {
+      process.exit(2);
+    }
+  `;
+  const result = spawnSync(
+    process.execPath,
+    ["--import", "tsx", "--input-type=module", "--eval", script],
+    { cwd: process.cwd(), timeout: 500 },
+  );
+
+  assert.equal(
+    result.error,
+    undefined,
+    `planner did not terminate: ${result.error?.message}`,
+  );
+  assert.equal(result.status, 0, result.stderr.toString());
 });

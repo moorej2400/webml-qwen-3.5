@@ -146,3 +146,111 @@ test("serializes deterministic manifest JSON independent of object insertion ord
   assert.match(stringifyManifest(manifest), /^\{\n  "excludedTensors"/);
   assert.ok(stringifyManifest(manifest).endsWith("\n"));
 });
+
+test("rejects storage formats that contradict the GGML tensor type", () => {
+  const manifest = validManifest();
+  manifest.tensorLayout[0]!.ggmlType = 0;
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /q3-k-112.*Q3_K/i,
+  );
+});
+
+test("requires every segment of one tensor to have consistent attributes", () => {
+  const manifest = validManifest();
+  manifest.shards[0]!.length = "224";
+  manifest.tensorLayout[0]!.shape = ["512"];
+  manifest.tensorLayout.push({
+    ...manifest.tensorLayout[0]!,
+    shape: ["256"],
+    shardOffset: "112",
+    tensorOffset: "112",
+  });
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /tensor.*consistent.*attributes/i,
+  );
+});
+
+test("requires contiguous tensor segments with exact shape-derived coverage", () => {
+  const manifest = validManifest();
+  manifest.shards[0]!.length = "336";
+  manifest.tensorLayout[0]!.shape = ["512"];
+  manifest.tensorLayout.push({
+    ...manifest.tensorLayout[0]!,
+    shardOffset: "224",
+    tensorOffset: "224",
+  });
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /tensor.*contiguous/i,
+  );
+
+  const incomplete = validManifest();
+  incomplete.tensorLayout[0]!.shape = ["512"];
+  assert.throws(
+    () => validateModelPackageManifest(incomplete),
+    /tensor.*exact.*length/i,
+  );
+});
+
+test("rejects overlapping tensor byte mappings inside a shard", () => {
+  const manifest = validManifest();
+  manifest.tensorLayout.push({
+    name: "output_norm.weight",
+    shape: ["1"],
+    ggmlType: 0,
+    storageType: "raw",
+    shard: 0,
+    shardOffset: "0",
+    tensorOffset: "0",
+    length: "4",
+  });
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /overlapping.*shard.*mapping/i,
+  );
+});
+
+test("rejects raw tensor segments that split native storage blocks", () => {
+  const manifest = validManifest();
+  manifest.shards[0]!.length = "18";
+  manifest.tensorLayout[0] = {
+    name: "blk.0.weight",
+    shape: ["32"],
+    ggmlType: 2,
+    storageType: "raw",
+    shard: 0,
+    shardOffset: "0",
+    tensorOffset: "0",
+    length: "9",
+  };
+  manifest.tensorLayout.push({
+    ...manifest.tensorLayout[0],
+    shardOffset: "9",
+    tensorOffset: "9",
+  });
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /native storage block alignment/i,
+  );
+});
+
+test("compares segment quantization attributes by value, not key order", () => {
+  const manifest = validManifest();
+  manifest.shards[0]!.length = "224";
+  manifest.tensorLayout[0]!.shape = ["512"];
+  manifest.tensorLayout.push({
+    ...manifest.tensorLayout[0]!,
+    shardOffset: "112",
+    tensorOffset: "112",
+    quantization: { blockBytes: 112, blockElements: 256 },
+  });
+
+  assert.doesNotThrow(() => validateModelPackageManifest(manifest));
+});

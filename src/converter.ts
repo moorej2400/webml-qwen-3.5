@@ -1,5 +1,6 @@
 import {
   GgmlType,
+  ggmlTypeLayout,
   type GgufTensorInfo,
   type ParsedGguf,
   type RandomAccessReader,
@@ -62,27 +63,46 @@ interface TypeLayout {
   readonly transform: PlannedSegment["transform"];
 }
 
+function nativeCopyLayout(type: GgmlType): TypeLayout {
+  const layout = ggmlTypeLayout(type);
+  return {
+    elements: layout.blockElements,
+    sourceBytes: Number(layout.blockBytes),
+    outputBytes: Number(layout.blockBytes),
+    transform: "copy",
+  };
+}
+
+const nativeQ3K = ggmlTypeLayout(GgmlType.Q3_K);
 const TYPE_LAYOUTS = new Map<GgmlType, TypeLayout>([
-  [GgmlType.F32, { elements: 1n, sourceBytes: 4, outputBytes: 4, transform: "copy" }],
-  [GgmlType.F16, { elements: 1n, sourceBytes: 2, outputBytes: 2, transform: "copy" }],
-  [GgmlType.BF16, { elements: 1n, sourceBytes: 2, outputBytes: 2, transform: "copy" }],
-  [GgmlType.I8, { elements: 1n, sourceBytes: 1, outputBytes: 1, transform: "copy" }],
-  [GgmlType.I16, { elements: 1n, sourceBytes: 2, outputBytes: 2, transform: "copy" }],
-  [GgmlType.I32, { elements: 1n, sourceBytes: 4, outputBytes: 4, transform: "copy" }],
-  [GgmlType.I64, { elements: 1n, sourceBytes: 8, outputBytes: 8, transform: "copy" }],
-  [GgmlType.F64, { elements: 1n, sourceBytes: 8, outputBytes: 8, transform: "copy" }],
-  [GgmlType.Q4_0, { elements: 32n, sourceBytes: 18, outputBytes: 18, transform: "copy" }],
-  [GgmlType.Q4_1, { elements: 32n, sourceBytes: 20, outputBytes: 20, transform: "copy" }],
-  [GgmlType.Q5_0, { elements: 32n, sourceBytes: 22, outputBytes: 22, transform: "copy" }],
-  [GgmlType.Q5_1, { elements: 32n, sourceBytes: 24, outputBytes: 24, transform: "copy" }],
-  [GgmlType.Q8_0, { elements: 32n, sourceBytes: 34, outputBytes: 34, transform: "copy" }],
-  [GgmlType.Q8_1, { elements: 32n, sourceBytes: 36, outputBytes: 36, transform: "copy" }],
-  [GgmlType.Q2_K, { elements: 256n, sourceBytes: 84, outputBytes: 84, transform: "copy" }],
-  [GgmlType.Q3_K, { elements: 256n, sourceBytes: 110, outputBytes: 112, transform: "q3-k-110-to-112" }],
-  [GgmlType.Q4_K, { elements: 256n, sourceBytes: 144, outputBytes: 144, transform: "copy" }],
-  [GgmlType.Q5_K, { elements: 256n, sourceBytes: 176, outputBytes: 176, transform: "copy" }],
-  [GgmlType.Q6_K, { elements: 256n, sourceBytes: 210, outputBytes: 210, transform: "copy" }],
-  [GgmlType.Q8_K, { elements: 256n, sourceBytes: 292, outputBytes: 292, transform: "copy" }],
+  [GgmlType.F32, nativeCopyLayout(GgmlType.F32)],
+  [GgmlType.F16, nativeCopyLayout(GgmlType.F16)],
+  [GgmlType.BF16, nativeCopyLayout(GgmlType.BF16)],
+  [GgmlType.I8, nativeCopyLayout(GgmlType.I8)],
+  [GgmlType.I16, nativeCopyLayout(GgmlType.I16)],
+  [GgmlType.I32, nativeCopyLayout(GgmlType.I32)],
+  [GgmlType.I64, nativeCopyLayout(GgmlType.I64)],
+  [GgmlType.F64, nativeCopyLayout(GgmlType.F64)],
+  [GgmlType.Q4_0, nativeCopyLayout(GgmlType.Q4_0)],
+  [GgmlType.Q4_1, nativeCopyLayout(GgmlType.Q4_1)],
+  [GgmlType.Q5_0, nativeCopyLayout(GgmlType.Q5_0)],
+  [GgmlType.Q5_1, nativeCopyLayout(GgmlType.Q5_1)],
+  [GgmlType.Q8_0, nativeCopyLayout(GgmlType.Q8_0)],
+  [GgmlType.Q8_1, nativeCopyLayout(GgmlType.Q8_1)],
+  [GgmlType.Q2_K, nativeCopyLayout(GgmlType.Q2_K)],
+  [
+    GgmlType.Q3_K,
+    {
+      elements: nativeQ3K.blockElements,
+      sourceBytes: Number(nativeQ3K.blockBytes),
+      outputBytes: 112,
+      transform: "q3-k-110-to-112",
+    },
+  ],
+  [GgmlType.Q4_K, nativeCopyLayout(GgmlType.Q4_K)],
+  [GgmlType.Q5_K, nativeCopyLayout(GgmlType.Q5_K)],
+  [GgmlType.Q6_K, nativeCopyLayout(GgmlType.Q6_K)],
+  [GgmlType.Q8_K, nativeCopyLayout(GgmlType.Q8_K)],
 ]);
 
 function tensorElementCount(tensor: GgufTensorInfo): bigint {
@@ -209,7 +229,9 @@ export function planConversion(
       const alignedOffset = align(shard.length, options.tensorAlignment);
       const available = options.maxShardBytes - alignedOffset;
       const fittingBlocks = available / BigInt(layout.outputBytes);
-      if (fittingBlocks === 0n) {
+      // A non-aligned shard limit can place alignedOffset past the limit;
+      // negative BigInt division is not zero and must not create a segment.
+      if (available <= 0n || fittingBlocks <= 0n) {
         shard = { index: shards.length, length: 0n };
         shards.push(shard);
         continue;
@@ -219,8 +241,14 @@ export function planConversion(
         blockCount - consumedBlocks < fittingBlocks
           ? blockCount - consumedBlocks
           : fittingBlocks;
+      if (segmentBlocks <= 0n) {
+        throw new Error(`Planner produced an empty segment for ${tensor.name}`);
+      }
       const sourceLength = segmentBlocks * BigInt(layout.sourceBytes);
       const outputLength = segmentBlocks * BigInt(layout.outputBytes);
+      if (sourceLength <= 0n || outputLength <= 0n) {
+        throw new Error(`Planner produced an empty byte range for ${tensor.name}`);
+      }
       segments.push({
         tensorName: tensor.name,
         dimensions: tensor.dimensions,

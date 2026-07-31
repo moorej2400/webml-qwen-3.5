@@ -60,7 +60,9 @@ export const GgmlType = {
 export type GgmlType = (typeof GgmlType)[keyof typeof GgmlType];
 
 export type GgufMetadataScalar = number | bigint | boolean | string;
-export type GgufMetadataValue = GgufMetadataScalar | GgufMetadataScalar[];
+export type GgufMetadataValue =
+  | GgufMetadataScalar
+  | readonly GgufMetadataValue[];
 
 export interface GgufTensorInfo {
   readonly name: string;
@@ -82,6 +84,8 @@ export interface GgufParseLimits {
   readonly maxMetadataCount?: number;
   readonly maxStringBytes?: number;
   readonly maxArrayLength?: number;
+  readonly maxMetadataArrayDepth?: number;
+  readonly maxMetadataArrayElements?: number;
   readonly maxTensorRank?: number;
 }
 
@@ -90,6 +94,8 @@ const DEFAULT_LIMITS = {
   maxMetadataCount: 1_000_000,
   maxStringBytes: 16 * 1024 * 1024,
   maxArrayLength: 1_000_000,
+  maxMetadataArrayDepth: 8,
+  maxMetadataArrayElements: 1_000_000,
   maxTensorRank: 4,
 } as const;
 
@@ -108,6 +114,69 @@ const SUPPORTED_SCALAR_TYPES = new Set<number>([
   GgufMetadataType.Int64,
   GgufMetadataType.Float64,
 ]);
+
+export interface GgmlTypeLayout {
+  readonly blockElements: bigint;
+  readonly blockBytes: bigint;
+}
+
+// These native GGML wire sizes are the source of truth for parser extents,
+// converter source ranges, and raw manifest coverage.
+const GGML_TYPE_LAYOUTS = new Map<GgmlType, GgmlTypeLayout>([
+  [GgmlType.F32, { blockElements: 1n, blockBytes: 4n }],
+  [GgmlType.F16, { blockElements: 1n, blockBytes: 2n }],
+  [GgmlType.BF16, { blockElements: 1n, blockBytes: 2n }],
+  [GgmlType.I8, { blockElements: 1n, blockBytes: 1n }],
+  [GgmlType.I16, { blockElements: 1n, blockBytes: 2n }],
+  [GgmlType.I32, { blockElements: 1n, blockBytes: 4n }],
+  [GgmlType.I64, { blockElements: 1n, blockBytes: 8n }],
+  [GgmlType.F64, { blockElements: 1n, blockBytes: 8n }],
+  [GgmlType.Q4_0, { blockElements: 32n, blockBytes: 18n }],
+  [GgmlType.Q4_1, { blockElements: 32n, blockBytes: 20n }],
+  [GgmlType.Q5_0, { blockElements: 32n, blockBytes: 22n }],
+  [GgmlType.Q5_1, { blockElements: 32n, blockBytes: 24n }],
+  [GgmlType.Q8_0, { blockElements: 32n, blockBytes: 34n }],
+  [GgmlType.Q8_1, { blockElements: 32n, blockBytes: 36n }],
+  [GgmlType.Q2_K, { blockElements: 256n, blockBytes: 84n }],
+  [GgmlType.Q3_K, { blockElements: 256n, blockBytes: 110n }],
+  [GgmlType.Q4_K, { blockElements: 256n, blockBytes: 144n }],
+  [GgmlType.Q5_K, { blockElements: 256n, blockBytes: 176n }],
+  [GgmlType.Q6_K, { blockElements: 256n, blockBytes: 210n }],
+  [GgmlType.Q8_K, { blockElements: 256n, blockBytes: 292n }],
+]);
+
+const MAX_UINT64 = (1n << 64n) - 1n;
+
+export function ggmlTypeLayout(type: GgmlType): GgmlTypeLayout {
+  const layout = GGML_TYPE_LAYOUTS.get(type);
+  if (layout === undefined) {
+    throw new Error(`Unsupported GGML tensor type layout: ${type}`);
+  }
+  return layout;
+}
+
+export function ggmlTensorByteLength(
+  type: GgmlType,
+  dimensions: readonly bigint[],
+): bigint {
+  const layout = ggmlTypeLayout(type);
+  let elementCount = 1n;
+  for (const dimension of dimensions) {
+    if (dimension < 1n || elementCount > MAX_UINT64 / dimension) {
+      throw new Error("GGML tensor element count exceeds the supported bound");
+    }
+    elementCount *= dimension;
+  }
+  if (elementCount % layout.blockElements !== 0n) {
+    throw new Error("GGML tensor does not contain a complete quantization block");
+  }
+  const byteLength =
+    (elementCount / layout.blockElements) * layout.blockBytes;
+  if (byteLength > MAX_UINT64) {
+    throw new Error("GGML tensor byte length exceeds the supported bound");
+  }
+  return byteLength;
+}
 
 class Cursor {
   offset = 0n;
@@ -137,7 +206,7 @@ class Cursor {
   }
 
   async i8(): Promise<number> {
-    return new DataView((await this.bytes(1)).buffer).getInt8(0);
+    return view(await this.bytes(1)).getInt8(0);
   }
 
   async u16(): Promise<number> {
@@ -172,10 +241,15 @@ class Cursor {
     return view(await this.bytes(8)).getFloat64(0, true);
   }
 
-  async string(): Promise<string> {
+  async string(
+    maxBytes = this.maxStringBytes,
+    label = "string",
+  ): Promise<string> {
     const length = await this.u64();
-    if (length > BigInt(this.maxStringBytes)) {
-      throw new Error(`GGUF string length ${length} exceeds the configured bound`);
+    if (length > BigInt(maxBytes)) {
+      throw new Error(
+        `GGUF ${label} length ${length} exceeds ${maxBytes} bytes`,
+      );
     }
     try {
       return new TextDecoder("utf-8", { fatal: true }).decode(
@@ -243,24 +317,49 @@ async function readScalar(
 async function readMetadataValue(
   cursor: Cursor,
   type: number,
-  maxArrayLength: number,
+  limits: {
+    maxArrayLength: number;
+    maxMetadataArrayDepth: number;
+  },
+  aggregateBudget: { remaining: number },
+  depth = 0,
 ): Promise<GgufMetadataValue> {
   if (type !== GgufMetadataType.Array) {
     return readScalar(cursor, type);
   }
 
+  if (depth >= limits.maxMetadataArrayDepth) {
+    throw new Error("GGUF metadata array depth exceeds the configured bound");
+  }
   const elementType = await cursor.u32();
-  if (!SUPPORTED_SCALAR_TYPES.has(elementType)) {
+  if (
+    elementType !== GgufMetadataType.Array &&
+    !SUPPORTED_SCALAR_TYPES.has(elementType)
+  ) {
     throw new Error(`Unsupported GGUF array element type: ${elementType}`);
   }
   const length = boundedCount(
     await cursor.u64(),
-    maxArrayLength,
+    limits.maxArrayLength,
     "array length",
   );
-  const values: GgufMetadataScalar[] = [];
+  aggregateBudget.remaining -= length;
+  if (aggregateBudget.remaining < 0) {
+    throw new Error(
+      "GGUF aggregate array element count exceeds the configured bound",
+    );
+  }
+  const values: GgufMetadataValue[] = [];
   for (let index = 0; index < length; index += 1) {
-    values.push(await readScalar(cursor, elementType));
+    values.push(
+      await readMetadataValue(
+        cursor,
+        elementType,
+        limits,
+        aggregateBudget,
+        depth + 1,
+      ),
+    );
   }
   return values;
 }
@@ -270,11 +369,13 @@ function requireAlignment(metadata: Record<string, GgufMetadataValue>): number {
   if (
     typeof value !== "number" ||
     !Number.isSafeInteger(value) ||
-    value < 1 ||
+    value < 8 ||
     value > 1024 * 1024 ||
-    (value & (value - 1)) !== 0
+    value % 8 !== 0
   ) {
-    throw new Error("GGUF general.alignment must be a bounded power of two");
+    throw new Error(
+      "GGUF general.alignment must be a bounded multiple of 8",
+    );
   }
   return value;
 }
@@ -323,8 +424,16 @@ export async function parseGguf(
   );
 
   const metadata: Record<string, GgufMetadataValue> = Object.create(null);
+  const aggregateArrayBudget = {
+    remaining: resolved.maxMetadataArrayElements,
+  };
   for (let index = 0; index < metadataCount; index += 1) {
-    const key = await cursor.string();
+    const key = await cursor.string(65_535, "metadata key");
+    if (!/^[a-z0-9_]+(?:\.[a-z0-9_]+)*$/.test(key)) {
+      throw new Error(
+        `GGUF metadata key must use hierarchical ASCII lower_snake_case: ${key}`,
+      );
+    }
     if (Object.hasOwn(metadata, key)) {
       throw new Error(`Duplicate GGUF metadata key: ${key}`);
     }
@@ -338,14 +447,15 @@ export async function parseGguf(
     metadata[key] = await readMetadataValue(
       cursor,
       type,
-      resolved.maxArrayLength,
+      resolved,
+      aggregateArrayBudget,
     );
   }
 
   const alignment = requireAlignment(metadata);
   const tensors: GgufTensorInfo[] = [];
   for (let index = 0; index < tensorCount; index += 1) {
-    const name = await cursor.string();
+    const name = await cursor.string(64, "tensor name");
     const rank = await cursor.u32();
     if (rank < 1 || rank > resolved.maxTensorRank) {
       throw new Error(`Invalid GGUF tensor rank: ${rank}`);
@@ -379,8 +489,9 @@ export async function parseGguf(
     throw new Error("Truncated GGUF input before tensor data");
   }
   for (const tensor of tensors) {
-    if (dataOffset + tensor.offset > reader.size) {
-      throw new Error(`GGUF tensor offset for ${tensor.name} exceeds file size`);
+    const byteLength = ggmlTensorByteLength(tensor.type, tensor.dimensions);
+    if (dataOffset + tensor.offset + byteLength > reader.size) {
+      throw new Error(`GGUF tensor extent for ${tensor.name} exceeds file size`);
     }
   }
 

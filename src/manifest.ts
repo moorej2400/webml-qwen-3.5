@@ -1,3 +1,9 @@
+import {
+  GgmlType,
+  ggmlTensorByteLength,
+  ggmlTypeLayout,
+} from "./gguf.js";
+
 export interface ImmutableArtifactIdentity {
   repository: string;
   revision: string;
@@ -147,7 +153,10 @@ export function validateModelPackageManifest(
     validateShardUrl(shard.url);
     const offset = decimal(shard.offset, `shard ${index} offset`);
     const length = decimal(shard.length, `shard ${index} length`, false);
-    if (offset !== expectedShardOffset) {
+    if (offset < expectedShardOffset) {
+      throw new Error(`shard ${index} has an overlapping shard mapping`);
+    }
+    if (offset > expectedShardOffset) {
       throw new Error(`shard ${index} offset must be contiguous`);
     }
     if (!SHA256.test(shard.sha256)) {
@@ -160,15 +169,24 @@ export function validateModelPackageManifest(
     throw new Error("tensorLayout must be an array");
   }
   const segments = new Set<string>();
+  const tensorGroups = new Map<
+    string,
+    {
+      attributes: string;
+      expectedLength: bigint;
+      segments: Array<{ offset: bigint; length: bigint }>;
+    }
+  >();
+  const shardMappings: Array<Array<{ offset: bigint; end: bigint }>> =
+    manifest.shards.map(() => []);
   for (const tensor of manifest.tensorLayout) {
     requireString(tensor.name, "tensor name");
-    if (
-      !Array.isArray(tensor.shape) ||
-      tensor.shape.length === 0 ||
-      tensor.shape.some((dimension) => decimal(dimension, "tensor dimension", false) < 1n)
-    ) {
+    if (!Array.isArray(tensor.shape) || tensor.shape.length === 0) {
       throw new Error(`tensor ${tensor.name} has an invalid shape`);
     }
+    const shape = tensor.shape.map((dimension) =>
+      decimal(dimension, "tensor dimension", false),
+    );
     if (!Number.isInteger(tensor.ggmlType) || tensor.ggmlType < 0) {
       throw new Error(`tensor ${tensor.name} has an invalid GGML type`);
     }
@@ -206,7 +224,13 @@ export function validateModelPackageManifest(
     }
     segments.add(segmentKey);
 
+    let expectedLength: bigint;
     if (tensor.storageType === "q3-k-112") {
+      if (tensor.ggmlType !== GgmlType.Q3_K) {
+        throw new Error(
+          `tensor ${tensor.name} uses q3-k-112 storage without GGML Q3_K type`,
+        );
+      }
       if (
         tensor.quantization?.blockElements !== 256 ||
         tensor.quantization.blockBytes !== 112 ||
@@ -214,6 +238,97 @@ export function validateModelPackageManifest(
         length % 112n !== 0n
       ) {
         throw new Error(`tensor ${tensor.name} violates Q3_K block alignment`);
+      }
+      const sourceBytes = ggmlTensorByteLength(GgmlType.Q3_K, shape);
+      expectedLength =
+        (sourceBytes / ggmlTypeLayout(GgmlType.Q3_K).blockBytes) * 112n;
+    } else {
+      if (tensor.ggmlType === GgmlType.Q3_K) {
+        throw new Error(
+          `tensor ${tensor.name} with GGML Q3_K type must use q3-k-112 storage`,
+        );
+      }
+      if (tensor.quantization !== undefined) {
+        throw new Error(`raw tensor ${tensor.name} cannot declare quantization`);
+      }
+      const nativeLayout = ggmlTypeLayout(tensor.ggmlType as GgmlType);
+      if (
+        tensorOffset % nativeLayout.blockBytes !== 0n ||
+        length % nativeLayout.blockBytes !== 0n
+      ) {
+        throw new Error(
+          `tensor ${tensor.name} violates native storage block alignment`,
+        );
+      }
+      expectedLength = ggmlTensorByteLength(
+        tensor.ggmlType as GgmlType,
+        shape,
+      );
+    }
+
+    const attributes = JSON.stringify({
+      shape: tensor.shape,
+      ggmlType: tensor.ggmlType,
+      storageType: tensor.storageType,
+      quantization:
+        tensor.quantization === undefined
+          ? null
+          : [
+              tensor.quantization.blockElements,
+              tensor.quantization.blockBytes,
+            ],
+    });
+    const group = tensorGroups.get(tensor.name);
+    if (group === undefined) {
+      tensorGroups.set(tensor.name, {
+        attributes,
+        expectedLength,
+        segments: [{ offset: tensorOffset, length }],
+      });
+    } else {
+      if (
+        group.attributes !== attributes ||
+        group.expectedLength !== expectedLength
+      ) {
+        throw new Error(
+          `tensor ${tensor.name} must use consistent attributes across segments`,
+        );
+      }
+      group.segments.push({ offset: tensorOffset, length });
+    }
+    shardMappings[tensor.shard]!.push({
+      offset: shardOffset,
+      end: shardOffset + length,
+    });
+  }
+
+  // Logical tensor coverage and physical shard mappings are independent:
+  // validate both so a complete tensor cannot alias another tensor's bytes.
+  for (const [name, group] of tensorGroups) {
+    group.segments.sort((left, right) =>
+      left.offset < right.offset ? -1 : left.offset > right.offset ? 1 : 0,
+    );
+    let covered = 0n;
+    for (const segment of group.segments) {
+      if (segment.offset !== covered) {
+        throw new Error(`tensor ${name} segments must be contiguous`);
+      }
+      covered += segment.length;
+    }
+    if (covered !== group.expectedLength) {
+      throw new Error(
+        `tensor ${name} segments must cover the exact shape-derived length`,
+      );
+    }
+  }
+
+  for (const mappings of shardMappings) {
+    mappings.sort((left, right) =>
+      left.offset < right.offset ? -1 : left.offset > right.offset ? 1 : 0,
+    );
+    for (let index = 1; index < mappings.length; index += 1) {
+      if (mappings[index]!.offset < mappings[index - 1]!.end) {
+        throw new Error("overlapping tensor shard mapping");
       }
     }
   }
