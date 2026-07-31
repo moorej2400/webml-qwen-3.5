@@ -14,7 +14,7 @@ export const RECOVERY_ORDER = [
 export interface ControlEnvironment {
   certPath: string;
   keyPath: string;
-  phoneToken: string;
+  pairingCode: string;
   operatorToken: string;
   publicHost: string;
   publicPort: number;
@@ -60,15 +60,17 @@ export const loadControlEnvironment = (
     requireValue(environment, "QWEN_CONTROL_TLS_KEY", "TLS key path"),
     "TLS key path",
   );
-  const phoneToken = assertHighEntropyCredential(
-    environment.QWEN_CONTROL_PHONE_TOKEN,
-    "phone credential",
+  const pairingCode = assertHighEntropyCredential(
+    environment.QWEN_CONTROL_PAIRING_CODE,
+    "pairing code",
   );
   const operatorToken = assertHighEntropyCredential(
     environment.QWEN_CONTROL_OPERATOR_TOKEN,
     "operator credential",
   );
-  if (phoneToken === operatorToken) throw new Error("phone and operator credentials must be distinct");
+  if (pairingCode === operatorToken) {
+    throw new Error("pairing and operator credentials must be distinct");
+  }
   const publicHost = requireValue(
     environment,
     "QWEN_CONTROL_PUBLIC_HOST",
@@ -80,7 +82,7 @@ export const loadControlEnvironment = (
   return {
     certPath,
     keyPath,
-    phoneToken,
+    pairingCode,
     operatorToken,
     publicHost,
     publicPort: parsePort(environment.QWEN_CONTROL_PUBLIC_PORT, 8443, "public port"),

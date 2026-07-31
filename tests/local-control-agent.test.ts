@@ -83,7 +83,7 @@ test("repeated runPrompt command id is reconciled without duplicate generation",
   );
 });
 
-test("cold app reload reports external fallback instead of inventing control", async () => {
+test("cold app reload stays started while external fallback reopens the app", async () => {
   const platform = createPlatform();
   const agent = new PhoneAgentRuntime({
     identity: {
@@ -102,12 +102,60 @@ test("cold app reload reports external fallback instead of inventing control", a
     command: "coldAppReload",
   });
 
-  assert.equal(
-    (platform.sent.at(-1) as { state: string }).state,
-    "indeterminate",
-  );
+  assert.equal((platform.sent.at(-1) as { state: string }).state, "started");
   assert.equal(
     (platform.sent.at(-1) as { reason: string }).reason,
     "external_fallback_required",
   );
+});
+
+test("getState requires a handler and returns only bounded sanitized state", async () => {
+  const withoutHandler = createPlatform();
+  const missing = new PhoneAgentRuntime({
+    identity: {
+      deviceId: "device_0123456789abcdef",
+      tabId: "tab_0123456789abcdef",
+      documentId: "document_0123456789abcdef",
+    },
+    platform: withoutHandler,
+    handlers: {},
+  });
+  await missing.receive({
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_0123456789abcdef",
+    command: "getState",
+  });
+  assert.equal((withoutHandler.sent.at(-1) as { state: string }).state, "failed");
+
+  const withHandler = createPlatform();
+  const agent = new PhoneAgentRuntime({
+    identity: {
+      deviceId: "device_0123456789abcdef",
+      tabId: "tab_0123456789abcdef",
+      documentId: "document_0123456789abcdef",
+    },
+    platform: withHandler,
+    handlers: {
+      getState: () => ({
+        modelState: "loaded",
+        contextTokens: 512,
+        prompt: "must not leave phone",
+        nested: { cookie: "secret" },
+      }),
+    },
+  });
+  await agent.receive({
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_1123456789abcdef",
+    command: "getState",
+  });
+  const completed = withHandler.sent.at(-1) as {
+    state: string;
+    result: Record<string, unknown>;
+  };
+  assert.equal(completed.state, "completed");
+  assert.deepEqual(completed.result, { modelState: "loaded", contextTokens: 512 });
+  assert.ok(Buffer.byteLength(JSON.stringify(completed.result)) <= 8_192);
 });

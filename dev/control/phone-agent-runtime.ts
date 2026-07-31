@@ -5,6 +5,7 @@ import {
   type ControlCommand,
   type PhoneIdentity,
 } from "./protocol.js";
+import { sanitizeStateResult, type SanitizedStateResult } from "./state-result.js";
 
 export interface AgentPlatform {
   send(message: unknown): void;
@@ -13,7 +14,7 @@ export interface AgentPlatform {
   clearTimer(id: number): void;
 }
 
-type AgentHandler = (payload?: Record<string, unknown>) => void | Promise<void>;
+type AgentHandler = (payload?: Record<string, unknown>) => unknown | Promise<unknown>;
 export type AgentHandlers = Partial<
   Record<Exclude<ControlCommand, "warmReload" | "coldAppReload">, AgentHandler>
 >;
@@ -27,6 +28,7 @@ export interface PhoneAgentRuntimeOptions {
 interface AgentCommandRecord {
   state: Exclude<CommandState, "issued">;
   reason?: string;
+  result?: SanitizedStateResult;
 }
 
 export class PhoneAgentRuntime {
@@ -47,7 +49,7 @@ export class PhoneAgentRuntime {
     if (previous !== undefined) {
       // A retry retransmits state only; executing the handler again could
       // generate the same prompt twice after a reconnect race.
-      this.#report(message.commandId, previous.state, previous.reason);
+      this.#report(message.commandId, previous.state, previous.reason, previous.result);
       return;
     }
 
@@ -60,17 +62,22 @@ export class PhoneAgentRuntime {
       return;
     }
     if (message.command === "coldAppReload") {
-      this.#setAndReport(message.commandId, "indeterminate", "external_fallback_required");
+      this.#setAndReport(message.commandId, "started", "external_fallback_required");
       return;
     }
 
     const handler = this.#handlers[message.command];
     try {
-      if (handler === undefined && message.command !== "getState") {
+      if (handler === undefined) {
         throw new Error("handler_unavailable");
       }
-      await handler?.(message.payload);
-      this.#setAndReport(message.commandId, "completed");
+      const value = await handler(message.payload);
+      this.#setAndReport(
+        message.commandId,
+        "completed",
+        undefined,
+        message.command === "getState" ? sanitizeStateResult(value) : undefined,
+      );
     } catch (error) {
       this.#setAndReport(
         message.commandId,
@@ -103,12 +110,22 @@ export class PhoneAgentRuntime {
     commandId: string,
     state: AgentCommandRecord["state"],
     reason?: string,
+    result?: SanitizedStateResult,
   ): void {
-    this.#commands.set(commandId, { state, ...(reason === undefined ? {} : { reason }) });
-    this.#report(commandId, state, reason);
+    this.#commands.set(commandId, {
+      state,
+      ...(reason === undefined ? {} : { reason }),
+      ...(result === undefined ? {} : { result }),
+    });
+    this.#report(commandId, state, reason, result);
   }
 
-  #report(commandId: string, state: AgentCommandRecord["state"], reason?: string): void {
+  #report(
+    commandId: string,
+    state: AgentCommandRecord["state"],
+    reason?: string,
+    result?: SanitizedStateResult,
+  ): void {
     this.#platform.send({
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "commandState",
@@ -117,6 +134,7 @@ export class PhoneAgentRuntime {
       commandId,
       state,
       ...(reason === undefined ? {} : { reason }),
+      ...(result === undefined ? {} : { result }),
     });
   }
 }

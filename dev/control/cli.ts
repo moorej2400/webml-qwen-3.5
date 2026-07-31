@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { loadControlEnvironment } from "./config.js";
 import { ControlPlane } from "./control-plane.js";
+import { PairingAuthority } from "./pairing.js";
 import { RunJournal } from "./run-journal.js";
 import {
   createDevelopmentServer,
@@ -26,10 +27,14 @@ const journal = new RunJournal({
 const controlPlane = new ControlPlane({
   onTelemetry: (event) => journal.append(event),
 });
+const pairingAuthority = new PairingAuthority({
+  pairingCode: config.pairingCode,
+  randomToken: () => randomBytes(32).toString("base64url"),
+});
 const appServer = createDevelopmentServer({
   tls,
   controlPlane,
-  phoneToken: config.phoneToken,
+  pairingAuthority,
   html: "<!doctype html><meta charset=utf-8><title>Qwen WebGPU development</title><main id=app></main>",
 });
 const operatorServer = createOperatorServer({

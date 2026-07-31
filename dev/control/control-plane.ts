@@ -38,8 +38,13 @@ export type DisconnectEvidence =
 
 export const classifyDisconnect = (
   evidence: DisconnectEvidence,
-): { classification: DisconnectEvidence["kind"]; confirmedCrash: false } => ({
+): {
+  classification: DisconnectEvidence["kind"];
+  evidence: DisconnectEvidence["kind"][];
+  confirmedCrash: false;
+} => ({
   classification: evidence.kind,
+  evidence: [evidence.kind],
   // None of these browser-visible signals proves that the process crashed.
   confirmedCrash: false,
 });
@@ -60,6 +65,16 @@ interface StoredCommand {
   timer?: number | NodeJS.Timeout;
 }
 
+interface DisconnectRecord {
+  atMs: number;
+  identity: PhoneIdentity;
+  classification: DisconnectEvidence["kind"] | "suspected_crash";
+  evidence: string[];
+  confirmedCrash: false;
+  timer?: number | NodeJS.Timeout;
+  reconnectedAtMs?: number;
+}
+
 export interface IssueCommandRequest {
   deviceId: string;
   tabId: string;
@@ -73,6 +88,7 @@ export interface ControlPlaneOptions {
   clock?: Clock;
   commandTimeoutMs?: number;
   reloadTimeoutMs?: number;
+  suspectedCrashTimeoutMs?: number;
   onTelemetry?: (event: Record<string, unknown>) => void | Promise<void>;
 }
 
@@ -93,23 +109,20 @@ export class ControlPlane {
   readonly #clock: Clock;
   readonly #commandTimeoutMs: number;
   readonly #reloadTimeoutMs: number;
+  readonly #suspectedCrashTimeoutMs: number;
   readonly #onTelemetry?: ControlPlaneOptions["onTelemetry"];
   readonly #connections = new Map<string, Connection>();
   readonly #connectionByTab = new Map<string, string>();
   readonly #disconnectedDocuments = new Set<string>();
   readonly #commands = new Map<string, StoredCommand>();
   readonly #sequences = new EventSequenceTracker();
-  readonly #disconnects: Array<{
-    atMs: number;
-    identity: PhoneIdentity;
-    classification: DisconnectEvidence["kind"];
-    confirmedCrash: false;
-  }> = [];
+  readonly #disconnects: DisconnectRecord[] = [];
 
   constructor(options: ControlPlaneOptions = {}) {
     this.#clock = options.clock ?? systemClock;
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 120_000;
     this.#reloadTimeoutMs = options.reloadTimeoutMs ?? 30_000;
+    this.#suspectedCrashTimeoutMs = options.suspectedCrashTimeoutMs ?? 10_000;
     this.#onTelemetry = options.onTelemetry;
   }
 
@@ -124,6 +137,16 @@ export class ControlPlane {
     const connection = { connectionId, identity, send };
     this.#connections.set(connectionId, connection);
     this.#connectionByTab.set(key, connectionId);
+    for (const disconnect of this.#disconnects) {
+      if (
+        disconnect.identity.deviceId === identity.deviceId &&
+        disconnect.identity.tabId === identity.tabId &&
+        disconnect.classification === "socket_loss"
+      ) {
+        disconnect.reconnectedAtMs = this.#clock.now();
+        if (disconnect.timer !== undefined) this.#clock.clearTimeout(disconnect.timer);
+      }
+    }
 
     const commands = [...this.#commands.values()]
       .filter((stored) => tabKey(stored.target) === key)
@@ -149,11 +172,21 @@ export class ControlPlane {
       this.#connectionByTab.delete(tabKey(connection.identity));
     }
     this.#disconnectedDocuments.add(connection.identity.documentId);
-    this.#disconnects.push({
+    const disconnectRecord: DisconnectRecord = {
       atMs: this.#clock.now(),
       identity: connection.identity,
       ...classifyDisconnect(resolvedEvidence),
-    });
+    };
+    if (resolvedEvidence.kind === "socket_loss") {
+      disconnectRecord.timer = this.#clock.setTimeout(() => {
+        if (disconnectRecord.reconnectedAtMs !== undefined) return;
+        disconnectRecord.classification = "suspected_crash";
+        if (!disconnectRecord.evidence.includes("reconnect_timeout")) {
+          disconnectRecord.evidence.push("reconnect_timeout");
+        }
+      }, this.#suspectedCrashTimeoutMs);
+    }
+    this.#disconnects.push(disconnectRecord);
   }
 
   issueCommand(request: IssueCommandRequest): CommandSnapshot {
@@ -209,6 +242,9 @@ export class ControlPlane {
         this.#clock.now(),
         isReload(request.command) ? "replacement_document_not_proven" : "command_timeout",
       );
+      if (!isReload(request.command)) {
+        this.#promoteSuspectedCrash(target, "command_timeout");
+      }
     }, timeoutMs);
     this.#commands.set(commandId, stored);
     return tracker.snapshot();
@@ -235,7 +271,15 @@ export class ControlPlane {
       if (evidence !== undefined) connection.lastEvidence = evidence;
       if (this.#onTelemetry !== undefined) {
         // Telemetry storage is intentionally detached from protocol progress.
-        void Promise.resolve(this.#onTelemetry(message.event)).catch(() => undefined);
+        void Promise.resolve(
+          this.#onTelemetry({
+            ...message.event,
+            deviceId: connection.identity.deviceId,
+            tabId: connection.identity.tabId,
+            documentId: connection.identity.documentId,
+            eventSeq: message.eventSeq,
+          }),
+        ).catch(() => undefined);
       }
     }
     return sequence;
@@ -245,7 +289,7 @@ export class ControlPlane {
     const stored = this.#commands.get(message.commandId);
     if (stored === undefined) throw new Error("unknown commandId");
     if (tabKey(stored.target) !== tabKey(message)) throw new Error("command target mismatch");
-    stored.tracker.transition(message.state, this.#clock.now(), message.reason);
+    stored.tracker.transition(message.state, this.#clock.now(), message.reason, message.result);
     if (isTerminal(stored.tracker.snapshot().state) && stored.timer !== undefined) {
       this.#clock.clearTimeout(stored.timer);
     }
@@ -285,10 +329,31 @@ export class ControlPlane {
   getDisconnectEvidence(): readonly Readonly<{
     atMs: number;
     identity: PhoneIdentity;
-    classification: DisconnectEvidence["kind"];
+    classification: DisconnectEvidence["kind"] | "suspected_crash";
+    evidence: string[];
     confirmedCrash: false;
   }>[] {
-    return structuredClone(this.#disconnects);
+    return this.#disconnects.map(({ timer: _timer, reconnectedAtMs: _reconnectedAtMs, ...record }) =>
+      structuredClone(record),
+    );
+  }
+
+  #promoteSuspectedCrash(
+    target: Pick<PhoneIdentity, "deviceId" | "tabId">,
+    evidence: "command_timeout",
+  ): void {
+    const record = [...this.#disconnects]
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.identity.deviceId === target.deviceId &&
+          candidate.identity.tabId === target.tabId &&
+          candidate.reconnectedAtMs === undefined &&
+          candidate.classification === "socket_loss",
+      );
+    if (record === undefined) return;
+    record.classification = "suspected_crash";
+    if (!record.evidence.includes(evidence)) record.evidence.push(evidence);
   }
 }
 

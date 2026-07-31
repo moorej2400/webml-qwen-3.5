@@ -260,6 +260,61 @@ test("phone lifecycle evidence refines later socket-loss classification", () => 
   assert.equal(plane.getDisconnectEvidence().at(-1)?.confirmedCrash, false);
 });
 
+test("journal callback receives authenticated correlation, not spoofed event identity", () => {
+  const events: Record<string, unknown>[] = [];
+  const plane = new ControlPlane({
+    clock: new FakeClock(),
+    onTelemetry: (event) => {
+      events.push(event);
+    },
+  });
+  const phone = connect(plane, identity("document_0123456789abcdef"));
+  plane.receive(phone.connectionId, {
+    schemaVersion: 1,
+    type: "telemetry",
+    ...identity("document_0123456789abcdef"),
+    eventSeq: 1,
+    event: {
+      category: "generation",
+      name: "token_rate",
+      timestampMs: 1_000,
+      deviceId: "device_spoofed_0123456789",
+      eventSeq: 999,
+      metrics: { tokensPerSecond: 31 },
+    },
+  });
+
+  assert.equal(events[0]?.deviceId, "device_0123456789abcdef");
+  assert.equal(events[0]?.tabId, "tab_0123456789abcdef");
+  assert.equal(events[0]?.documentId, "document_0123456789abcdef");
+  assert.equal(events[0]?.eventSeq, 1);
+});
+
+test("socket loss becomes suspected_crash only after reconnect timeout", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, suspectedCrashTimeoutMs: 500 });
+  const phone = connect(plane, identity("document_0123456789abcdef"));
+  plane.disconnect(phone.connectionId, { kind: "socket_loss" });
+
+  assert.equal(plane.getDisconnectEvidence().at(-1)?.classification, "socket_loss");
+  clock.advance(501);
+  const evidence = plane.getDisconnectEvidence().at(-1);
+  assert.equal(evidence?.classification, "suspected_crash");
+  assert.deepEqual(evidence?.evidence, ["socket_loss", "reconnect_timeout"]);
+  assert.equal(evidence?.confirmedCrash, false);
+});
+
+test("reconnect before timeout prevents suspected crash classification", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, suspectedCrashTimeoutMs: 500 });
+  const phone = connect(plane, identity("document_0123456789abcdef"));
+  plane.disconnect(phone.connectionId, { kind: "socket_loss" });
+  connect(plane, identity("document_0123456789abcdef"));
+  clock.advance(501);
+
+  assert.equal(plane.getDisconnectEvidence().at(-1)?.classification, "socket_loss");
+});
+
 test("sequence gaps and replays are rejected without applying state", () => {
   const plane = new ControlPlane({ clock: new FakeClock() });
   const phone = connect(plane, identity("document_0123456789abcdef"));

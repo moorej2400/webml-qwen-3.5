@@ -1,3 +1,5 @@
+import { sanitizeStateResult, type SanitizedStateResult } from "./state-result.js";
+
 export const CONTROL_SCHEMA_VERSION = 1 as const;
 
 export const CONTROL_COMMANDS = [
@@ -35,6 +37,7 @@ export interface CommandStateMessage extends PhoneIdentity {
   commandId: string;
   state: Exclude<CommandState, "issued">;
   reason?: string;
+  result?: SanitizedStateResult;
 }
 
 export interface ReadyMessage extends PhoneIdentity {
@@ -70,6 +73,7 @@ export interface CommandSnapshot {
   startedAtMs?: number;
   terminalAtMs?: number;
   reason?: string;
+  result?: SanitizedStateResult;
 }
 
 export interface ReconcileMessage {
@@ -141,6 +145,7 @@ export const parsePhoneMessage = (input: unknown): PhoneToServerMessage => {
     if (typeof input.reason === "string") {
       message.reason = input.reason.slice(0, 128);
     }
+    if (input.result !== undefined) message.result = sanitizeStateResult(input.result);
     return message;
   }
   if (input.type === "telemetry" && isRecord(input.event)) {
@@ -177,13 +182,21 @@ export class CommandTracker {
     };
   }
 
-  transition(state: Exclude<CommandState, "issued">, atMs: number, reason?: string): void {
+  transition(
+    state: Exclude<CommandState, "issued">,
+    atMs: number,
+    reason?: string,
+    result?: SanitizedStateResult,
+  ): void {
     const current = this.#snapshot.state;
     if (isTerminal(current)) {
       if (state === current) return;
       throw new Error(`command already reached terminal state ${current}`);
     }
-    if (state === current) return;
+    if (state === current) {
+      if (reason !== undefined) this.#snapshot.reason = reason.slice(0, 128);
+      return;
+    }
     if (current === "issued" && state !== "accepted") {
       throw new Error("command must be accepted before it can start");
     }
@@ -199,6 +212,7 @@ export class CommandTracker {
     if (isTerminal(state)) {
       this.#snapshot.terminalAtMs = atMs;
       if (reason !== undefined) this.#snapshot.reason = reason.slice(0, 128);
+      if (result !== undefined) this.#snapshot.result = sanitizeStateResult(result);
     }
   }
 

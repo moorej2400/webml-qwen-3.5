@@ -27,11 +27,11 @@ not put that hostname or an address in this repository.
 
 ## Process-only credentials
 
-Generate a different token for the phone and operator in the current shell.
-The commands below keep the values in process environment only:
+Generate a one-time pairing code and a different operator token in the current
+shell. The commands below keep the values in process environment only:
 
 ```sh
-export QWEN_CONTROL_PHONE_TOKEN="$(openssl rand -base64 48 | tr -d '\n' | tr '+/' '-_')"
+export QWEN_CONTROL_PAIRING_CODE="$(openssl rand -base64 48 | tr -d '\n' | tr '+/' '-_')"
 export QWEN_CONTROL_OPERATOR_TOKEN="$(openssl rand -base64 48 | tr -d '\n' | tr '+/' '-_')"
 export QWEN_CONTROL_TLS_CERT=".local/tls/cert.pem"
 export QWEN_CONTROL_TLS_KEY=".local/tls/key.pem"
@@ -39,8 +39,14 @@ export QWEN_CONTROL_PUBLIC_HOST="<development-hostname>"
 npm run control:dev
 ```
 
-Do not put tokens in `.env`, shell scripts, command arguments, source files, or
-logs. The service fails closed if TLS material, either token, or the explicit
+Do not put the pairing code or token in `.env`, shell scripts, command
+arguments, source files, or logs. Enter the pairing code through the on-device
+pairing flow. The code expires after five minutes and works once. The resulting
+device session requests a single-use, short-lived ticket for each WebSocket
+connection. The public browser-agent response contains no reusable credential.
+The local-only page shows a pairing dialog when it has no valid device session.
+
+The service fails closed if TLS material, either credential, or the explicit
 public host is missing. The operator API always binds to the IPv4 loopback
 interface. Only the HTTPS app and authenticated phone WebSocket use the
 configured development host.
@@ -54,4 +60,6 @@ the phone or a remote desktop.
 
 Structured telemetry is written under ignored `.local/runs/`. The journal uses
 an allowlist and does not store prompts, responses, URLs, cookies, headers,
-addresses, or stack traces.
+addresses, or stack traces. A run uses capped segments and stops accepting new
+events at its hard cap instead of overwriting prior evidence. The operator API
+returns sanitized benchmark identifiers and numeric metric summaries.

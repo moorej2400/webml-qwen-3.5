@@ -7,7 +7,7 @@ import { loadControlEnvironment, RECOVERY_ORDER } from "../dev/control/config.js
 const validEnvironment = {
   QWEN_CONTROL_TLS_CERT: ".local/tls/cert.pem",
   QWEN_CONTROL_TLS_KEY: ".local/tls/key.pem",
-  QWEN_CONTROL_PHONE_TOKEN: randomBytes(32).toString("base64url"),
+  QWEN_CONTROL_PAIRING_CODE: randomBytes(32).toString("base64url"),
   QWEN_CONTROL_OPERATOR_TOKEN: randomBytes(32).toString("base64url"),
   QWEN_CONTROL_PUBLIC_HOST: "development-host.invalid",
 };
@@ -15,8 +15,8 @@ const validEnvironment = {
 test("control environment fails closed without TLS, auth, or an explicit public host", () => {
   assert.throws(() => loadControlEnvironment({}), /TLS certificate/i);
   assert.throws(
-    () => loadControlEnvironment({ ...validEnvironment, QWEN_CONTROL_PHONE_TOKEN: undefined }),
-    /phone credential/i,
+    () => loadControlEnvironment({ ...validEnvironment, QWEN_CONTROL_PAIRING_CODE: undefined }),
+    /pairing code/i,
   );
   assert.throws(
     () => loadControlEnvironment({ ...validEnvironment, QWEN_CONTROL_PUBLIC_HOST: undefined }),
@@ -37,7 +37,7 @@ test("control environment keeps TLS paths under .local and tokens distinct", () 
     () =>
       loadControlEnvironment({
         ...validEnvironment,
-        QWEN_CONTROL_OPERATOR_TOKEN: validEnvironment.QWEN_CONTROL_PHONE_TOKEN,
+        QWEN_CONTROL_OPERATOR_TOKEN: validEnvironment.QWEN_CONTROL_PAIRING_CODE,
       }),
     /distinct/i,
   );

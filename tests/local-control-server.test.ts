@@ -15,6 +15,7 @@ import {
   loadLocalTlsMaterial,
 } from "../dev/control/server.js";
 import { ControlPlane } from "../dev/control/control-plane.js";
+import { PairingAuthority } from "../dev/control/pairing.js";
 
 test("credentials must be high entropy and are not accepted as short secrets", () => {
   assert.throws(() => assertHighEntropyCredential("password", "credential"), /entropy/i);
@@ -22,12 +23,38 @@ test("credentials must be high entropy and are not accepted as short secrets", (
 });
 
 test("phone authentication accepts only the exact token via WebSocket subprotocol", () => {
-  const token = randomBytes(32).toString("base64url");
-  assert.deepEqual(authenticatePhoneProtocols(`qwen-control.v1, ${token}`, token), {
+  const authority = new PairingAuthority({
+    pairingCode: randomBytes(32).toString("base64url"),
+    now: () => 1_000,
+    randomToken: () => randomBytes(32).toString("base64url"),
+  });
+  const identity = {
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    documentId: "document_0123456789abcdef",
+  };
+  const pairingCode = randomBytes(32).toString("base64url");
+  const ticketAuthority = new PairingAuthority({
+    pairingCode,
+    now: () => 1_000,
+    randomToken: () => randomBytes(32).toString("base64url"),
+  });
+  const session = ticketAuthority.pair(pairingCode, identity);
+  const ticket = ticketAuthority.issueTicket(session.sessionCapability, identity);
+  assert.deepEqual(
+    authenticatePhoneProtocols(
+      `qwen-control.v1, ${ticket.ticket}`,
+      (candidate) => ticketAuthority.consumeTicket(candidate),
+    ),
+    {
     accepted: true,
     protocol: "qwen-control.v1",
-  });
-  assert.deepEqual(authenticatePhoneProtocols("qwen-control.v1, wrong", token), {
+      identity,
+    },
+  );
+  assert.deepEqual(authenticatePhoneProtocols("qwen-control.v1, wrong", (candidate) =>
+    authority.consumeTicket(candidate),
+  ), {
     accepted: false,
   });
 });
@@ -104,4 +131,71 @@ test("operator server binds only to loopback and rejects missing authentication"
   const address = await listenOperatorServer(fakeServer as unknown as Server, 0);
   assert.equal(boundHost, "127.0.0.1");
   assert.deepEqual(address, { host: "127.0.0.1", port: 9012 });
+});
+
+test("operator command query returns sanitized getState result", async () => {
+  const token = randomBytes(32).toString("base64url");
+  const plane = new ControlPlane();
+  const phoneIdentity = {
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    documentId: "document_0123456789abcdef",
+  };
+  const connectionId = plane.connect(phoneIdentity, () => undefined);
+  plane.issueCommand({
+    deviceId: phoneIdentity.deviceId,
+    tabId: phoneIdentity.tabId,
+    commandId: "command_0123456789abcdef",
+    command: "getState",
+  });
+  plane.receive(connectionId, {
+    schemaVersion: 1,
+    type: "commandState",
+    ...phoneIdentity,
+    eventSeq: 1,
+    commandId: "command_0123456789abcdef",
+    state: "accepted",
+  });
+  plane.receive(connectionId, {
+    schemaVersion: 1,
+    type: "commandState",
+    ...phoneIdentity,
+    eventSeq: 2,
+    commandId: "command_0123456789abcdef",
+    state: "started",
+  });
+  plane.receive(connectionId, {
+    schemaVersion: 1,
+    type: "commandState",
+    ...phoneIdentity,
+    eventSeq: 3,
+    commandId: "command_0123456789abcdef",
+    state: "completed",
+    result: { modelState: "loaded", prompt: "private" },
+  });
+
+  const handler = createOperatorRequestHandler({ controlPlane: plane, operatorToken: token });
+  let status = 0;
+  let responseBody = "";
+  await handler(
+    {
+      headers: { authorization: `Bearer ${token}` },
+      method: "GET",
+      url: "/v1/commands/command_0123456789abcdef",
+    } as IncomingMessage,
+    {
+      writeHead(code: number) {
+        status = code;
+        return this;
+      },
+      end(chunk?: string) {
+        responseBody += chunk ?? "";
+        return this;
+      },
+    } as unknown as ServerResponse,
+  );
+
+  assert.equal(status, 200);
+  const snapshot = JSON.parse(responseBody) as { result: Record<string, unknown> };
+  assert.deepEqual(snapshot.result, { modelState: "loaded" });
 });

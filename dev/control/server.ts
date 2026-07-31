@@ -8,6 +8,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 
 import { createBrowserAgentSource } from "./browser-agent-source.js";
 import { ControlPlane, type IssueCommandRequest } from "./control-plane.js";
+import { PairingAuthority } from "./pairing.js";
 import { CONTROL_SCHEMA_VERSION, validateProtocolId, type PhoneIdentity } from "./protocol.js";
 import { listRunSummaries } from "./run-journal.js";
 import { assertHighEntropyCredential } from "./security.js";
@@ -24,16 +25,24 @@ const constantTimeEqual = (left: string, right: string): boolean => {
 
 export const authenticatePhoneProtocols = (
   header: string | string[] | undefined,
-  expectedToken: string,
-): { accepted: true; protocol: "qwen-control.v1" } | { accepted: false } => {
-  assertHighEntropyCredential(expectedToken, "phone credential");
+  consumeTicket: (ticket: string) => PhoneIdentity,
+):
+  | { accepted: true; protocol: "qwen-control.v1"; identity: PhoneIdentity }
+  | { accepted: false } => {
   const value = Array.isArray(header) ? header.join(",") : header ?? "";
   const protocols = value.split(",").map((entry) => entry.trim());
-  return protocols[0] === "qwen-control.v1" &&
-    protocols[1] !== undefined &&
-    constantTimeEqual(protocols[1], expectedToken)
-    ? { accepted: true, protocol: "qwen-control.v1" }
-    : { accepted: false };
+  if (protocols[0] !== "qwen-control.v1" || protocols[1] === undefined) {
+    return { accepted: false };
+  }
+  try {
+    return {
+      accepted: true,
+      protocol: "qwen-control.v1",
+      identity: consumeTicket(protocols[1]),
+    };
+  } catch {
+    return { accepted: false };
+  }
 };
 
 const resolveLocalFile = async (projectRoot: string, relativePath: string): Promise<string> => {
@@ -140,6 +149,19 @@ export const createOperatorRequestHandler = (
         sendJson(response, 200, options.controlPlane.getBenchmark(benchmarkId));
         return;
       }
+      if (request.method === "GET" && url.pathname.startsWith("/v1/commands/")) {
+        const commandId = validateProtocolId(
+          decodeURIComponent(url.pathname.slice("/v1/commands/".length)),
+          "commandId",
+        );
+        const command = options.controlPlane.getCommand(commandId);
+        sendJson(
+          response,
+          command === undefined ? 404 : 200,
+          command ?? { error: "command_not_found" },
+        );
+        return;
+      }
       if (request.method === "POST" && url.pathname === "/v1/commands") {
         const body = await readJsonBody(request);
         const issued = options.controlPlane.issueCommand(body as unknown as IssueCommandRequest);
@@ -180,14 +202,15 @@ export const listenOperatorServer = async (
 export interface DevelopmentServerOptions {
   tls: { cert: Buffer; key: Buffer };
   controlPlane: ControlPlane;
-  phoneToken: string;
+  pairingAuthority: PairingAuthority;
   html: string;
 }
 
-export const createDevelopmentServer = (options: DevelopmentServerOptions): https.Server => {
-  const phoneToken = assertHighEntropyCredential(options.phoneToken, "phone credential");
-  const agentSource = createBrowserAgentSource({ phoneToken });
-  const server = https.createServer(options.tls, (request, response) => {
+export const createDevelopmentRequestHandler = (
+  options: Pick<DevelopmentServerOptions, "pairingAuthority" | "html">,
+): ((request: IncomingMessage, response: ServerResponse) => Promise<void>) => {
+  const agentSource = createBrowserAgentSource();
+  return async (request, response) => {
     const url = new URL(request.url ?? "/", "https://development.invalid");
     if (url.pathname === "/.local-agent.js") {
       response.writeHead(200, {
@@ -195,6 +218,37 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
         "cache-control": "no-store",
       });
       response.end(agentSource);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/.local-pair") {
+      try {
+        const body = await readJsonBody(request);
+        const identity = parsePhoneIdentity(body);
+        const paired = options.pairingAuthority.pair(
+          typeof body.pairingCode === "string" ? body.pairingCode : "",
+          identity,
+        );
+        sendJson(response, 200, paired);
+      } catch {
+        sendJson(response, 401, { error: "pairing_failed" });
+      }
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/.local-ticket") {
+      try {
+        const authorization = request.headers.authorization;
+        if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) {
+          throw new Error("missing session capability");
+        }
+        const body = await readJsonBody(request);
+        const ticket = options.pairingAuthority.issueTicket(
+          authorization.slice("Bearer ".length),
+          parsePhoneIdentity(body),
+        );
+        sendJson(response, 200, ticket);
+      } catch {
+        sendJson(response, 401, { error: "ticket_failed" });
+      }
       return;
     }
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -211,6 +265,13 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
     }
     response.writeHead(404);
     response.end();
+  };
+};
+
+export const createDevelopmentServer = (options: DevelopmentServerOptions): https.Server => {
+  const requestHandler = createDevelopmentRequestHandler(options);
+  const server = https.createServer(options.tls, (request, response) => {
+    void requestHandler(request, response);
   });
   const websocketServer = new WebSocketServer({
     noServer: true,
@@ -219,12 +280,13 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
     },
     maxPayload: 64 * 1024,
   });
+  const authenticatedIdentities = new WeakMap<WebSocket, PhoneIdentity>();
 
   server.on("upgrade", (request, socket, head) => {
     const url = new URL(request.url ?? "/", "https://development.invalid");
     const auth = authenticatePhoneProtocols(
       request.headers["sec-websocket-protocol"],
-      phoneToken,
+      (ticket) => options.pairingAuthority.consumeTicket(ticket),
     );
     if (url.pathname !== "/.local-control" || !auth.accepted) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
@@ -232,6 +294,7 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
       return;
     }
     websocketServer.handleUpgrade(request, socket, head, (websocket) => {
+      authenticatedIdentities.set(websocket, auth.identity);
       websocketServer.emit("connection", websocket, request);
     });
   });
@@ -250,6 +313,15 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
         const parsed: unknown = JSON.parse(data.toString());
         if (connectionId === undefined) {
           const hello = parseHello(parsed);
+          const authenticatedIdentity = authenticatedIdentities.get(websocket);
+          if (
+            authenticatedIdentity === undefined ||
+            authenticatedIdentity.deviceId !== hello.deviceId ||
+            authenticatedIdentity.tabId !== hello.tabId ||
+            authenticatedIdentity.documentId !== hello.documentId
+          ) {
+            throw new Error("hello identity does not match WSS ticket");
+          }
           connectionId = options.controlPlane.connect(hello, (message) => {
             if (websocket.readyState === websocket.OPEN) websocket.send(JSON.stringify(message));
           });
@@ -279,9 +351,11 @@ const parseHello = (input: unknown): PhoneIdentity => {
   if (value.schemaVersion !== CONTROL_SCHEMA_VERSION || value.type !== "hello") {
     throw new TypeError("first phone message must be a v1 hello");
   }
-  return {
-    deviceId: validateProtocolId(value.deviceId, "deviceId"),
-    tabId: validateProtocolId(value.tabId, "tabId"),
-    documentId: validateProtocolId(value.documentId, "documentId"),
-  };
+  return parsePhoneIdentity(value);
 };
+
+const parsePhoneIdentity = (value: Record<string, unknown>): PhoneIdentity => ({
+  deviceId: validateProtocolId(value.deviceId, "deviceId"),
+  tabId: validateProtocolId(value.tabId, "tabId"),
+  documentId: validateProtocolId(value.documentId, "documentId"),
+});
