@@ -33,7 +33,6 @@ import {
   BrowserOpfsStorage,
   ImmutableOpfsModelCache,
   modelCacheKey,
-  type CachedModelPackage,
   type ModelCacheStorage,
 } from "./opfs-model-cache.js";
 import {
@@ -46,6 +45,18 @@ import {
   type Qwen35Program,
   type Qwen35TensorDirectoryEntry,
 } from "./qwen35-program.js";
+import {
+  qwen35TensorWeightBytes,
+  type Qwen35PackageDirectory,
+  type Qwen35PackageSegment,
+  type Qwen35PackageTensor,
+  type Qwen35WeightDirectory,
+  type Qwen35WeightDirectoryView,
+} from "./qwen35-weight-directory.js";
+import {
+  initializeQwen35WeightExecution,
+  type Qwen35WeightWriteQueue,
+} from "./qwen35-weight-upload.js";
 import type {
   LoadOptions,
   Qwen35ExecutionDriver,
@@ -53,7 +64,6 @@ import type {
 } from "./qwen35-session.js";
 
 export const QWEN35_RUNTIME_ABI = "qwen35-webgpu-v1";
-const GPU_STORAGE_AND_COPY_DST = 0x0080 | 0x0008;
 const PINNED_LANGUAGE_SOURCE: Readonly<ImmutableArtifactIdentity> =
   Object.freeze({
     repository: "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF",
@@ -73,53 +83,25 @@ const PINNED_TOKENIZER_SOURCE: Readonly<ImmutableArtifactIdentity> =
 
 interface Qwen35OwnedDevice extends GpuArenaDevice {
   readonly lost: Promise<unknown>;
-  readonly queue: {
-    onSubmittedWorkDone(): Promise<void>;
-  };
+  readonly queue: Qwen35WeightWriteQueue;
   destroy(): void;
 }
 
-export interface Qwen35PackageSegment {
-  readonly shardIndex: number;
-  readonly shardOffset: string;
-  readonly tensorOffset: string;
-  readonly length: string;
-}
-
-export interface Qwen35PackageTensor {
-  readonly name: string;
-  readonly shape: readonly number[];
-  readonly ggmlType: number;
-  readonly storageType: string;
-  readonly segments: readonly Qwen35PackageSegment[];
-}
-
-export interface Qwen35PackageDirectory {
-  readonly manifestSha256: string;
-  readonly shards: readonly {
-    readonly index: number;
-    readonly url: string;
-    readonly offset: string;
-    readonly length: string;
-    readonly sha256: string;
-  }[];
-  readonly tensors: readonly Qwen35PackageTensor[];
-}
-
-export interface Qwen35WeightUploadInput {
-  readonly shardIndex: number;
-  readonly allocation: GpuAllocation;
-  readonly chunk: Uint8Array;
-  readonly byteOffset: number;
-  readonly signal: AbortSignal;
-}
+export type {
+  Qwen35PackageDirectory,
+  Qwen35PackageSegment,
+  Qwen35PackageTensor,
+  Qwen35WeightDirectory,
+  Qwen35WeightDirectoryView,
+} from "./qwen35-weight-directory.js";
 
 export interface Qwen35DriverFactoryContext {
   readonly profile: DeviceProfile;
   readonly program: Qwen35Program;
   readonly arena: GpuArena;
   readonly hybridState: Qwen35HybridState;
-  readonly weightAllocations: readonly GpuAllocation[];
+  /** Tensor-owned buffers; tied embedding and logits share one exact entry. */
+  readonly weightDirectory: Qwen35WeightDirectoryView;
   /** Exact immutable mapping from logical tensors to uploaded shard ranges. */
   readonly packageDirectory: Qwen35PackageDirectory;
 }
@@ -132,10 +114,6 @@ export interface Qwen35ExecutionDriverFactory {
   ): Promise<void>;
   /** A rejected create call must release any factory-private partial state. */
   create(context: Qwen35DriverFactoryContext): Promise<Qwen35ExecutionDriver>;
-  uploadWeightChunk(
-    driver: Qwen35ExecutionDriver,
-    input: Qwen35WeightUploadInput,
-  ): Promise<void>;
 }
 
 export interface Qwen35BrowserLoadOptions extends LoadOptions {
@@ -436,54 +414,6 @@ function shardSource(
   };
 }
 
-export async function streamQwen35CachedWeights(input: {
-  storage: ModelCacheStorage;
-  cached: CachedModelPackage;
-  allocations: readonly GpuAllocation[];
-  driver: Qwen35ExecutionDriver;
-  factory: Qwen35ExecutionDriverFactory;
-  uploadLaneBytes: number;
-  signal: AbortSignal;
-}): Promise<void> {
-  for (const [shardIndex, shard] of input.cached.shards.entries()) {
-    const stream = await input.storage.openRead(shard.storagePath);
-    if (stream === null) {
-      throw diagnosticError(
-        "model-cache-shard-missing",
-        "Authenticated model cache shard is unavailable",
-      );
-    }
-    let byteOffset = 0;
-    for await (const sourceChunk of stream) {
-      for (
-        let chunkOffset = 0;
-        chunkOffset < sourceChunk.byteLength;
-        chunkOffset += input.uploadLaneBytes
-      ) {
-        input.signal.throwIfAborted();
-        const chunk = sourceChunk.subarray(
-          chunkOffset,
-          Math.min(sourceChunk.byteLength, chunkOffset + input.uploadLaneBytes),
-        );
-        await input.factory.uploadWeightChunk(input.driver, {
-          shardIndex,
-          allocation: input.allocations[shardIndex]!,
-          chunk,
-          byteOffset,
-          signal: input.signal,
-        });
-        byteOffset += chunk.byteLength;
-      }
-    }
-    if (byteOffset !== shard.byteLength) {
-      throw diagnosticError(
-        "model-cache-shard-size-invalid",
-        "Authenticated model cache shard has an invalid length",
-      );
-    }
-  }
-}
-
 function destroyReverse(allocations: readonly GpuAllocation[]): unknown {
   let firstError: unknown;
   for (let index = allocations.length - 1; index >= 0; index -= 1) {
@@ -542,13 +472,9 @@ export async function cleanupQwen35GpuResources(input: {
 }
 
 export function qwen35AllocatedWeightBytes(
-  shards: readonly { readonly byteLength: number }[],
+  packageDirectory: Qwen35PackageDirectory,
 ): bigint {
-  return shards.reduce(
-    (sum, shard) =>
-      sum + ((BigInt(shard.byteLength) + 3n) / 4n) * 4n,
-    0n,
-  );
+  return qwen35TensorWeightBytes(packageDirectory);
 }
 
 const GPU_LEDGER_REPRESENTATION_GUARD = BigInt(Number.MAX_SAFE_INTEGER);
@@ -667,6 +593,7 @@ export async function loadQwen35BrowserResources(
     typeof device.createBuffer !== "function" ||
     typeof device.pushErrorScope !== "function" ||
     typeof device.popErrorScope !== "function" ||
+    typeof device.queue?.writeBuffer !== "function" ||
     typeof device.queue?.onSubmittedWorkDone !== "function" ||
     typeof device.destroy !== "function" ||
     typeof device.lost?.then !== "function"
@@ -680,7 +607,7 @@ export async function loadQwen35BrowserResources(
   const stateBytes = planQwen35HybridState(
     QWEN35_4B_CONFIG.productContextLength,
   ).totalBytes;
-  const weightBytes = qwen35AllocatedWeightBytes(cached.shards);
+  const weightBytes = qwen35AllocatedWeightBytes(packageDirectory);
   const minimumLedgerBytes = stateBytes + weightBytes;
   let ledger: AllocationLedger;
   try {
@@ -695,43 +622,35 @@ export async function loadQwen35BrowserResources(
   const arena = new GpuArena(device, ledger, {
     bufferShardCapBytes: BigInt(profile.bufferShardCapBytes),
   });
-  const weightAllocations: GpuAllocation[] = [];
+  let weightDirectory: Qwen35WeightDirectory | null = null;
   let hybridState: Qwen35HybridState | null = null;
   let driver: Qwen35ExecutionDriver | null = null;
   try {
-    for (const [index, shard] of cached.shards.entries()) {
-      weightAllocations.push(await arena.allocate({
-        id: `model-shard-${index}`,
-        category: "model",
-        byteLength: BigInt(shard.byteLength),
-        usage: GPU_STORAGE_AND_COPY_DST,
-        alignment: 4,
-        requiredShardQuantumBytes: 4n,
-      }));
-    }
     hybridState = await createQwen35HybridState({
       arena,
       capacity: QWEN35_4B_CONFIG.productContextLength,
       clearAllocation: (allocation, resource) =>
         factory.clearStateAllocation(allocation, resource),
     });
-    driver = await factory.create({
-      profile,
-      program,
+    const initialized = await initializeQwen35WeightExecution({
       arena,
-      hybridState,
-      weightAllocations: Object.freeze([...weightAllocations]),
       packageDirectory,
-    });
-    await streamQwen35CachedWeights({
       storage,
       cached,
-      allocations: weightAllocations,
-      driver,
-      factory,
+      queue: device.queue,
       uploadLaneBytes: profile.uploadLaneBytes,
       signal,
+      createDriver: (uploadedWeights) => factory.create({
+        profile,
+        program,
+        arena,
+        hybridState: hybridState!,
+        weightDirectory: uploadedWeights,
+        packageDirectory,
+      }),
     });
+    weightDirectory = initialized.directory;
+    driver = initialized.driver;
     signal.throwIfAborted();
   } catch (error) {
     try {
@@ -739,7 +658,7 @@ export async function loadQwen35BrowserResources(
         driver,
         device,
         hybridState,
-        weightAllocations,
+        weightAllocations: weightDirectory?.allocations ?? [],
         ledger,
       });
     } catch {
@@ -753,6 +672,7 @@ export async function loadQwen35BrowserResources(
 
   const ownedDriver = driver!;
   const ownedState = hybridState!;
+  const ownedWeightDirectory = weightDirectory!;
   let disposed = false;
   return {
     tokenizer,
@@ -776,7 +696,7 @@ export async function loadQwen35BrowserResources(
           driver: ownedDriver,
           device,
           hybridState: ownedState,
-          weightAllocations,
+          weightAllocations: ownedWeightDirectory.allocations,
           ledger,
         });
       } catch {

@@ -3,7 +3,7 @@ import test from "node:test";
 
 import type { GpuAllocation } from "../src/gpu-arena.js";
 import type { ModelPackageManifest } from "../src/manifest.js";
-import { modelCacheKey, type ModelCacheStorage } from "../src/opfs-model-cache.js";
+import { modelCacheKey } from "../src/opfs-model-cache.js";
 import {
   assertQwen35PackageIdentity,
   assertQwen35ConvertedPackageTrust,
@@ -14,8 +14,6 @@ import {
   loadQwen35BrowserResources,
   qwen35AllocatedWeightBytes,
   snapshotQwen35Manifest,
-  streamQwen35CachedWeights,
-  type Qwen35ExecutionDriverFactory,
 } from "../src/qwen35-model-loader.js";
 import type { Qwen35ExecutionDriver } from "../src/qwen35-session.js";
 
@@ -86,82 +84,8 @@ function pinnedManifest(): ModelPackageManifest {
   };
 }
 
-function streamingStorage(
-  chunks: readonly Uint8Array[],
-  onClose?: () => void,
-): ModelCacheStorage {
-  return {
-    async openAtomicWriter() {
-      throw new Error("not used");
-    },
-    async openRead() {
-      return (async function* () {
-        try {
-          yield* chunks;
-        } finally {
-          onClose?.();
-        }
-      })();
-    },
-    async move() {
-      return false;
-    },
-    async list() {
-      return [];
-    },
-  };
-}
-
-test("streams cached weights through bounded awaited upload lanes", async () => {
-  const uploaded: Array<{ offset: number; length: number }> = [];
-  let activeUploads = 0;
-  let peakUploads = 0;
-  const factory = {
-    async uploadWeightChunk(
-      _driver: Qwen35ExecutionDriver,
-      input: { byteOffset: number; chunk: Uint8Array },
-    ) {
-      activeUploads += 1;
-      peakUploads = Math.max(peakUploads, activeUploads);
-      uploaded.push({ offset: input.byteOffset, length: input.chunk.byteLength });
-      await Promise.resolve();
-      activeUploads -= 1;
-    },
-  } as Qwen35ExecutionDriverFactory;
-
-  await streamQwen35CachedWeights({
-    storage: streamingStorage([new Uint8Array(25)]),
-    cached: {
-      cacheKey: "a",
-      manifestSha256: "b",
-      cacheHit: false,
-      shards: [{ storagePath: "blob", byteLength: 25, sha256: "c" }],
-    },
-    allocations: [allocation],
-    driver,
-    factory,
-    uploadLaneBytes: 8,
-    signal: new AbortController().signal,
-  });
-
-  assert.deepEqual(uploaded, [
-    { offset: 0, length: 8 },
-    { offset: 8, length: 8 },
-    { offset: 16, length: 8 },
-    { offset: 24, length: 1 },
-  ]);
-  assert.equal(peakUploads, 1);
-});
-
-test("accounts for exact aligned GPU shard ownership", () => {
-  assert.equal(
-    qwen35AllocatedWeightBytes([
-      { byteLength: 1 },
-      { byteLength: 4 },
-      { byteLength: 5 },
-    ]),
-    16n,
-  );
+test("accounts for exact tensor-owned GPU bytes without package padding", () => {
+  assert.equal(qwen35AllocatedWeightBytes(buildQwen35PackageDirectory(pinnedManifest())), 288n);
 });
 
 test("default ledger accounting allows scheduler scratch while explicit budgets enforce limits", () => {
@@ -200,35 +124,6 @@ test("default ledger accounting allows scheduler scratch while explicit budgets 
     () => createQwen35GpuLedger(100n, BigInt(Number.MAX_SAFE_INTEGER) + 1n),
     { code: "gpu-ledger-limit-unsafe" },
   );
-});
-
-test("closes the cached shard stream when upload fails", async () => {
-  let closed = false;
-  const factory = {
-    async uploadWeightChunk() {
-      throw new Error("private GPU failure");
-    },
-  } as unknown as Qwen35ExecutionDriverFactory;
-
-  await assert.rejects(
-    streamQwen35CachedWeights({
-      storage: streamingStorage([new Uint8Array(25)], () => {
-        closed = true;
-      }),
-      cached: {
-        cacheKey: "a",
-        manifestSha256: "b",
-        cacheHit: false,
-        shards: [{ storagePath: "blob", byteLength: 25, sha256: "c" }],
-      },
-      allocations: [allocation],
-      driver,
-      factory,
-      uploadLaneBytes: 8,
-      signal: new AbortController().signal,
-    }),
-  );
-  assert.equal(closed, true);
 });
 
 test("builds one exact program tensor entry from segmented manifest storage", () => {
