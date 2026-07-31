@@ -124,7 +124,7 @@ export interface GgmlTypeLayout {
 }
 
 // These native GGML wire sizes are the source of truth for parser extents,
-// converter source ranges, and raw manifest coverage.
+// converter source ranges, and shape-derived manifest coverage.
 const GGML_TYPE_LAYOUTS = new Map<GgmlType, GgmlTypeLayout>([
   [GgmlType.F32, { blockElements: 1n, blockBytes: 4n }],
   [GgmlType.F16, { blockElements: 1n, blockBytes: 2n }],

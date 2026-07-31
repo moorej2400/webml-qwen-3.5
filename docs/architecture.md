@@ -10,9 +10,28 @@ code must validate this boundary before it fetches or interprets tensor bytes.
 The GGUF converter reads only bounded ranges. It inventories the source tensor
 types from the file directory, records excluded MTP tensors with a stable
 policy reason, and produces aligned shard segments without splitting
-quantization blocks. Q3_K tensors remain quantized: native 110-byte
-superblocks are reordered into 112-byte WebGPU blocks. Full tensors are not
-expanded to FP16 during conversion.
+quantization blocks. Language tensors use one of six explicit layouts:
+
+- F32: native four-byte values;
+- Q8_0: native 34-byte blocks reordered to 36 bytes;
+- Q3_K: native 110-byte blocks reordered to 112 bytes;
+- Q4_K: native, u32-aligned 144-byte blocks;
+- Q5_K: native, u32-aligned 176-byte blocks; and
+- Q6_K: native 210-byte blocks padded to 212 bytes.
+
+Q8_0 moves its signed quant bytes behind a two-byte pad. Q6_K retains native
+field order and adds trailing zero padding. These layouts keep each adjacent
+block u32-aligned without changing quantized fields. Full tensors are not
+expanded to floating-point storage during conversion or GEMV.
+
+Each correctness-first GEMV invocation owns one local row. The shader reads its
+packed block directly, reconstructs scalar values in registers, and writes to
+`outputRowOffset + localRow`. Matrix shard plans require contiguous complete
+rows, while the bound weight buffer uses a shader-local byte offset.
+
+`tools/webgpu-kernel-harness.html` is the deterministic browser validation
+surface. It compiles every language shader and compares two GPU rows per layout
+against the independent packed CPU path.
 
 ## Scope
 

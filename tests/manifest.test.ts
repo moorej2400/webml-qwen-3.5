@@ -118,6 +118,17 @@ test("rejects tensor ranges outside their shard", () => {
   );
 });
 
+test("requires explicit WebGPU tensor mappings to start on u32 boundaries", () => {
+  const manifest = validManifest();
+  manifest.shards[0]!.length = "114";
+  manifest.tensorLayout[0]!.shardOffset = "2";
+
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /shardOffset.*u32 aligned/i,
+  );
+});
+
 test("rejects duplicate tensor names unless segments have distinct offsets", () => {
   const manifest = validManifest();
   manifest.tensorLayout.push({ ...manifest.tensorLayout[0]! });
@@ -203,7 +214,7 @@ test("rejects overlapping tensor byte mappings inside a shard", () => {
     name: "output_norm.weight",
     shape: ["1"],
     ggmlType: 0,
-    storageType: "raw",
+    storageType: "f32",
     shard: 0,
     shardOffset: "0",
     tensorOffset: "0",

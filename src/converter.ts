@@ -11,11 +11,18 @@ import {
   type ImmutableArtifactIdentity,
   type ModelPackageManifest,
   type PackageKind,
+  type TensorStorageType,
 } from "./manifest.js";
+import {
+  repackNativeQ6K,
+  repackNativeQ8_0,
+} from "./mixed-quant.js";
 import { repackNativeQ3K } from "./q3k.js";
 import {
   MTP_EXCLUSION_REASON,
+  WEBGPU_LANGUAGE_TENSOR_LAYOUTS,
   isMtpTensorName,
+  type WebGpuTensorTransform,
 } from "./tensor-policy.js";
 
 export { MTP_EXCLUSION_REASON } from "./tensor-policy.js";
@@ -37,7 +44,9 @@ export interface PlannedSegment {
   readonly tensorName: string;
   readonly dimensions: readonly bigint[];
   readonly ggmlType: GgmlType;
-  readonly transform: "copy" | "q3-k-110-to-112";
+  readonly storageType: TensorStorageType;
+  readonly transform: WebGpuTensorTransform;
+  readonly blockElements: number;
   readonly shard: number;
   readonly shardOffset: bigint;
   readonly tensorOffset: bigint;
@@ -66,6 +75,8 @@ export interface RandomAccessWriter {
 interface TypeLayout {
   readonly sourceBytes: number;
   readonly outputBytes: number;
+  readonly blockElements: number;
+  readonly storageType: TensorStorageType;
   readonly transform: PlannedSegment["transform"];
 }
 
@@ -74,13 +85,13 @@ function nativeCopyLayout(type: GgmlType): TypeLayout {
   return {
     sourceBytes: Number(layout.blockBytes),
     outputBytes: Number(layout.blockBytes),
+    blockElements: Number(layout.blockElements),
+    storageType: "raw",
     transform: "copy",
   };
 }
 
-const nativeQ3K = ggmlTypeLayout(GgmlType.Q3_K);
 const TYPE_LAYOUTS = new Map<GgmlType, TypeLayout>([
-  [GgmlType.F32, nativeCopyLayout(GgmlType.F32)],
   [GgmlType.F16, nativeCopyLayout(GgmlType.F16)],
   [GgmlType.BF16, nativeCopyLayout(GgmlType.BF16)],
   [GgmlType.I8, nativeCopyLayout(GgmlType.I8)],
@@ -92,22 +103,19 @@ const TYPE_LAYOUTS = new Map<GgmlType, TypeLayout>([
   [GgmlType.Q4_1, nativeCopyLayout(GgmlType.Q4_1)],
   [GgmlType.Q5_0, nativeCopyLayout(GgmlType.Q5_0)],
   [GgmlType.Q5_1, nativeCopyLayout(GgmlType.Q5_1)],
-  [GgmlType.Q8_0, nativeCopyLayout(GgmlType.Q8_0)],
   [GgmlType.Q8_1, nativeCopyLayout(GgmlType.Q8_1)],
   [GgmlType.Q2_K, nativeCopyLayout(GgmlType.Q2_K)],
-  [
-    GgmlType.Q3_K,
-    {
-      sourceBytes: Number(nativeQ3K.blockBytes),
-      outputBytes: 112,
-      transform: "q3-k-110-to-112",
-    },
-  ],
-  [GgmlType.Q4_K, nativeCopyLayout(GgmlType.Q4_K)],
-  [GgmlType.Q5_K, nativeCopyLayout(GgmlType.Q5_K)],
-  [GgmlType.Q6_K, nativeCopyLayout(GgmlType.Q6_K)],
   [GgmlType.Q8_K, nativeCopyLayout(GgmlType.Q8_K)],
 ]);
+for (const policy of WEBGPU_LANGUAGE_TENSOR_LAYOUTS) {
+  TYPE_LAYOUTS.set(policy.ggmlType, {
+    sourceBytes: policy.sourceBlockBytes,
+    outputBytes: policy.outputBlockBytes,
+    blockElements: policy.blockElements,
+    storageType: policy.storageType,
+    transform: policy.transform,
+  });
+}
 
 function tensorLayout(tensor: GgufTensorInfo): {
   layout: TypeLayout;
@@ -242,7 +250,9 @@ export function planConversion(
         tensorName: tensor.name,
         dimensions: tensor.dimensions,
         ggmlType: tensor.type,
+        storageType: layout.storageType,
         transform: layout.transform,
+        blockElements: layout.blockElements,
         shard: shard.index,
         shardOffset: alignedOffset,
         tensorOffset: consumedBlocks * BigInt(layout.outputBytes),
@@ -280,8 +290,8 @@ export interface ExecuteConversionOptions {
 }
 
 /**
- * Executes planned byte ranges in bounded chunks. Q3_K chunks are repacked
- * block-for-block and never expanded to floating-point tensor storage.
+ * Executes planned byte ranges in bounded chunks. Quantized chunks are copied
+ * or padded block-for-block and never expanded to floating-point tensor storage.
  */
 export async function executeConversionPlan(
   plan: ConversionPlan,
@@ -339,10 +349,21 @@ export async function executeConversionPlan(
       if (source.byteLength !== sourceLength) {
         throw new Error(`Source reader returned a short read for ${segment.tensorName}`);
       }
-      const output =
-        segment.transform === "q3-k-110-to-112"
-          ? repackNativeQ3K(source)
-          : source;
+      let output: Uint8Array;
+      switch (segment.transform) {
+        case "copy":
+          output = source;
+          break;
+        case "q8-0-34-to-36":
+          output = repackNativeQ8_0(source);
+          break;
+        case "q3-k-110-to-112":
+          output = repackNativeQ3K(source);
+          break;
+        case "q6-k-210-to-212":
+          output = repackNativeQ6K(source);
+          break;
+      }
       await writer.write(
         segment.shardOffset +
           completedBlocks * BigInt(segment.outputBlockBytes),
@@ -395,15 +416,20 @@ export function createManifestFromPlan(
       name: segment.tensorName,
       shape: segment.dimensions.map(String),
       ggmlType: segment.ggmlType,
-      storageType:
-        segment.transform === "q3-k-110-to-112" ? "q3-k-112" : "raw",
+      storageType: segment.storageType,
       shard: segment.shard,
       shardOffset: segment.shardOffset.toString(),
       tensorOffset: segment.tensorOffset.toString(),
       length: segment.outputLength.toString(),
-      ...(segment.transform === "q3-k-110-to-112"
-        ? { quantization: { blockElements: 256, blockBytes: 112 } }
-        : {}),
+      ...(segment.storageType === "raw" || segment.storageType === "f32"
+        ? {}
+        : {
+            quantization: {
+              blockElements:
+                segment.blockElements,
+              blockBytes: segment.outputBlockBytes,
+            },
+          }),
     })),
     shards,
     excludedTensors: [...plan.excludedTensors],

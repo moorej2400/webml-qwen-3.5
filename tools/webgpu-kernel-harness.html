@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Qwen WebGPU kernel harness</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #111827;
+        color: #e5e7eb;
+      }
+      main {
+        max-width: 72rem;
+        margin: 3rem auto;
+        padding: 0 1.5rem;
+      }
+      pre {
+        overflow: auto;
+        padding: 1.25rem;
+        border: 1px solid #374151;
+        border-radius: 0.75rem;
+        background: #030712;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Qwen WebGPU kernel harness</h1>
+      <p>Compiles all pinned language GEMV kernels and compares GPU rows with deterministic CPU references.</p>
+      <pre id="results">Running…</pre>
+    </main>
+    <script type="module" src="./webgpu-kernel-harness.mjs"></script>
+  </body>
+</html>

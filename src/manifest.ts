@@ -5,7 +5,10 @@ import {
 } from "./gguf.js";
 import {
   MTP_EXCLUSION_REASON,
+  WEBGPU_LANGUAGE_TENSOR_LAYOUTS,
   isMtpTensorName,
+  webGpuLanguageTensorLayout,
+  type WebGpuTensorStorageType,
 } from "./tensor-policy.js";
 
 export interface ImmutableArtifactIdentity {
@@ -22,7 +25,7 @@ export interface RuntimeIdentity {
 }
 
 export type PackageKind = "language" | "vision";
-export type TensorStorageType = "raw" | "q3-k-112";
+export type TensorStorageType = "raw" | WebGpuTensorStorageType;
 
 export interface TensorLayoutEntry {
   name: string;
@@ -76,6 +79,23 @@ const MAX_SHARDS = 4_096;
 const MAX_TENSOR_SEGMENTS = 100_000;
 const MAX_EXCLUDED_TENSORS = 100_000;
 const textEncoder = new TextEncoder();
+const GGML_TYPE_NAMES = new Map<GgmlType, string>([
+  [GgmlType.F32, "F32"],
+  [GgmlType.Q8_0, "Q8_0"],
+  [GgmlType.Q3_K, "Q3_K"],
+  [GgmlType.Q4_K, "Q4_K"],
+  [GgmlType.Q5_K, "Q5_K"],
+  [GgmlType.Q6_K, "Q6_K"],
+]);
+const TENSOR_STORAGE_TYPES: ReadonlySet<TensorStorageType> = new Set([
+  "raw",
+  "f32",
+  "q8-0-36",
+  "q3-k-112",
+  "q4-k-144",
+  "q5-k-176",
+  "q6-k-212",
+]);
 
 function requireString(
   value: unknown,
@@ -265,7 +285,7 @@ export function validateModelPackageManifest(
     if (!Number.isInteger(tensor.ggmlType) || tensor.ggmlType < 0) {
       throw new Error(`tensor ${tensor.name} has an invalid GGML type`);
     }
-    if (tensor.storageType !== "raw" && tensor.storageType !== "q3-k-112") {
+    if (!TENSOR_STORAGE_TYPES.has(tensor.storageType)) {
       throw new Error(`tensor ${tensor.name} has an unsupported storage type`);
     }
     if (
@@ -300,27 +320,57 @@ export function validateModelPackageManifest(
     segments.add(segmentKey);
 
     let expectedLength: bigint;
-    if (tensor.storageType === "q3-k-112") {
-      if (tensor.ggmlType !== GgmlType.Q3_K) {
+    if (tensor.storageType !== "raw") {
+      if (shardOffset % 4n !== 0n) {
         throw new Error(
-          `tensor ${tensor.name} uses q3-k-112 storage without GGML Q3_K type`,
+          `tensor ${tensor.name} shardOffset must be u32 aligned`,
         );
       }
-      if (
-        tensor.quantization?.blockElements !== 256 ||
-        tensor.quantization.blockBytes !== 112 ||
-        tensorOffset % 112n !== 0n ||
-        length % 112n !== 0n
-      ) {
-        throw new Error(`tensor ${tensor.name} violates Q3_K block alignment`);
-      }
-      const sourceBytes = ggmlTensorByteLength(GgmlType.Q3_K, shape);
-      expectedLength =
-        (sourceBytes / ggmlTypeLayout(GgmlType.Q3_K).blockBytes) * 112n;
-    } else {
-      if (tensor.ggmlType === GgmlType.Q3_K) {
+      const policy = webGpuLanguageTensorLayout(
+        tensor.ggmlType as GgmlType,
+      );
+      if (policy?.storageType !== tensor.storageType) {
+        const expectedType = WEBGPU_LANGUAGE_TENSOR_LAYOUTS.find(
+          (candidate) => candidate.storageType === tensor.storageType,
+        )?.ggmlType;
         throw new Error(
-          `tensor ${tensor.name} with GGML Q3_K type must use q3-k-112 storage`,
+          `tensor ${tensor.name} uses ${tensor.storageType} storage without GGML ${
+            expectedType === undefined
+              ? "supported"
+              : GGML_TYPE_NAMES.get(expectedType)
+          } type`,
+        );
+      }
+      const outputBlockBytes = BigInt(policy.outputBlockBytes);
+      if (tensorOffset % outputBlockBytes !== 0n || length % outputBlockBytes !== 0n) {
+        throw new Error(
+          `tensor ${tensor.name} violates ${tensor.storageType} block alignment`,
+        );
+      }
+      if (policy.blockElements === 1) {
+        if (tensor.quantization !== undefined) {
+          throw new Error(`F32 tensor ${tensor.name} cannot declare quantization`);
+        }
+      } else if (
+        tensor.quantization?.blockElements !== policy.blockElements ||
+        tensor.quantization.blockBytes !== policy.outputBlockBytes
+      ) {
+        throw new Error(
+          `tensor ${tensor.name} has invalid ${tensor.storageType} quantization metadata`,
+        );
+      }
+      const sourceBytes = ggmlTensorByteLength(
+        tensor.ggmlType as GgmlType,
+        shape,
+      );
+      expectedLength =
+        (sourceBytes / BigInt(policy.sourceBlockBytes)) * outputBlockBytes;
+    } else {
+      if (
+        webGpuLanguageTensorLayout(tensor.ggmlType as GgmlType) !== undefined
+      ) {
+        throw new Error(
+          `tensor ${tensor.name} must use its explicit WebGPU storage layout`,
         );
       }
       if (tensor.quantization !== undefined) {

@@ -14,6 +14,10 @@ import {
 import { GgmlType, type ParsedGguf } from "../src/gguf.js";
 import { stringifyManifest, type ImmutableArtifactIdentity } from "../src/manifest.js";
 import { NATIVE_Q3_K_BLOCK_BYTES } from "../src/q3k.js";
+import {
+  NATIVE_Q6_K_BLOCK_BYTES,
+  NATIVE_Q8_0_BLOCK_BYTES,
+} from "../src/mixed-quant.js";
 import { memoryReader } from "./fixture-utils.js";
 
 const REVISION = "1".repeat(40);
@@ -69,6 +73,102 @@ test("inventories mixed source types and records explicit MTP exclusions", () =>
     },
   ]);
   assert.ok(plan.segments.every((segment) => !segment.tensorName.includes(".mtp.")));
+});
+
+test("plans and manifests every pinned language tensor layout explicitly", () => {
+  const tensors: ParsedGguf["tensors"] = [
+    { name: "a.f32", dimensions: [4n], type: GgmlType.F32, offset: 0n },
+    { name: "b.q8", dimensions: [32n], type: GgmlType.Q8_0, offset: 32n },
+    { name: "c.q3", dimensions: [256n], type: GgmlType.Q3_K, offset: 96n },
+    { name: "d.q4", dimensions: [256n], type: GgmlType.Q4_K, offset: 224n },
+    { name: "e.q5", dimensions: [256n], type: GgmlType.Q5_K, offset: 384n },
+    { name: "f.q6", dimensions: [256n], type: GgmlType.Q6_K, offset: 576n },
+  ];
+  const plan = planConversion(fixtureGguf(tensors), {
+    maxShardBytes: 4096n,
+    tensorAlignment: 16,
+  });
+
+  assert.deepEqual(
+    plan.segments.map(({ ggmlType, transform, sourceBlockBytes, outputBlockBytes }) => ({
+      ggmlType,
+      transform,
+      sourceBlockBytes,
+      outputBlockBytes,
+    })),
+    [
+      { ggmlType: GgmlType.F32, transform: "copy", sourceBlockBytes: 4, outputBlockBytes: 4 },
+      { ggmlType: GgmlType.Q8_0, transform: "q8-0-34-to-36", sourceBlockBytes: 34, outputBlockBytes: 36 },
+      { ggmlType: GgmlType.Q3_K, transform: "q3-k-110-to-112", sourceBlockBytes: 110, outputBlockBytes: 112 },
+      { ggmlType: GgmlType.Q4_K, transform: "copy", sourceBlockBytes: 144, outputBlockBytes: 144 },
+      { ggmlType: GgmlType.Q5_K, transform: "copy", sourceBlockBytes: 176, outputBlockBytes: 176 },
+      { ggmlType: GgmlType.Q6_K, transform: "q6-k-210-to-212", sourceBlockBytes: 210, outputBlockBytes: 212 },
+    ],
+  );
+
+  const identity: ImmutableArtifactIdentity = {
+    repository: "Qwen/Qwen3.5-4B",
+    revision: REVISION,
+    file: "model.gguf",
+    size: "4096",
+    sha256: SHA_A,
+  };
+  const manifest = createManifestFromPlan(plan, {
+    packageKind: "language",
+    source: identity,
+    runtimeAbi: "qwen35-webgpu-v1",
+    tokenizer: { ...identity, file: "tokenizer.json" },
+    shards: [{ url: "shards/model-00000.bin", sha256: SHA_A }],
+  });
+  assert.deepEqual(
+    manifest.tensorLayout.map(({ storageType, quantization }) => ({
+      storageType,
+      quantization: quantization ?? null,
+    })),
+    [
+      { storageType: "f32", quantization: null },
+      { storageType: "q8-0-36", quantization: { blockElements: 32, blockBytes: 36 } },
+      { storageType: "q3-k-112", quantization: { blockElements: 256, blockBytes: 112 } },
+      { storageType: "q4-k-144", quantization: { blockElements: 256, blockBytes: 144 } },
+      { storageType: "q5-k-176", quantization: { blockElements: 256, blockBytes: 176 } },
+      { storageType: "q6-k-212", quantization: { blockElements: 256, blockBytes: 212 } },
+    ],
+  );
+});
+
+test("executes padded Q8_0 and Q6_K conversion without changing native fields", async () => {
+  const tensors: ParsedGguf["tensors"] = [
+    { name: "a.q8", dimensions: [32n], type: GgmlType.Q8_0, offset: 0n },
+    { name: "b.q6", dimensions: [256n], type: GgmlType.Q6_K, offset: 64n },
+  ];
+  const parsed = { ...fixtureGguf(tensors), dataOffset: 0n };
+  const plan = planConversion(parsed, {
+    maxShardBytes: 512n,
+    tensorAlignment: 4,
+  });
+  const source = new Uint8Array(64 + NATIVE_Q6_K_BLOCK_BYTES);
+  source.set(
+    Uint8Array.from({ length: NATIVE_Q8_0_BLOCK_BYTES }, (_, index) => index),
+    0,
+  );
+  source.set(
+    Uint8Array.from({ length: NATIVE_Q6_K_BLOCK_BYTES }, (_, index) => 255 - index),
+    64,
+  );
+  const output = new Uint8Array(Number(plan.shards[0]!.length));
+  await executeConversionPlan(
+    plan,
+    memoryReader(source),
+    [{ async write(offset, bytes) { output.set(bytes, Number(offset)); } }],
+  );
+  const [q8, q6] = plan.segments;
+  const q8Bytes = output.subarray(Number(q8!.shardOffset), Number(q8!.shardOffset + q8!.outputLength));
+  assert.deepEqual(q8Bytes.subarray(0, 2), source.subarray(0, 2));
+  assert.deepEqual(q8Bytes.subarray(2, 4), Uint8Array.of(0, 0));
+  assert.deepEqual(q8Bytes.subarray(4), source.subarray(2, 34));
+  const q6Bytes = output.subarray(Number(q6!.shardOffset), Number(q6!.shardOffset + q6!.outputLength));
+  assert.deepEqual(q6Bytes.subarray(0, 210), source.subarray(64, 274));
+  assert.deepEqual(q6Bytes.subarray(210), Uint8Array.of(0, 0));
 });
 
 test("does not exclude names that only contain the letters mtp", () => {
