@@ -57,6 +57,7 @@ import {
   initializeQwen35WeightExecution,
   type Qwen35WeightWriteQueue,
 } from "./qwen35-weight-upload.js";
+import type { Qwen35WebGpuDevice } from "./qwen35-webgpu-executor.js";
 import type {
   LoadOptions,
   Qwen35ExecutionDriver,
@@ -81,11 +82,28 @@ const PINNED_TOKENIZER_SOURCE: Readonly<ImmutableArtifactIdentity> =
     sha256: "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
   });
 
-interface Qwen35OwnedDevice extends GpuArenaDevice {
+/**
+ * One loader-owned device shared by allocation, upload, execution, and cleanup.
+ * Factory contexts borrow this exact object and must never destroy it.
+ */
+export interface Qwen35ModelDevice extends Qwen35WebGpuDevice {
+  readonly features: Iterable<string>;
+  readonly limits: Qwen35WebGpuDevice["limits"] & {
+    readonly maxBufferSize: number;
+  };
+  readonly queue: Qwen35WebGpuDevice["queue"] & Qwen35WeightWriteQueue;
+  pushErrorScope(filter: "validation" | "out-of-memory"): void;
   readonly lost: Promise<unknown>;
-  readonly queue: Qwen35WeightWriteQueue;
   destroy(): void;
 }
+
+/** Non-owning device surface exposed to execution factories. */
+export type Qwen35BorrowedModelDevice = Omit<Qwen35ModelDevice, "destroy">;
+
+/** Profile view that cannot transfer device-destruction authority. */
+export type Qwen35BorrowedDeviceProfile = Omit<DeviceProfile, "device"> & {
+  readonly device: Qwen35BorrowedModelDevice;
+};
 
 export type {
   Qwen35PackageDirectory,
@@ -96,7 +114,9 @@ export type {
 } from "./qwen35-weight-directory.js";
 
 export interface Qwen35DriverFactoryContext {
-  readonly profile: DeviceProfile;
+  /** Borrowed from the loader; the factory may use but must not destroy it. */
+  readonly device: Qwen35BorrowedModelDevice;
+  readonly profile: Qwen35BorrowedDeviceProfile;
   readonly program: Qwen35Program;
   readonly arena: GpuArena;
   readonly hybridState: Qwen35HybridState;
@@ -106,14 +126,67 @@ export interface Qwen35DriverFactoryContext {
   readonly packageDirectory: Qwen35PackageDirectory;
 }
 
+export interface Qwen35StateAllocationClearContext {
+  /** Borrowed from the loader; the factory may use but must not destroy it. */
+  readonly device: Qwen35BorrowedModelDevice;
+  readonly allocation: GpuAllocation;
+  readonly resource: Qwen35HybridStateResource;
+}
+
 /** Installation point for the next model-scheduler milestone. */
 export interface Qwen35ExecutionDriverFactory {
+  clearStateAllocation(
+    context: Qwen35StateAllocationClearContext,
+  ): Promise<void>;
+  /** A rejected create call must release any factory-private partial state. */
+  create(context: Qwen35DriverFactoryContext): Promise<Qwen35ExecutionDriver>;
+}
+
+export type Qwen35DriverFactoryBoundaryContext = Omit<
+  Qwen35DriverFactoryContext,
+  "device" | "profile"
+> & {
+  readonly profile: DeviceProfile;
+};
+
+export interface Qwen35DriverFactoryBoundary {
   clearStateAllocation(
     allocation: GpuAllocation,
     resource: Qwen35HybridStateResource,
   ): Promise<void>;
-  /** A rejected create call must release any factory-private partial state. */
-  create(context: Qwen35DriverFactoryContext): Promise<Qwen35ExecutionDriver>;
+  create(
+    context: Qwen35DriverFactoryBoundaryContext,
+  ): Promise<Qwen35ExecutionDriver>;
+}
+
+/** Freezes non-owning call contexts around one exact loader-owned device. */
+export function createQwen35DriverFactoryBoundary(
+  device: Qwen35ModelDevice,
+  factory: Qwen35ExecutionDriverFactory,
+): Qwen35DriverFactoryBoundary {
+  return Object.freeze({
+    clearStateAllocation(
+      allocation: GpuAllocation,
+      resource: Qwen35HybridStateResource,
+    ) {
+      return factory.clearStateAllocation(Object.freeze({
+        device,
+        allocation,
+        resource,
+      }));
+    },
+    create(context: Qwen35DriverFactoryBoundaryContext) {
+      const borrowedProfile: Qwen35BorrowedDeviceProfile = Object.freeze({
+        ...context.profile,
+        device,
+      });
+      return factory.create(Object.freeze({
+        ...context,
+        profile: borrowedProfile,
+        device,
+      }));
+    },
+  });
 }
 
 export interface Qwen35BrowserLoadOptions extends LoadOptions {
@@ -511,6 +584,108 @@ export function createQwen35GpuLedger(
   return new AllocationLedger(limitBytes);
 }
 
+const REQUIRED_QWEN35_DEVICE_LIMITS = Object.freeze([
+  "maxBufferSize",
+  "maxStorageBufferBindingSize",
+  "minStorageBufferOffsetAlignment",
+  "minUniformBufferOffsetAlignment",
+  "maxUniformBufferBindingSize",
+  "maxComputeWorkgroupsPerDimension",
+] as const);
+
+function isIterable(value: unknown): value is Iterable<unknown> {
+  if (value === null || value === undefined) {
+    return false;
+  }
+  try {
+    return typeof (value as { [Symbol.iterator]?: unknown })[
+      Symbol.iterator
+    ] === "function";
+  } catch {
+    return false;
+  }
+}
+
+/** Validates the complete model device surface before any GPU allocation. */
+export function assertQwen35ModelDevice(
+  value: unknown,
+): asserts value is Qwen35ModelDevice {
+  if (typeof value !== "object" || value === null) {
+    throw diagnosticError(
+      "webgpu-device-incomplete",
+      "WebGPU device is missing required resource methods",
+    );
+  }
+  const device = value as Record<string, unknown>;
+  const queue = device.queue as Record<string, unknown> | null | undefined;
+  const limits = device.limits as Record<string, unknown> | null | undefined;
+  const lost = device.lost as Record<string, unknown> | null | undefined;
+  const validLimits =
+    limits !== null &&
+    limits !== undefined &&
+    REQUIRED_QWEN35_DEVICE_LIMITS.every((name) => {
+      const limit = limits[name];
+      return Number.isSafeInteger(limit) && (limit as number) > 0;
+    });
+  if (
+    !validLimits ||
+    !isIterable(device.features) ||
+    queue === null ||
+    queue === undefined ||
+    typeof queue.writeBuffer !== "function" ||
+    typeof queue.submit !== "function" ||
+    typeof queue.onSubmittedWorkDone !== "function" ||
+    typeof device.createBuffer !== "function" ||
+    typeof device.pushErrorScope !== "function" ||
+    typeof device.popErrorScope !== "function" ||
+    typeof device.createShaderModule !== "function" ||
+    typeof device.createComputePipelineAsync !== "function" ||
+    typeof device.createBindGroup !== "function" ||
+    typeof device.createCommandEncoder !== "function" ||
+    typeof device.destroy !== "function" ||
+    lost === null ||
+    lost === undefined ||
+    typeof lost.then !== "function"
+  ) {
+    throw diagnosticError(
+      "webgpu-device-incomplete",
+      "WebGPU device is missing required resource methods",
+    );
+  }
+}
+
+function destroyQwen35DeviceOrThrow(
+  value: unknown,
+  code: string,
+  message: string,
+): void {
+  const destroy = (value as { destroy?: unknown } | null)?.destroy;
+  if (typeof destroy !== "function") {
+    throw diagnosticError(code, message);
+  }
+  try {
+    destroy.call(value);
+  } catch {
+    throw diagnosticError(code, message);
+  }
+}
+
+/** Validates an acquired device and preserves cleanup failure as public state. */
+export function assertQwen35AcquiredModelDevice(
+  value: unknown,
+): asserts value is Qwen35ModelDevice {
+  try {
+    assertQwen35ModelDevice(value);
+  } catch (validationError) {
+    destroyQwen35DeviceOrThrow(
+      value,
+      "webgpu-device-rejection-cleanup-failed",
+      "Rejected WebGPU device cleanup failed",
+    );
+    throw validationError;
+  }
+}
+
 /** Builds the authenticated, GPU-owned resources for one lock-held session. */
 export async function loadQwen35BrowserResources(
   signal: AbortSignal,
@@ -586,42 +761,44 @@ export async function loadQwen35BrowserResources(
   };
   const profile = await probeDeviceProfile(
     options.webGpuSurface ?? browserSurface,
-    { requiredFeatures: ["shader-f16"] },
+    {
+      requiredFeatures: ["shader-f16"],
+      rejectedDeviceCleanup: (rejectedDevice) => {
+        destroyQwen35DeviceOrThrow(
+          rejectedDevice,
+          "webgpu-device-rejection-cleanup-failed",
+          "Rejected WebGPU device cleanup failed",
+        );
+      },
+    },
   );
-  const device = profile.device as unknown as Qwen35OwnedDevice;
-  if (
-    typeof device.createBuffer !== "function" ||
-    typeof device.pushErrorScope !== "function" ||
-    typeof device.popErrorScope !== "function" ||
-    typeof device.queue?.writeBuffer !== "function" ||
-    typeof device.queue?.onSubmittedWorkDone !== "function" ||
-    typeof device.destroy !== "function" ||
-    typeof device.lost?.then !== "function"
-  ) {
-    device.destroy?.();
-    throw diagnosticError(
-      "webgpu-device-incomplete",
-      "WebGPU device is missing required resource methods",
-    );
-  }
-  const stateBytes = planQwen35HybridState(
-    QWEN35_4B_CONFIG.productContextLength,
-  ).totalBytes;
-  const weightBytes = qwen35AllocatedWeightBytes(packageDirectory);
-  const minimumLedgerBytes = stateBytes + weightBytes;
+  const device = profile.device as unknown;
+  assertQwen35AcquiredModelDevice(device);
   let ledger: AllocationLedger;
+  let arena: GpuArena;
+  let driverBoundary: Qwen35DriverFactoryBoundary;
   try {
+    const stateBytes = planQwen35HybridState(
+      QWEN35_4B_CONFIG.productContextLength,
+    ).totalBytes;
+    const weightBytes = qwen35AllocatedWeightBytes(packageDirectory);
+    const minimumLedgerBytes = stateBytes + weightBytes;
     ledger = createQwen35GpuLedger(
       minimumLedgerBytes,
       options.gpuLedgerLimitBytes,
     );
+    arena = new GpuArena(device, ledger, {
+      bufferShardCapBytes: BigInt(profile.bufferShardCapBytes),
+    });
+    driverBoundary = createQwen35DriverFactoryBoundary(device, factory);
   } catch (error) {
-    device.destroy();
+    destroyQwen35DeviceOrThrow(
+      device,
+      "model-load-device-cleanup-failed",
+      "Model device cleanup failed during load setup",
+    );
     throw error;
   }
-  const arena = new GpuArena(device, ledger, {
-    bufferShardCapBytes: BigInt(profile.bufferShardCapBytes),
-  });
   let weightDirectory: Qwen35WeightDirectory | null = null;
   let hybridState: Qwen35HybridState | null = null;
   let driver: Qwen35ExecutionDriver | null = null;
@@ -630,7 +807,7 @@ export async function loadQwen35BrowserResources(
       arena,
       capacity: QWEN35_4B_CONFIG.productContextLength,
       clearAllocation: (allocation, resource) =>
-        factory.clearStateAllocation(allocation, resource),
+        driverBoundary.clearStateAllocation(allocation, resource),
     });
     const initialized = await initializeQwen35WeightExecution({
       arena,
@@ -640,7 +817,7 @@ export async function loadQwen35BrowserResources(
       queue: device.queue,
       uploadLaneBytes: profile.uploadLaneBytes,
       signal,
-      createDriver: (uploadedWeights) => factory.create({
+      createDriver: (uploadedWeights) => driverBoundary.create({
         profile,
         program,
         arena,

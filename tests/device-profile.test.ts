@@ -18,6 +18,7 @@ function adapterSurface(options?: {
   readonly heapLimit?: number;
 }) {
   const requests: unknown[] = [];
+  let destroyCount = 0;
   const limits = {
     maxBufferSize: options?.maxBufferSize ?? 512 * MIB,
     maxStorageBufferBindingSize:
@@ -27,6 +28,7 @@ function adapterSurface(options?: {
   };
   return {
     requests,
+    destroyCount: () => destroyCount,
     surface: {
       gpu: {
         async requestAdapter() {
@@ -55,6 +57,7 @@ function adapterSurface(options?: {
                     descriptor.requiredFeatures ??
                     [],
                 ),
+                destroy() { destroyCount += 1; },
               };
             },
           };
@@ -156,18 +159,20 @@ test("applies inverse comparison semantics to minimum alignment limits", async (
     ),
     /required WebGPU limit is unavailable/i,
   );
+  const rejectedReturnedDevice = adapterSurface({
+    minStorageBufferOffsetAlignment: 128,
+    deviceMinStorageBufferOffsetAlignment: 512,
+  });
   await assert.rejects(
     probeDeviceProfile(
-      adapterSurface({
-        minStorageBufferOffsetAlignment: 128,
-        deviceMinStorageBufferOffsetAlignment: 512,
-      }).surface,
+      rejectedReturnedDevice.surface,
       {
         requiredLimits: { minStorageBufferOffsetAlignment: 256 },
       },
     ),
     /returned WebGPU device does not satisfy required limits/i,
   );
+  assert.equal(rejectedReturnedDevice.destroyCount(), 1);
 });
 
 test("keeps missing Safari heap telemetry null and supports evidence profiles", async () => {

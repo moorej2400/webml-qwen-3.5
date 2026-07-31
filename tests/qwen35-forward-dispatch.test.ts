@@ -5,6 +5,7 @@ import { GgmlType } from "../src/gguf.js";
 import {
   planQwen35PackedEmbeddingDispatch,
   planQwen35PackedGemvDispatches,
+  planQwen35TiedLogitsGeometry,
   planQwen35TiedLogitsDispatches,
   type Qwen35ForwardDeviceLimits,
 } from "../src/qwen35-forward-dispatch.js";
@@ -346,6 +347,32 @@ test("tiles tied logits without a vocabulary-sized output buffer", () => {
       logits.at(-1)!.pieceRows - 1,
     248_069,
   );
+});
+
+test("derives tied-logits uniform capacity before buffers are allocated", () => {
+  const geometry = planQwen35TiedLogitsGeometry({
+    weights: directory([tensor({
+      name: "token_embd.weight",
+      shape: [2_560, 248_320],
+      ggmlType: GgmlType.Q4_K,
+      storageType: "q4-k-144",
+      rowBytes: 1_440,
+      splits: [1_500, 246_820],
+    })]),
+    limits,
+  });
+
+  assert.deepEqual(geometry, {
+    modelRows: 248_320,
+    decodableRows: 248_070,
+    logicalTileRows: 1_024,
+    mathematicalTileCount: 243,
+    finalTileRows: 262,
+    physicalPieceCount: 244,
+    reductionDispatchCount: 244,
+    uniformCount: 488,
+  });
+  assert.equal(Object.isFrozen(geometry), true);
 });
 
 test("reduces tied-logits tiles to the aligned device binding limit", () => {

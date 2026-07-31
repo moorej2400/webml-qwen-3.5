@@ -2,18 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { GpuAllocation } from "../src/gpu-arena.js";
+import type { Qwen35HybridStateResource } from "../src/hybrid-state.js";
 import type { ModelPackageManifest } from "../src/manifest.js";
 import { modelCacheKey } from "../src/opfs-model-cache.js";
 import {
+  assertQwen35AcquiredModelDevice,
+  assertQwen35ModelDevice,
   assertQwen35PackageIdentity,
   assertQwen35ConvertedPackageTrust,
   buildQwen35PackageDirectory,
   buildQwen35TensorDirectory,
   cleanupQwen35GpuResources,
+  createQwen35DriverFactoryBoundary,
   createQwen35GpuLedger,
   loadQwen35BrowserResources,
   qwen35AllocatedWeightBytes,
   snapshotQwen35Manifest,
+  type Qwen35DriverFactoryContext,
+  type Qwen35ModelDevice,
 } from "../src/qwen35-model-loader.js";
 import type { Qwen35ExecutionDriver } from "../src/qwen35-session.js";
 
@@ -31,6 +37,245 @@ const driver: Qwen35ExecutionDriver = {
   async reset() {},
   async dispose() {},
 };
+
+function borrowedDeviceDoesNotExposeOwnership(
+  context: Qwen35DriverFactoryContext,
+): void {
+  // @ts-expect-error The factory borrows the device and cannot destroy it.
+  context.device.destroy();
+  // @ts-expect-error The nested profile aliases the same borrowed device.
+  context.profile.device.destroy?.();
+}
+void borrowedDeviceDoesNotExposeOwnership;
+
+function completeDevice(): {
+  readonly device: Qwen35ModelDevice;
+  readonly allocationCount: () => number;
+  readonly destroyCount: () => number;
+} {
+  let allocationCount = 0;
+  let destroyCount = 0;
+  const device = {
+    features: new Set(["shader-f16"]),
+    limits: {
+      maxBufferSize: 1 << 30,
+      maxStorageBufferBindingSize: 1 << 30,
+      minStorageBufferOffsetAlignment: 256,
+      minUniformBufferOffsetAlignment: 256,
+      maxUniformBufferBindingSize: 65_536,
+      maxComputeWorkgroupsPerDimension: 65_535,
+    },
+    queue: {
+      writeBuffer() {},
+      submit() {},
+      async onSubmittedWorkDone() {},
+    },
+    pushErrorScope() {},
+    async popErrorScope() { return null; },
+    createBuffer() {
+      allocationCount += 1;
+      return { destroy() {} };
+    },
+    createShaderModule() {
+      return { async getCompilationInfo() { return { messages: [] }; } };
+    },
+    async createComputePipelineAsync() {
+      return { getBindGroupLayout() { return {}; } };
+    },
+    createBindGroup() { return {}; },
+    createCommandEncoder() {
+      return {
+        beginComputePass() {
+          return {
+            setPipeline() {},
+            setBindGroup() {},
+            dispatchWorkgroups() {},
+            end() {},
+          };
+        },
+        copyBufferToBuffer() {},
+        finish() { return {}; },
+      };
+    },
+    lost: Promise.resolve({}),
+    destroy() { destroyCount += 1; },
+  };
+  return {
+    device,
+    allocationCount: () => allocationCount,
+    destroyCount: () => destroyCount,
+  };
+}
+
+test("rejects a device missing executor methods before model allocation", () => {
+  for (const method of [
+    "createShaderModule",
+    "createComputePipelineAsync",
+    "createBindGroup",
+    "createCommandEncoder",
+  ] as const) {
+    const fake = completeDevice();
+    const incomplete = { ...fake.device } as Record<string, unknown>;
+    delete incomplete[method];
+    assert.throws(
+      () => assertQwen35ModelDevice(incomplete),
+      { code: "webgpu-device-incomplete" },
+      method,
+    );
+    assert.equal(fake.allocationCount(), 0, method);
+    assert.equal(fake.destroyCount(), 0, method);
+  }
+  const fake = completeDevice();
+  const incompleteQueue = {
+    ...fake.device,
+    queue: { ...fake.device.queue, submit: undefined },
+  };
+  assert.throws(
+    () => assertQwen35ModelDevice(incompleteQueue),
+    { code: "webgpu-device-incomplete" },
+  );
+  assert.equal(fake.allocationCount(), 0);
+  for (const method of [
+    "writeBuffer",
+    "submit",
+    "onSubmittedWorkDone",
+  ] as const) {
+    const queueFake = completeDevice();
+    const incompleteQueueMethod = {
+      ...queueFake.device,
+      queue: { ...queueFake.device.queue, [method]: undefined },
+    };
+    assert.throws(
+      () => assertQwen35ModelDevice(incompleteQueueMethod),
+      { code: "webgpu-device-incomplete" },
+      method,
+    );
+    assert.equal(queueFake.allocationCount(), 0, method);
+  }
+});
+
+test("destroys a rejected acquired device exactly once", () => {
+  const fake = completeDevice();
+  const invalid = { ...fake.device, createBuffer: undefined };
+  assert.throws(
+    () => assertQwen35AcquiredModelDevice(invalid),
+    { code: "webgpu-device-incomplete" },
+  );
+  assert.equal(fake.destroyCount(), 1);
+});
+
+test("rejects missing or unsafe executor limits before model allocation", () => {
+  for (const limit of [
+    "maxBufferSize",
+    "maxStorageBufferBindingSize",
+    "minStorageBufferOffsetAlignment",
+    "minUniformBufferOffsetAlignment",
+    "maxUniformBufferBindingSize",
+    "maxComputeWorkgroupsPerDimension",
+  ] as const) {
+    const fake = completeDevice();
+    const incomplete = {
+      ...fake.device,
+      limits: { ...fake.device.limits, [limit]: 0 },
+    };
+    assert.throws(
+      () => assertQwen35ModelDevice(incomplete),
+      { code: "webgpu-device-incomplete" },
+      limit,
+    );
+    assert.equal(fake.allocationCount(), 0, limit);
+  }
+});
+
+test("rejects a device without an iterable feature surface", () => {
+  const fake = completeDevice();
+  const incomplete = { ...fake.device, features: {} };
+
+  assert.throws(
+    () => assertQwen35ModelDevice(incomplete),
+    { code: "webgpu-device-incomplete" },
+  );
+  assert.equal(fake.allocationCount(), 0);
+  assert.equal(fake.destroyCount(), 0);
+});
+
+test("reports a sanitized error when rejected-device cleanup fails", () => {
+  const privateFailure = "private adapter identity and local path";
+  const invalidDevice = {
+    ...completeDevice().device,
+    createCommandEncoder: undefined,
+    destroy() {
+      throw new Error(privateFailure);
+    },
+  };
+
+  assert.throws(
+    () => assertQwen35AcquiredModelDevice(invalidDevice),
+    (error: unknown) => {
+      assert.equal(
+        (error as { code?: unknown }).code,
+        "webgpu-device-rejection-cleanup-failed",
+      );
+      assert.equal(
+        (error as Error).message,
+        "Rejected WebGPU device cleanup failed",
+      );
+      assert.equal((error as Error).message.includes(privateFailure), false);
+      assert.equal("cause" in (error as object), false);
+      return true;
+    },
+  );
+});
+
+test("passes one borrowed device through frozen clear and create contexts", async () => {
+  const fake = completeDevice();
+  let clearContext: Record<string, unknown> | undefined;
+  let createContext: Record<string, unknown> | undefined;
+  const boundary = createQwen35DriverFactoryBoundary(fake.device, {
+    async clearStateAllocation(context) {
+      clearContext = context as Record<string, unknown>;
+    },
+    async create(context) {
+      createContext = context as Record<string, unknown>;
+      return driver;
+    },
+  });
+  const resource = Object.freeze({
+    id: "layer-3-key",
+    layer: 3,
+    kind: "key",
+    bytes: 25n,
+  }) satisfies Qwen35HybridStateResource;
+  const createInput = Object.freeze({
+    profile: {},
+    program: {},
+    arena: {},
+    hybridState: {},
+    weightDirectory: {},
+    packageDirectory: {},
+  }) as unknown as Omit<Qwen35DriverFactoryContext, "device">;
+
+  await boundary.clearStateAllocation(allocation, resource);
+  assert.equal(await boundary.create(createInput), driver);
+
+  assert.equal(Object.isFrozen(boundary), true);
+  assert.equal(Object.isFrozen(clearContext), true);
+  assert.equal(clearContext?.device, fake.device);
+  assert.equal(clearContext?.allocation, allocation);
+  assert.equal(clearContext?.resource, resource);
+  assert.equal(Object.isFrozen(createContext), true);
+  assert.equal(createContext?.device, fake.device);
+  assert.equal(
+    (createContext?.profile as { readonly device?: unknown }).device,
+    fake.device,
+  );
+  assert.equal(Object.isFrozen(createContext?.profile), true);
+  for (const [name, value] of Object.entries(createInput)) {
+    if (name === "profile") continue;
+    assert.equal(createContext?.[name], value);
+  }
+  assert.equal(fake.destroyCount(), 0);
+});
 
 function pinnedManifest(): ModelPackageManifest {
   return {

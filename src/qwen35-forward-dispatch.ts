@@ -53,10 +53,24 @@ export interface Qwen35TiedLogitsDispatchPlan
   readonly completesTile: boolean;
 }
 
+export interface Qwen35TiedLogitsGeometry {
+  readonly modelRows: 248_320;
+  readonly decodableRows: 248_070;
+  readonly logicalTileRows: 1_024;
+  readonly mathematicalTileCount: 243;
+  readonly finalTileRows: 262;
+  readonly physicalPieceCount: number;
+  readonly reductionDispatchCount: 244;
+  readonly uniformCount: number;
+}
+
 const MAX_LOGITS_TILE_ROWS = 1_024;
 const QWEN35_HIDDEN_SIZE = 2_560;
 const QWEN35_VOCABULARY_SIZE = 248_320;
 const QWEN35_DECODABLE_LOGIT_ROWS = 248_070;
+const QWEN35_MATHEMATICAL_LOGITS_TILES = 243;
+const QWEN35_FINAL_LOGITS_TILE_ROWS = 262;
+const QWEN35_LOGITS_REDUCTION_DISPATCHES = 244;
 
 const EMBEDDING_KERNEL_SOURCES = new Map<GemvLayout, Qwen35KernelSource>(
   PACKED_EMBEDDING_KERNELS.map((kernel) => [
@@ -623,6 +637,48 @@ function gemvKernel(
   return { layout, kernel, source };
 }
 
+function tiedLogitsGeometryData(input: {
+  readonly weights: Qwen35WeightDirectoryView;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): {
+  readonly shape: { readonly columns: number; readonly rows: number };
+  readonly selected: ReturnType<typeof gemvKernel>;
+  readonly rowBytes: number;
+  readonly pieces: ReturnType<typeof logitsPieces>;
+} {
+  const tensor = requireTensor(input.weights, "token_embd.weight");
+  const shape = matrixShape(tensor);
+  requireTiedEmbeddingShape(shape);
+  const selected = gemvKernel(tensor);
+  const rowBytes = expectedRowBytes(tensor, shape.columns);
+  const views = physicalRows(tensor, shape.rows, rowBytes);
+  const pieces = logitsPieces(
+    views,
+    QWEN35_DECODABLE_LOGIT_ROWS,
+    rowBytes,
+    input.limits,
+  );
+  return { shape, selected, rowBytes, pieces };
+}
+
+/** Derives uniform capacity from physical rows before uniform allocation. */
+export function planQwen35TiedLogitsGeometry(input: {
+  readonly weights: Qwen35WeightDirectoryView;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): Qwen35TiedLogitsGeometry {
+  const data = tiedLogitsGeometryData(input);
+  return Object.freeze({
+    modelRows: QWEN35_VOCABULARY_SIZE,
+    decodableRows: QWEN35_DECODABLE_LOGIT_ROWS,
+    logicalTileRows: MAX_LOGITS_TILE_ROWS,
+    mathematicalTileCount: QWEN35_MATHEMATICAL_LOGITS_TILES,
+    finalTileRows: QWEN35_FINAL_LOGITS_TILE_ROWS,
+    physicalPieceCount: data.pieces.length,
+    reductionDispatchCount: QWEN35_LOGITS_REDUCTION_DISPATCHES,
+    uniformCount: data.pieces.length + QWEN35_LOGITS_REDUCTION_DISPATCHES,
+  });
+}
+
 /** Plans one packed GEMV request for each row-sharded physical weight buffer. */
 export function planQwen35PackedGemvDispatches(input: {
   readonly weights: Qwen35WeightDirectoryView;
@@ -726,18 +782,7 @@ export function planQwen35TiedLogitsDispatches(input: Omit<
   Parameters<typeof planQwen35PackedGemvDispatches>[0],
   "tensorName"
 >): readonly Qwen35TiedLogitsDispatchPlan[] {
-  const tensor = requireTensor(input.weights, "token_embd.weight");
-  const shape = matrixShape(tensor);
-  requireTiedEmbeddingShape(shape);
-  const selected = gemvKernel(tensor);
-  const rowBytes = expectedRowBytes(tensor, shape.columns);
-  const views = physicalRows(tensor, shape.rows, rowBytes);
-  const pieces = logitsPieces(
-    views,
-    QWEN35_DECODABLE_LOGIT_ROWS,
-    rowBytes,
-    input.limits,
-  );
+  const { shape, selected, rowBytes, pieces } = tiedLogitsGeometryData(input);
   if (input.uniforms.length !== pieces.length) {
     throw diagnosticError(
       "forward-uniform-count-invalid",

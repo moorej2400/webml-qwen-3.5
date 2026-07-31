@@ -12,6 +12,7 @@ export interface GpuLimitsLike {
 export interface GpuDeviceProfileDevice {
   readonly features: Iterable<string>;
   readonly limits: GpuLimitsLike;
+  destroy?(): void;
 }
 
 export interface GpuAdapterLike {
@@ -38,6 +39,8 @@ export interface DeviceProfileOptions {
   readonly requiredFeatures?: readonly string[];
   readonly requiredLimits?: Readonly<Record<string, number>>;
   readonly bufferShardPolicy?: BufferShardPolicy;
+  /** Releases a device when validation after requestDevice fails. */
+  readonly rejectedDeviceCleanup?: (device: GpuDeviceProfileDevice) => void;
 }
 
 export interface DeviceProfile {
@@ -170,56 +173,68 @@ export async function probeDeviceProfile(
     descriptor.requiredLimits = requiredLimits;
   }
   const device = await adapter.requestDevice(descriptor);
-
-  const enabledFeatures = new Set(device.features);
-  for (const feature of requiredFeatures) {
-    if (!enabledFeatures.has(feature)) {
-      throw new Error("Returned WebGPU device is missing a required feature");
+  try {
+    const enabledFeatures = new Set(device.features);
+    for (const feature of requiredFeatures) {
+      if (!enabledFeatures.has(feature)) {
+        throw new Error("Returned WebGPU device is missing a required feature");
+      }
     }
-  }
-  for (const [name, required] of Object.entries(requiredLimits)) {
-    const returned = requireLimitValue(device.limits, name);
-    if (!supportsRequiredLimit(returned, required, name)) {
-      throw new Error(
-        "Returned WebGPU device does not satisfy required limits",
-      );
+    for (const [name, required] of Object.entries(requiredLimits)) {
+      const returned = requireLimitValue(device.limits, name);
+      if (!supportsRequiredLimit(returned, required, name)) {
+        throw new Error(
+          "Returned WebGPU device does not satisfy required limits",
+        );
+      }
     }
+
+    // Both limits are live allocation constraints. A high maxBufferSize does not
+    // permit a storage binding that exceeds maxStorageBufferBindingSize.
+    requireLimitValue(device.limits, "maxBufferSize");
+    requireLimitValue(
+      device.limits,
+      "maxStorageBufferBindingSize",
+    );
+    const adapterFeatures = [...availableFeatures]
+      .filter((feature) => /^[a-z0-9-]+$/.test(feature))
+      .sort();
+    // Optional adapter features are not usable until requestDevice enables them.
+    const deviceFeatures = [...enabledFeatures]
+      .filter((feature) => /^[a-z0-9-]+$/.test(feature))
+      .sort();
+    const requiredLimitNames = Object.keys(requiredLimits);
+
+    return {
+      device,
+      bufferShardCapBytes:
+        BUFFER_SHARD_POLICY_BYTES[options.bufferShardPolicy ?? "default"],
+      uploadLaneBytes: DEFAULT_UPLOAD_LANE_BYTES,
+      bufferShardCapIsCapabilityCeiling: false,
+      facts: {
+        adapter: {
+          features: Object.freeze(adapterFeatures),
+          limits: sanitizedLimitFacts(adapter.limits, requiredLimitNames),
+        },
+        device: {
+          features: Object.freeze(deviceFeatures),
+          limits: sanitizedLimitFacts(device.limits, requiredLimitNames),
+        },
+        // Safari does not expose performance.memory; absence must not look like a
+        // measured zero-byte heap.
+        jsHeapLimitBytes: sanitizedHeapLimit(surface),
+      },
+    };
+  } catch (error) {
+    try {
+      if (options.rejectedDeviceCleanup !== undefined) {
+        options.rejectedDeviceCleanup(device);
+      } else {
+        device.destroy?.();
+      }
+    } catch {
+      throw new Error("Returned WebGPU device cleanup failed");
+    }
+    throw error;
   }
-
-  // Both limits are live allocation constraints. A high maxBufferSize does not
-  // permit a storage binding that exceeds maxStorageBufferBindingSize.
-  requireLimitValue(device.limits, "maxBufferSize");
-  requireLimitValue(
-    device.limits,
-    "maxStorageBufferBindingSize",
-  );
-  const adapterFeatures = [...availableFeatures]
-    .filter((feature) => /^[a-z0-9-]+$/.test(feature))
-    .sort();
-  // Optional adapter features are not usable until requestDevice enables them.
-  const deviceFeatures = [...enabledFeatures]
-    .filter((feature) => /^[a-z0-9-]+$/.test(feature))
-    .sort();
-  const requiredLimitNames = Object.keys(requiredLimits);
-
-  return {
-    device,
-    bufferShardCapBytes:
-      BUFFER_SHARD_POLICY_BYTES[options.bufferShardPolicy ?? "default"],
-    uploadLaneBytes: DEFAULT_UPLOAD_LANE_BYTES,
-    bufferShardCapIsCapabilityCeiling: false,
-    facts: {
-      adapter: {
-        features: Object.freeze(adapterFeatures),
-        limits: sanitizedLimitFacts(adapter.limits, requiredLimitNames),
-      },
-      device: {
-        features: Object.freeze(deviceFeatures),
-        limits: sanitizedLimitFacts(device.limits, requiredLimitNames),
-      },
-      // Safari does not expose performance.memory; absence must not look like a
-      // measured zero-byte heap.
-      jsHeapLimitBytes: sanitizedHeapLimit(surface),
-    },
-  };
 }
