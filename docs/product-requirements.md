@@ -29,6 +29,14 @@ limits, adapter limits, failed allocations, compiler failures, or an early
 device crash as proof that the product is impossible. They describe one tested
 design only.
 
+Rules of thumb such as a 1 GB browser-model ceiling are not product constraints.
+Prior browser implementations have already shown that larger models can run
+well when packing, residency, allocation, and scheduling are designed for the
+physical device. The working assumption is that this selected model can work
+and can achieve unusually strong performance. Experiments must discover the
+design that makes this true; they must not search for a reason to lower the
+goal.
+
 When a design fails, change one or more of these variables and test again:
 
 - tensor packing and shard layout;

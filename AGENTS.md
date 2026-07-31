@@ -41,6 +41,9 @@ reviewed and sanitized.
 
 - Treat an early device failure as evidence about the tested implementation,
   not proof that the browser target is impossible.
+- Do not use a rule of thumb such as a 1 GB browser-model ceiling as a product
+  constraint. Assume the selected model can work and can perform very well;
+  use experiments to find the required design.
 - Do not turn conventional browser guidance, reported limits, adapter limits,
   or a failed allocation into a stop condition. Change the design and measure
   the result on the physical target.
