@@ -10,6 +10,7 @@ import {
   repackNativeQ8_0,
 } from "../dist/src/mixed-quant.js";
 import { repackNativeQ3K } from "../dist/src/q3k.js";
+import { validateParity } from "./webgpu-parity.mjs";
 
 function deterministicBytes(length, seed) {
   let state = seed >>> 0;
@@ -88,9 +89,12 @@ async function runKernel(device, kernel) {
   const rows = 2;
   const columns = kernel.abi.valuesPerBlock;
   const oneRow = packedFixture(kernel.layout);
-  const packed = new Uint8Array(oneRow.byteLength * rows);
-  packed.set(oneRow, 0);
-  packed.set(oneRow, oneRow.byteLength);
+  const packedByteOffset = 32;
+  const packed = new Uint8Array(
+    packedByteOffset + oneRow.byteLength * rows,
+  );
+  packed.set(oneRow, packedByteOffset);
+  packed.set(oneRow, packedByteOffset + oneRow.byteLength);
   const activation = Float32Array.from(
     { length: columns },
     (_, index) => ((index * 17 + 3) % 29 - 14) / 16,
@@ -98,11 +102,13 @@ async function runKernel(device, kernel) {
   const expected = gemvCpu(kernel.layout, packed, activation, {
     rows,
     columns,
+    packedByteOffset,
   });
   const plan = planGemvDispatch({
     layout: kernel.layout,
     localRows: rows,
     columns,
+    packedByteOffset,
   });
 
   const pipeline = await device.createComputePipelineAsync({
@@ -130,7 +136,7 @@ async function runKernel(device, kernel) {
         rows,
         columns,
         plan.uniforms.blocksPerRow,
-        0,
+        plan.uniforms.weightWordOffset,
         0,
       ).buffer,
     ),
@@ -165,18 +171,10 @@ async function runKernel(device, kernel) {
   const actual = new Float32Array(readback.getMappedRange().slice(0));
   readback.unmap();
 
-  const tolerance = 2e-4;
-  for (let index = 0; index < rows; index += 1) {
-    const error = Math.abs(actual[index] - expected[index]);
-    if (error > tolerance * (1 + Math.abs(expected[index]))) {
-      throw new Error(
-        `${kernel.id}: row ${index} CPU ${expected[index]} GPU ${actual[index]}`,
-      );
-    }
-  }
   for (const buffer of [weights, inputs, output, uniforms, readback]) {
     buffer.destroy();
   }
+  validateParity(kernel.id, expected, actual);
   return {
     id: kernel.id,
     expected: Array.from(expected),

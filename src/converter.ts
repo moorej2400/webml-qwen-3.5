@@ -148,7 +148,7 @@ function compareText(left: string, right: string): number {
 
 /**
  * Creates a byte-range plan from the GGUF directory. Source payloads are not
- * read during planning, and every segment boundary is a complete type block.
+ * read during planning, and every segment contains complete contiguous rows.
  */
 export function planConversion(
   gguf: ParsedGguf,
@@ -211,13 +211,18 @@ export function planConversion(
   const segments: PlannedSegment[] = [];
 
   for (const { tensor, layout, blockCount } of included) {
-    if (BigInt(layout.outputBytes) > options.maxShardBytes) {
+    const rowBlocks =
+      tensor.dimensions[0]! / BigInt(layout.blockElements);
+    const rowSourceBytes = rowBlocks * BigInt(layout.sourceBytes);
+    const rowOutputBytes = rowBlocks * BigInt(layout.outputBytes);
+    if (rowOutputBytes > options.maxShardBytes) {
       throw new Error(
-        `Shard size cannot hold one ${layout.outputBytes}-byte block for ${tensor.name}`,
+        `Shard size cannot hold one complete ${rowOutputBytes}-byte row for ${tensor.name}`,
       );
     }
-    let consumedBlocks = 0n;
-    while (consumedBlocks < blockCount) {
+    const rowCount = blockCount / rowBlocks;
+    let consumedRows = 0n;
+    while (consumedRows < rowCount) {
       let shard = shards.at(-1);
       if (shard === undefined) {
         shard = { index: 0, length: 0n };
@@ -225,24 +230,25 @@ export function planConversion(
       }
       const alignedOffset = align(shard.length, options.tensorAlignment);
       const available = options.maxShardBytes - alignedOffset;
-      const fittingBlocks = available / BigInt(layout.outputBytes);
+      const fittingRows = available / rowOutputBytes;
       // A non-aligned shard limit can place alignedOffset past the limit;
       // negative BigInt division is not zero and must not create a segment.
-      if (available <= 0n || fittingBlocks <= 0n) {
+      if (available <= 0n || fittingRows <= 0n) {
         shard = { index: shards.length, length: 0n };
         shards.push(shard);
         continue;
       }
 
-      const segmentBlocks =
-        blockCount - consumedBlocks < fittingBlocks
-          ? blockCount - consumedBlocks
-          : fittingBlocks;
-      if (segmentBlocks <= 0n) {
+      const segmentRows =
+        rowCount - consumedRows < fittingRows
+          ? rowCount - consumedRows
+          : fittingRows;
+      if (segmentRows <= 0n) {
         throw new Error(`Planner produced an empty segment for ${tensor.name}`);
       }
-      const sourceLength = segmentBlocks * BigInt(layout.sourceBytes);
-      const outputLength = segmentBlocks * BigInt(layout.outputBytes);
+      const segmentBlocks = segmentRows * rowBlocks;
+      const sourceLength = segmentRows * rowSourceBytes;
+      const outputLength = segmentRows * rowOutputBytes;
       if (sourceLength <= 0n || outputLength <= 0n) {
         throw new Error(`Planner produced an empty byte range for ${tensor.name}`);
       }
@@ -255,11 +261,11 @@ export function planConversion(
         blockElements: layout.blockElements,
         shard: shard.index,
         shardOffset: alignedOffset,
-        tensorOffset: consumedBlocks * BigInt(layout.outputBytes),
+        tensorOffset: consumedRows * rowOutputBytes,
         sourceOffset:
           gguf.dataOffset +
           tensor.offset +
-          consumedBlocks * BigInt(layout.sourceBytes),
+          consumedRows * rowSourceBytes,
         sourceLength,
         outputLength,
         blockCount: segmentBlocks,
@@ -267,7 +273,7 @@ export function planConversion(
         outputBlockBytes: layout.outputBytes,
       });
       shard.length = alignedOffset + outputLength;
-      consumedBlocks += segmentBlocks;
+      consumedRows += segmentRows;
     }
   }
 

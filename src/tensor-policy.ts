@@ -2,6 +2,19 @@ import { GgmlType } from "./gguf.js";
 
 export const MTP_EXCLUSION_REASON = "excluded-by-mtp-name-policy-v1";
 
+/**
+ * Mirrors model-sources.json for the pinned Qwen language artifact. Keeping the
+ * values in the runtime policy makes block ownership available without a JSON
+ * fetch; the descriptor test prevents the two public pins from drifting.
+ */
+export const PINNED_LANGUAGE_BLOCK_POLICY = Object.freeze({
+  blockCount: 33,
+  baseBlockCount: 32,
+  excludedBlock: 32,
+});
+const PINNED_MTP_BLOCK_PREFIX =
+  `blk.${PINNED_LANGUAGE_BLOCK_POLICY.excludedBlock}`;
+
 export type WebGpuTensorStorageType =
   | "f32"
   | "q8-0-36"
@@ -90,9 +103,14 @@ export function webGpuLanguageTensorLayout(
 }
 
 /**
- * Policy v1 matches only complete MTP/nextn name segments; substring matches
- * would incorrectly exclude ordinary names such as `attempt.weight`.
+ * The pinned artifact stores MTP as the complete final block and also uses
+ * explicit MTP/nextn name segments. Anchors prevent similar base-model names
+ * such as `blk.320.*` and `attempt.weight` from being excluded.
  */
 export function isMtpTensorName(name: string): boolean {
-  return /(?:^|\.)(?:mtp|nextn)(?:\.|$)/i.test(name);
+  return (
+    name === PINNED_MTP_BLOCK_PREFIX ||
+    name.startsWith(`${PINNED_MTP_BLOCK_PREFIX}.`) ||
+    /(?:^|\.)(?:mtp|nextn)(?:\.|$)/i.test(name)
+  );
 }

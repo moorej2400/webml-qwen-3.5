@@ -18,6 +18,7 @@ import {
   NATIVE_Q6_K_BLOCK_BYTES,
   NATIVE_Q8_0_BLOCK_BYTES,
 } from "../src/mixed-quant.js";
+import { WEBGPU_LANGUAGE_TENSOR_LAYOUTS } from "../src/tensor-policy.js";
 import { memoryReader } from "./fixture-utils.js";
 
 const REVISION = "1".repeat(40);
@@ -171,7 +172,7 @@ test("executes padded Q8_0 and Q6_K conversion without changing native fields", 
   assert.deepEqual(q6Bytes.subarray(210), Uint8Array.of(0, 0));
 });
 
-test("does not exclude names that only contain the letters mtp", () => {
+test("matches only complete MTP and nextn name segments", () => {
   const parsed = fixtureGguf([
     {
       name: "attempt.weight",
@@ -179,14 +180,74 @@ test("does not exclude names that only contain the letters mtp", () => {
       type: GgmlType.F32,
       offset: 0n,
     },
+    {
+      name: "model.nextness.weight",
+      dimensions: [16n],
+      type: GgmlType.F32,
+      offset: 64n,
+    },
+    {
+      name: "mtp.output.weight",
+      dimensions: [16n],
+      type: GgmlType.F32,
+      offset: 128n,
+    },
+    {
+      name: "model.nextn.output.weight",
+      dimensions: [16n],
+      type: GgmlType.F32,
+      offset: 192n,
+    },
   ]);
 
-  assert.equal(
-    planConversion(parsed, {
-      maxShardBytes: 128n,
-      tensorAlignment: 16,
-    }).excludedTensors.length,
-    0,
+  const plan = planConversion(parsed, {
+    maxShardBytes: 128n,
+    tensorAlignment: 16,
+  });
+  assert.deepEqual(
+    plan.excludedTensors.map(({ name }) => name),
+    ["model.nextn.output.weight", "mtp.output.weight"],
+  );
+  assert.deepEqual(
+    plan.segments.map(({ tensorName }) => tensorName),
+    ["attempt.weight", "model.nextness.weight"],
+  );
+});
+
+test("excludes the pinned block 32 MTP tensors without matching similar names", () => {
+  const parsed = fixtureGguf([
+    { name: "blk.31.attn_q.weight", dimensions: [256n], type: GgmlType.Q3_K, offset: 0n },
+    { name: "blk.32.attn_q.weight", dimensions: [256n], type: GgmlType.Q3_K, offset: 128n },
+    { name: "blk.32.ffn_up.weight", dimensions: [256n], type: GgmlType.Q3_K, offset: 256n },
+    { name: "blk.32.post_attention_layernorm.weight", dimensions: [16n], type: GgmlType.F32, offset: 384n },
+    { name: "blk.320.attn_q.weight", dimensions: [256n], type: GgmlType.Q3_K, offset: 448n },
+    { name: "xblk.32.attn_q.weight", dimensions: [256n], type: GgmlType.Q3_K, offset: 576n },
+    { name: "blk.32ish.weight", dimensions: [16n], type: GgmlType.F32, offset: 704n },
+    { name: "attempt.weight", dimensions: [16n], type: GgmlType.F32, offset: 768n },
+  ]);
+
+  const plan = planConversion(parsed, {
+    maxShardBytes: 4096n,
+    tensorAlignment: 16,
+  });
+
+  assert.deepEqual(plan.excludedTensors, [
+    { name: "blk.32.attn_q.weight", reason: MTP_EXCLUSION_REASON },
+    { name: "blk.32.ffn_up.weight", reason: MTP_EXCLUSION_REASON },
+    {
+      name: "blk.32.post_attention_layernorm.weight",
+      reason: MTP_EXCLUSION_REASON,
+    },
+  ]);
+  assert.deepEqual(
+    plan.segments.map((segment) => segment.tensorName),
+    [
+      "attempt.weight",
+      "blk.31.attn_q.weight",
+      "blk.320.attn_q.weight",
+      "blk.32ish.weight",
+      "xblk.32.attn_q.weight",
+    ],
   );
 });
 
@@ -227,6 +288,88 @@ test("packs aligned shards without splitting Q3_K blocks", () => {
         blocks: 16n,
       },
     ],
+  );
+});
+
+test("segments every language layout only at complete contiguous row boundaries", () => {
+  for (const policy of WEBGPU_LANGUAGE_TENSOR_LAYOUTS) {
+    const rowBlocks = 2;
+    const rows = 5;
+    const rowBytes = BigInt(policy.outputBlockBytes * rowBlocks);
+    const plan = planConversion(
+      fixtureGguf([
+        {
+          name: `matrix.${policy.storageType}`,
+          dimensions: [BigInt(policy.blockElements * rowBlocks), BigInt(rows)],
+          type: policy.ggmlType,
+          offset: 0n,
+        },
+      ]),
+      {
+        // The extra bytes deliberately do not fit another complete row.
+        maxShardBytes:
+          rowBytes * 2n + BigInt(policy.outputBlockBytes) + 3n,
+        tensorAlignment: 16,
+      },
+    );
+
+    assert.equal(plan.segments.length, 3, policy.storageType);
+    assert.ok(
+      plan.segments.every(
+        (segment) =>
+          segment.outputLength % rowBytes === 0n &&
+          segment.tensorOffset % rowBytes === 0n &&
+          segment.blockCount % BigInt(rowBlocks) === 0n,
+      ),
+      policy.storageType,
+    );
+  }
+});
+
+test("keeps full-vocabulary-style matrix segments on complete rows", () => {
+  const columns = 2560n;
+  const rows = 248_320n;
+  const rowBytes = (columns / 256n) * 112n;
+  const plan = planConversion(
+    fixtureGguf([
+      {
+        name: "output.weight",
+        dimensions: [columns, rows],
+        type: GgmlType.Q3_K,
+        offset: 0n,
+      },
+    ]),
+    {
+      maxShardBytes: 128n * 1024n * 1024n + 37n,
+      tensorAlignment: 256,
+    },
+  );
+
+  assert.ok(plan.segments.length > 1);
+  assert.ok(
+    plan.segments.every(
+      (segment) =>
+        segment.outputLength % rowBytes === 0n &&
+        segment.tensorOffset % rowBytes === 0n,
+    ),
+  );
+});
+
+test("rejects a shard limit that cannot hold one complete matrix row", () => {
+  assert.throws(
+    () =>
+      planConversion(
+        fixtureGguf([
+          {
+            name: "matrix.weight",
+            dimensions: [512n, 2n],
+            type: GgmlType.Q3_K,
+            offset: 0n,
+          },
+        ]),
+        { maxShardBytes: 223n, tensorAlignment: 16 },
+      ),
+    /cannot hold one complete.*row/i,
   );
 });
 
@@ -316,7 +459,7 @@ test("emits a valid deterministic manifest from planned shards", () => {
   assert.equal(manifest.shards[1]!.offset, "224");
 });
 
-test("rejects unsupported tensor types and shard sizes that cannot hold one block", () => {
+test("rejects unsupported tensor types and shards that cannot hold one row", () => {
   const unsupported = fixtureGguf([
     {
       name: "bad.weight",
@@ -340,7 +483,7 @@ test("rejects unsupported tensor types and shard sizes that cannot hold one bloc
         maxShardBytes: 111n,
         tensorAlignment: 16,
       }),
-    /cannot hold.*block/i,
+    /cannot hold.*row/i,
   );
 });
 

@@ -169,11 +169,11 @@ test("plans safe row-aware offsets and complete matrix shard coverage", () => {
       layout: kernel.layout,
       localRows: 3,
       columns,
-      packedByteOffset: kernel.abi.bytesPerBlock,
+      packedByteOffset: 32,
       outputRowOffset: 7,
     });
     assert.deepEqual(dispatch.workgroups, { x: 3, y: 1, z: 1 });
-    assert.equal(dispatch.uniforms.weightWordOffset, kernel.abi.bytesPerBlock / 4);
+    assert.equal(dispatch.uniforms.weightWordOffset, 8);
     assert.equal(dispatch.uniforms.outputRowOffset, 7);
 
     const shards = planMatrixShardDispatch({
@@ -187,6 +187,28 @@ test("plans safe row-aware offsets and complete matrix shard coverage", () => {
     });
     assert.deepEqual(shards.map((item) => item.uniforms.localRows), [1, 3]);
     assert.deepEqual(shards.map((item) => item.uniforms.outputRowOffset), [0, 1]);
+  }
+});
+
+test("reads matrices from a u32-aligned non-block-multiple shard offset", () => {
+  for (const kernel of LANGUAGE_GEMV_KERNELS) {
+    const fixture = packedFixture(kernel.layout);
+    const activation = Float32Array.from(
+      { length: fixture.values.length },
+      (_, index) => (index % 5) - 2,
+    );
+    const prefixed = new Uint8Array(32 + fixture.packed.length);
+    prefixed.set(fixture.packed, 32);
+
+    assert.deepEqual(
+      gemvCpu(kernel.layout, prefixed, activation, {
+        rows: 1,
+        columns: activation.length,
+        packedByteOffset: 32,
+      }),
+      Float32Array.of(dot(fixture.values, activation)),
+      kernel.layout,
+    );
   }
 });
 
@@ -225,9 +247,9 @@ test("rejects unsupported and mismatched type/layout or unsafe shapes", () => {
         layout: "q6-k-212",
         localRows: 1,
         columns: 256,
-        packedByteOffset: 4,
+        packedByteOffset: 2,
       }),
-    /212-byte block/i,
+    /u32 aligned/i,
   );
   assert.throws(
     () =>

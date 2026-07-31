@@ -366,6 +366,33 @@ test("enforces the version-one MTP exclusion name and reason policy", () => {
   );
 });
 
+test("accepts pinned block 32 exclusions and rejects block-like substrings", () => {
+  const manifest = validManifest();
+  manifest.excludedTensors = [
+    { name: "blk.32.attn_q.weight", reason: "excluded-by-mtp-name-policy-v1" },
+    { name: "blk.32.ffn_up.weight", reason: "excluded-by-mtp-name-policy-v1" },
+    {
+      name: "blk.32.post_attention_layernorm.weight",
+      reason: "excluded-by-mtp-name-policy-v1",
+    },
+  ];
+  assert.doesNotThrow(() => validateModelPackageManifest(manifest));
+
+  for (const name of [
+    "blk.31.attn_q.weight",
+    "blk.320.attn_q.weight",
+    "xblk.32.attn_q.weight",
+    "blk.32ish.weight",
+  ]) {
+    const invalid = validManifest();
+    invalid.excludedTensors[0]!.name = name;
+    assert.throws(
+      () => validateModelPackageManifest(invalid),
+      /does not match.*MTP.*policy/i,
+    );
+  }
+});
+
 test("requires included and excluded tensor names to be disjoint", () => {
   const manifest = validManifest();
   manifest.tensorLayout[0]!.name = "model.mtp.output.weight";

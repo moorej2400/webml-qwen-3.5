@@ -399,11 +399,8 @@ export function planGemvDispatch(input: {
   if (packedByteOffset % 4 !== 0) {
     throw new Error("GEMV packed byte offset must be u32 aligned");
   }
-  if (packedByteOffset % kernel.abi.bytesPerBlock !== 0) {
-    throw new Error(
-      `GEMV packed byte offset must begin on a ${kernel.abi.bytesPerBlock}-byte block`,
-    );
-  }
+  // Shard placement aligns tensor starts to u32, not to each quant block size.
+  // Block indexing is relative to this base word inside the bound shard.
   const outputRowOffset = input.outputRowOffset ?? 0;
   requireU32(outputRowOffset, "GEMV output row offset", true);
   if (BigInt(outputRowOffset) + BigInt(input.localRows) > 0x1_0000_0000n) {

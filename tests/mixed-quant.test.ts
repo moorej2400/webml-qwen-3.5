@@ -45,6 +45,17 @@ function half(view: DataView, offset: number, value: number): void {
   view.setUint16(offset, known.get(value)!, true);
 }
 
+function independentHalf(bits: number): number {
+  const sign = (bits & 0x8000) === 0 ? 1 : -1;
+  const exponent = (bits >>> 10) & 31;
+  const fraction = bits & 1023;
+  if (exponent === 0) return sign * fraction * 2 ** -24;
+  if (exponent === 31) {
+    return fraction === 0 ? sign * Infinity : Number.NaN;
+  }
+  return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
+}
+
 function scaleMin(scales: Uint8Array, group: number): [number, number] {
   if (group < 4) {
     return [scales[group]! & 63, scales[group + 4]! & 63];
@@ -57,8 +68,8 @@ function scaleMin(scales: Uint8Array, group: number): [number, number] {
 
 function independentQ4(native: Uint8Array): Float32Array {
   const view = new DataView(native.buffer, native.byteOffset);
-  const d = view.getUint16(0, true) === 0x3c00 ? 1 : Number.NaN;
-  const dmin = view.getUint16(2, true) === 0x4000 ? 2 : Number.NaN;
+  const d = independentHalf(view.getUint16(0, true));
+  const dmin = independentHalf(view.getUint16(2, true));
   const scales = native.subarray(4, 16);
   const qs = native.subarray(16);
   const output = new Float32Array(256);
@@ -76,6 +87,9 @@ function independentQ4(native: Uint8Array): Float32Array {
 }
 
 function independentQ5(native: Uint8Array): Float32Array {
+  const delta = independentHalf(
+    new DataView(native.buffer, native.byteOffset).getUint16(0, true),
+  );
   const qh = native.subarray(16, 48);
   const lowOnly = new Uint8Array(NATIVE_Q4_K_BLOCK_BYTES);
   lowOnly.set(native.subarray(0, 16), 0);
@@ -89,9 +103,11 @@ function independentQ5(native: Uint8Array): Float32Array {
     const highMask = 1 << (chunk * 2 + 1);
     for (let lane = 0; lane < 32; lane += 1) {
       const high = qh[lane]!;
-      if ((high & lowMask) !== 0) output[chunk * 64 + lane]! += 16 * s0;
+      if ((high & lowMask) !== 0) {
+        output[chunk * 64 + lane]! += delta * 16 * s0;
+      }
       if ((high & highMask) !== 0) {
-        output[chunk * 64 + lane + 32]! += 16 * s1;
+        output[chunk * 64 + lane + 32]! += delta * 16 * s1;
       }
     }
   }
@@ -99,6 +115,9 @@ function independentQ5(native: Uint8Array): Float32Array {
 }
 
 function independentQ6(native: Uint8Array): Float32Array {
+  const delta = independentHalf(
+    new DataView(native.buffer, native.byteOffset).getUint16(208, true),
+  );
   const ql = native.subarray(0, 128);
   const qh = native.subarray(128, 192);
   const scales = new Int8Array(
@@ -115,14 +134,19 @@ function independentQ6(native: Uint8Array): Float32Array {
       const base = halfIndex * 128;
       const scaleBase = halfIndex * 8 + Math.floor(lane / 16);
       output[base + lane] =
-        scales[scaleBase]! * (((low0 & 15) | ((high & 3) << 4)) - 32);
+        delta *
+        scales[scaleBase]! *
+        (((low0 & 15) | ((high & 3) << 4)) - 32);
       output[base + lane + 32] =
+        delta *
         scales[scaleBase + 2]! *
         (((low1 & 15) | (((high >>> 2) & 3) << 4)) - 32);
       output[base + lane + 64] =
+        delta *
         scales[scaleBase + 4]! *
         (((low0 >>> 4) | (((high >>> 4) & 3) << 4)) - 32);
       output[base + lane + 96] =
+        delta *
         scales[scaleBase + 6]! *
         (((low1 >>> 4) | (((high >>> 6) & 3) << 4)) - 32);
     }
@@ -195,14 +219,14 @@ test("matches independent Q4_K and Q5_K vectors with scale, min, and high bits",
   assert.deepEqual(dequantizeQ4KBlock(unpackNativeQ4KBlock(q4)), independentQ4(q4));
 
   const q5 = deterministicNative(NATIVE_Q5_K_BLOCK_BYTES, 47);
-  half(new DataView(q5.buffer), 0, 1);
+  half(new DataView(q5.buffer), 0, 0.5);
   half(new DataView(q5.buffer), 2, 2);
   assert.deepEqual(dequantizeQ5KBlock(unpackNativeQ5KBlock(q5)), independentQ5(q5));
 });
 
 test("matches independent Q6_K sign planes and Q8_0 signed bytes", () => {
   const q6 = deterministicNative(NATIVE_Q6_K_BLOCK_BYTES, 53);
-  half(new DataView(q6.buffer), 208, 1);
+  half(new DataView(q6.buffer), 208, 2);
   assert.deepEqual(dequantizeQ6KBlock(unpackNativeQ6KBlock(q6)), independentQ6(q6));
 
   const q8 = deterministicNative(NATIVE_Q8_0_BLOCK_BYTES, 59);

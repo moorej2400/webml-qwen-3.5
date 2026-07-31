@@ -10,8 +10,8 @@ foundation and mixed-quant compute layer:
 
 - a bounded, random-access GGUF v3 directory parser;
 - a versioned and validated browser package manifest;
-- deterministic, streaming shard planning with an explicit MTP exclusion
-  policy;
+- deterministic, streaming complete-row shard planning with a pinned MTP
+  exclusion policy;
 - explicit F32, Q8_0, Q3_K, Q4_K, Q5_K, and Q6_K WebGPU layouts;
 - exact block repacking without full-tensor dequantization;
 - direct packed-weight GEMV kernels with row-aware shard dispatch;

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { PINNED_LANGUAGE_BLOCK_POLICY } from "../src/tensor-policy.js";
 
 test("pins the public source identities and inspected language inventory", async () => {
   const descriptor = JSON.parse(
@@ -43,5 +44,10 @@ test("pins the public source identities and inspected language inventory", async
     file: "mmproj-Qwen_Qwen3.5-4B-bf16.gguf",
     size: 675569216,
     sha256: "463f39bd1c291c1186c319a8c90ff8640aafa678b14cbee2232d695113dfbb66",
+  });
+  assert.deepEqual(PINNED_LANGUAGE_BLOCK_POLICY, {
+    blockCount: descriptor.language.blockCount,
+    baseBlockCount: descriptor.language.excludedBlock,
+    excludedBlock: descriptor.language.excludedBlock,
   });
 });
