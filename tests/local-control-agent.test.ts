@@ -159,3 +159,34 @@ test("getState requires a handler and returns only bounded sanitized state", asy
   assert.deepEqual(completed.result, { modelState: "loaded", contextTokens: 512 });
   assert.ok(Buffer.byteLength(JSON.stringify(completed.result)) <= 8_192);
 });
+
+test("outbox overflow does not consume the next event sequence", async () => {
+  const platform = createPlatform();
+  const agent = new PhoneAgentRuntime({
+    identity: {
+      deviceId: "device_0123456789abcdef",
+      tabId: "tab_0123456789abcdef",
+      documentId: "document_0123456789abcdef",
+    },
+    platform,
+    handlers: {},
+    outboxLimit: 1,
+  });
+
+  agent.reportReady();
+  assert.throws(() => agent.reportTelemetry({ name: "overflow" }), /outbox.*limit/i);
+  await agent.receive({
+    schemaVersion: 1,
+    type: "eventAck",
+    documentId: "document_0123456789abcdef",
+    status: "accepted",
+    acknowledgedSeq: 1,
+    expectedSeq: 2,
+  });
+  agent.reportTelemetry({ name: "after_ack" });
+
+  assert.deepEqual(
+    platform.sent.map((message) => (message as { eventSeq: number }).eventSeq),
+    [1, 2],
+  );
+});

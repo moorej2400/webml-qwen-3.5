@@ -52,7 +52,7 @@ export const classifyDisconnect = (
 interface Connection {
   connectionId: string;
   identity: PhoneIdentity;
-  send: (message: ServerToPhoneMessage) => void;
+  send: (message: ServerToPhoneMessage) => boolean;
   lastEvidence?: DisconnectEvidence;
 }
 
@@ -148,7 +148,7 @@ export class ControlPlane {
       }
     }
 
-    send({
+    this.#tryQueue(connection, {
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "sequenceSync",
       documentId: identity.documentId,
@@ -158,13 +158,11 @@ export class ControlPlane {
     const commands = [...this.#commands.values()]
       .filter((stored) => tabKey(stored.target) === key)
       .map((stored) => stored.tracker.snapshot());
-    send({ schemaVersion: CONTROL_SCHEMA_VERSION, type: "reconcile", commands });
+    this.#tryQueue(connection, { schemaVersion: CONTROL_SCHEMA_VERSION, type: "reconcile", commands });
 
     for (const stored of this.#commands.values()) {
       if (tabKey(stored.target) === key && !stored.dispatched) {
-        send(stored.message);
-        stored.dispatched = true;
-        stored.originalDocumentId = identity.documentId;
+        this.#attemptDispatch(stored, connection);
       }
     }
     return connectionId;
@@ -208,6 +206,9 @@ export class ControlPlane {
         existing.target.tabId === tabId &&
         JSON.stringify(existing.message.payload ?? null) === JSON.stringify(request.payload ?? null);
       if (!same) throw new Error("commandId is already assigned to different work");
+      if (!existing.dispatched && !isTerminal(existing.tracker.snapshot().state)) {
+        this.#attemptDispatch(existing);
+      }
       return existing.tracker.snapshot();
     }
 
@@ -229,19 +230,15 @@ export class ControlPlane {
       ...(request.payload === undefined ? {} : { payload: structuredClone(request.payload) }),
     };
     const target = { deviceId, tabId };
-    const connectionId = this.#connectionByTab.get(tabKey(target));
-    const connection = connectionId === undefined ? undefined : this.#connections.get(connectionId);
     const stored: StoredCommand = {
       tracker,
       target,
       message,
-      dispatched: connection !== undefined,
-      ...(connection === undefined ? {} : { originalDocumentId: connection.identity.documentId }),
+      dispatched: false,
     };
     // Publish tracker ownership before transport delivery because in-memory
     // tests and future local transports can synchronously acknowledge a send.
     this.#commands.set(commandId, stored);
-    if (connection !== undefined) connection.send(message);
 
     const timeoutMs = isReload(request.command) ? this.#reloadTimeoutMs : this.#commandTimeoutMs;
     stored.timer = this.#clock.setTimeout(() => {
@@ -256,7 +253,30 @@ export class ControlPlane {
         this.#promoteSuspectedCrash(target, "command_timeout");
       }
     }, timeoutMs);
+    this.#attemptDispatch(stored);
     return tracker.snapshot();
+  }
+
+  #tryQueue(connection: Connection, message: ServerToPhoneMessage): boolean {
+    try {
+      return connection.send(message);
+    } catch {
+      return false;
+    }
+  }
+
+  #attemptDispatch(stored: StoredCommand, connection?: Connection): boolean {
+    if (stored.dispatched) return true;
+    if (isTerminal(stored.tracker.snapshot().state)) return false;
+    const selected = connection ?? (() => {
+      const connectionId = this.#connectionByTab.get(tabKey(stored.target));
+      return connectionId === undefined ? undefined : this.#connections.get(connectionId);
+    })();
+    if (selected === undefined || tabKey(selected.identity) !== tabKey(stored.target)) return false;
+    if (!this.#tryQueue(selected, stored.message)) return false;
+    stored.dispatched = true;
+    stored.originalDocumentId = selected.identity.documentId;
+    return true;
   }
 
   receive(connectionId: string, input: unknown): SequenceResult {

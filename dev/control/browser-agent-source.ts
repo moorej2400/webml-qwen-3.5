@@ -75,15 +75,17 @@ export const createBrowserAgentSource = (): string => `(() => {
   };
   const send = (message) => {
     if (outbox.size >= OUTBOX_LIMIT) throw new Error("control_outbox_limit");
+    const eventSeq = sequence + 1;
     const frame = {
       schemaVersion: VERSION,
       ...identity(),
-      eventSeq: ++sequence,
+      eventSeq,
       ...message
     };
     // Retain ownership before transport delivery so reconnect and synchronous
     // test transports cannot lose an unacknowledged state transition.
-    outbox.set(frame.eventSeq, frame);
+    outbox.set(eventSeq, frame);
+    sequence = eventSeq;
     sendFrame(frame);
   };
   const replayFrom = (expectedSeq) => {

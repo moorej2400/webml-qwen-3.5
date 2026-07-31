@@ -29,11 +29,21 @@ test("injected browser agent retains and replays bounded unacknowledged events",
   const source = createBrowserAgentSource();
 
   assert.match(source, /const OUTBOX_LIMIT = 256/);
-  assert.match(source, /outbox\.set\(frame\.eventSeq, frame\)/);
+  assert.match(source, /outbox\.set\(eventSeq, frame\)/);
   assert.match(source, /message\.type === "eventAck"/);
   assert.match(source, /message\.type === "sequenceSync"/);
   assert.match(source, /replayFrom\(message\.expectedSeq\)/);
   assert.match(source, /resendState\(command\.commandId, local\)/);
+  const candidate = source.indexOf("const eventSeq = sequence + 1");
+  const retained = source.indexOf("outbox.set(eventSeq, frame)");
+  const committed = source.indexOf("sequence = eventSeq");
+  const transmitted = source.indexOf("sendFrame(frame)", committed);
+  assert.ok(
+    candidate >= 0 &&
+      candidate < retained &&
+      retained < committed &&
+      committed < transmitted,
+  );
 });
 
 test("pairing code is one-time and creates a short-lived session capability", () => {

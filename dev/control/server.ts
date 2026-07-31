@@ -323,7 +323,9 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
             throw new Error("hello identity does not match WSS ticket");
           }
           connectionId = options.controlPlane.connect(hello, (message) => {
-            if (websocket.readyState === websocket.OPEN) websocket.send(JSON.stringify(message));
+            if (websocket.readyState !== websocket.OPEN) return false;
+            websocket.send(JSON.stringify(message));
+            return true;
           });
           return;
         }

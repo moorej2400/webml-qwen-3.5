@@ -51,7 +51,10 @@ const connect = (
   currentIdentity: PhoneIdentity,
 ): { sent: ServerToPhoneMessage[]; connectionId: string } => {
   const sent: ServerToPhoneMessage[] = [];
-  const connectionId = plane.connect(currentIdentity, (message) => sent.push(message));
+  const connectionId = plane.connect(currentIdentity, (message) => {
+    sent.push(message);
+    return true;
+  });
   return { sent, connectionId };
 };
 
@@ -84,6 +87,138 @@ test("retrying a command id never sends runPrompt twice", () => {
 
   assert.equal(first.commandId, retry.commandId);
   assert.equal(phone.sent.filter((message) => message.type === "command").length, 1);
+});
+
+test("throwing command transport retains retry and timeout ownership", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, commandTimeoutMs: 500 });
+  let throwing = true;
+  let deliveries = 0;
+  plane.connect(identity("document_0123456789abcdef"), (message) => {
+    if (message.type === "command") {
+      if (throwing) throw new Error("transport queue failed");
+      deliveries += 1;
+    }
+    return true;
+  });
+  const request = {
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt" as const,
+  };
+
+  assert.doesNotThrow(() => plane.issueCommand(request));
+  throwing = false;
+  plane.issueCommand(request);
+  plane.issueCommand(request);
+  assert.equal(deliveries, 1);
+
+  clock.advance(500);
+  assert.equal(plane.getCommand(request.commandId)?.state, "timed_out");
+});
+
+test("closed transport reports failed queueing and later retry dispatches once", () => {
+  const plane = new ControlPlane({ clock: new FakeClock() });
+  let open = false;
+  let deliveries = 0;
+  plane.connect(identity("document_0123456789abcdef"), (message) => {
+    if (message.type !== "command") return true;
+    if (!open) return false;
+    deliveries += 1;
+    return true;
+  });
+  const request = {
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt" as const,
+  };
+
+  plane.issueCommand(request);
+  plane.issueCommand(request);
+  assert.equal(deliveries, 0);
+  open = true;
+  plane.issueCommand(request);
+  plane.issueCommand(request);
+  assert.equal(deliveries, 1);
+});
+
+test("undispatched command is sent once by a later connection", () => {
+  const plane = new ControlPlane({ clock: new FakeClock() });
+  const first = plane.connect(identity("document_0123456789abcdef"), (message) => {
+    if (message.type === "command") throw new Error("transport queue failed");
+    return true;
+  });
+  const request = {
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt" as const,
+  };
+  plane.issueCommand(request);
+  plane.disconnect(first, { kind: "socket_loss" });
+  let deliveries = 0;
+  plane.connect(identity("document_0123456789abcdef"), (message) => {
+    if (message.type === "command") deliveries += 1;
+    return true;
+  });
+
+  assert.equal(deliveries, 1);
+  plane.issueCommand(request);
+  assert.equal(deliveries, 1);
+});
+
+test("timed-out undispatched command is not sent by a later connection", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, commandTimeoutMs: 500 });
+  const first = plane.connect(identity("document_0123456789abcdef"), () => false);
+  plane.issueCommand({
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt",
+  });
+  clock.advance(500);
+  plane.disconnect(first, { kind: "socket_loss" });
+  let deliveries = 0;
+  plane.connect(identity("document_0123456789abcdef"), (message) => {
+    if (message.type === "command") deliveries += 1;
+    return true;
+  });
+
+  assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "timed_out");
+  assert.equal(deliveries, 0);
+});
+
+test("successful reentrant acknowledgement sees command ownership", () => {
+  const plane = new ControlPlane({ clock: new FakeClock() });
+  let connectionId = "";
+  let commandDeliveries = 0;
+  connectionId = plane.connect(identity("document_0123456789abcdef"), (message) => {
+    if (message.type === "command") {
+      commandDeliveries += 1;
+      plane.receive(connectionId, {
+        schemaVersion: 1,
+        type: "commandState",
+        ...identity("document_0123456789abcdef"),
+        eventSeq: 1,
+        commandId: message.commandId,
+        state: "accepted",
+      });
+    }
+    return true;
+  });
+
+  const snapshot = plane.issueCommand({
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt",
+  });
+
+  assert.equal(snapshot.state, "accepted");
+  assert.equal(commandDeliveries, 1);
 });
 
 test("same-document reconnect reconciles command state without reissuing work", () => {

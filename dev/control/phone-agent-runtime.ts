@@ -123,7 +123,7 @@ export class PhoneAgentRuntime {
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "ready",
       ...this.#identity,
-      eventSeq: ++this.#eventSeq,
+      eventSeq: this.#eventSeq + 1,
     });
   }
 
@@ -132,7 +132,7 @@ export class PhoneAgentRuntime {
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "telemetry",
       ...this.#identity,
-      eventSeq: ++this.#eventSeq,
+      eventSeq: this.#eventSeq + 1,
       event,
     });
   }
@@ -161,7 +161,7 @@ export class PhoneAgentRuntime {
       schemaVersion: CONTROL_SCHEMA_VERSION,
       type: "commandState",
       ...this.#identity,
-      eventSeq: ++this.#eventSeq,
+      eventSeq: this.#eventSeq + 1,
       commandId,
       state,
       ...(reason === undefined ? {} : { reason }),
@@ -171,6 +171,7 @@ export class PhoneAgentRuntime {
 
   #emit(message: Parameters<PhoneEventOutbox["enqueue"]>[0]): void {
     this.#outbox.enqueue(message);
+    this.#eventSeq = message.eventSeq;
     this.#platform.send(message);
   }
 

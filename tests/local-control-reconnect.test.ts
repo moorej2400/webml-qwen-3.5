@@ -76,15 +76,16 @@ test("lost state frame is replayed after reconnect and prompt runs exactly once"
   let running: Promise<void> | undefined;
   let connecting = false;
   const queuedServerMessages: ServerToPhoneMessage[] = [];
-  const deliverServer = (message: ServerToPhoneMessage): void => {
+  const deliverServer = (message: ServerToPhoneMessage): boolean => {
     // A WebSocket cannot deliver a phone reply re-entrantly before connect()
     // returns the server-side connection identity.
     if (agent === undefined || connecting) {
       queuedServerMessages.push(message);
-      return;
+      return true;
     }
     const delivery = agent.receive(message);
     if (message.type === "command") running = delivery;
+    return true;
   };
   const platform: AgentPlatform = {
     send(message) {

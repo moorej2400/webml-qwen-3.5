@@ -141,7 +141,7 @@ test("operator command query returns sanitized getState result", async () => {
     tabId: "tab_0123456789abcdef",
     documentId: "document_0123456789abcdef",
   };
-  const connectionId = plane.connect(phoneIdentity, () => undefined);
+  const connectionId = plane.connect(phoneIdentity, () => true);
   plane.issueCommand({
     deviceId: phoneIdentity.deviceId,
     tabId: phoneIdentity.tabId,
