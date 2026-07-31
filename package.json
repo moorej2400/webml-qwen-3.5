@@ -13,6 +13,7 @@
     "build": "tsc",
     "build:public": "node tools/build-public.mjs --out-dir public-dist",
     "convert:qwen35-language": "node --import tsx tools/convert-qwen35-language.ts",
+    "stage:qwen35-huggingface": "node --import tsx tools/stage-qwen35-huggingface.ts",
     "control:dev": "tsc --project tsconfig.dev.json && node dev-dist/dev/control/cli.js"
   },
   "devDependencies": {

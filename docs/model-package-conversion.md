@@ -53,3 +53,23 @@ retained for inspection. Review it manually before moving it to trash.
 Publication is a separate operation. Before publication, supply an existing
 local copy of the exact pinned GGUF, a new outside-Git output path, the final
 public model-repository identifier, and credentials for that hosting service.
+
+For Hugging Face's flat web uploader, authenticate and stage the converted
+package with the compiled tokenizer:
+
+```sh
+npm run stage:qwen35-huggingface -- \
+  --package <converted-package-path> \
+  --tokenizer-bin <compiled-tokenizer-bin> \
+  --tokenizer-manifest <compiled-tokenizer-manifest> \
+  --output <new-upload-directory>
+```
+
+The staging tool verifies the converted package checksum file, the exact model
+and tokenizer identities, every shard hash, and the compiled tokenizer. It then
+creates an exclusively reserved outside-Git directory with flat shard names, a
+rewritten validated manifest, publication provenance, and complete checksums.
+Shard files use copy-on-write cloning when the filesystem supports it and always
+have ownership independent from the converter output. The tool verifies every
+staged shard again, never overwrites output, and retains failed output for
+inspection.
