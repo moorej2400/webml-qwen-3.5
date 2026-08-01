@@ -53,6 +53,8 @@ test("ships a deterministic browser execution and CPU parity harness", async () 
   assert.match(script, /const tokenCount = qkv \? 2 : 1/);
   assert.match(script, /planar QKV fixture did not differ from token-major QKV/);
   assert.match(script, /for \(const kernel of QWEN35_VISION_LAYER_KERNELS\)/);
+  assert.match(script, /QWEN35_VISION_MERGER_KERNELS/);
+  assert.match(script, /visionExactGeluCpu/);
   assert.match(script, /visionPatchConv3dCpu/);
   assert.doesNotMatch(script, /visionPatchConv3dReferenceCpu/);
   assert.match(script, /visionPrepare2dRopeCpu/);

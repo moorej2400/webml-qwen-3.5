@@ -50,6 +50,7 @@ export * from "./qwen35-vision-package-bootstrap.js";
 export * from "./qwen35-vision-program.js";
 export * from "./qwen35-vision-foundation-kernels.js";
 export * from "./qwen35-vision-layer-kernels.js";
+export * from "./qwen35-vision-merger-kernels.js";
 export * from "./qwen35-vision-streaming-executor.js";
 export * from "./qwen35-webgpu-executor.js";
 export type {

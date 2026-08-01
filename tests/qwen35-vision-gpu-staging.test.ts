@@ -22,6 +22,7 @@ import {
 } from "../src/qwen35-vision-gpu-staging.js";
 import { planQwen35VisionBootstrapFoundationDispatches } from "../src/qwen35-vision-foundation-kernels.js";
 import { planQwen35VisionLayerDispatches } from "../src/qwen35-vision-layer-kernels.js";
+import { planQwen35VisionMergerDispatches } from "../src/qwen35-vision-merger-kernels.js";
 import { createQwen35VisionProgram } from "../src/qwen35-vision-program.js";
 import type { Qwen35VisionProgram } from "../src/qwen35-vision-program.js";
 import type { RangeFetch } from "../src/http-range-reader.js";
@@ -314,6 +315,28 @@ test("bridges one-, two-, and three-byte source remainders without unaligned GPU
     await staged.destroy();
     assert.equal(ledger.snapshot().currentBytes, 0n);
   }
+});
+
+test("plans the authenticated bootstrap merger with four-row logical input orientation", async () => {
+  const input = fixture();
+  const fakes = gpuFakes();
+  const ledger = new AllocationLedger(128n * BigInt(MIB));
+  const bootstrap = await stageQwen35VisionGpuGroup({ package: input.package_, program: input.program, layer: "bootstrap", ledger, allocator: fakes.allocator, queue: fakes.queue, allocationId: "vision-merger-bootstrap", uploadLaneBytes: 32 * MIB });
+  const buffers = Array.from({ length: 8 }, () => ({}));
+  const workspace = {
+    hidden: { buffer: buffers[0]!, byteLength: 4 * 1_024 * 4 },
+    normalized: { buffer: buffers[1]!, byteLength: 4 * 1_024 * 4 },
+    intermediate: { buffer: buffers[2]!, byteLength: 4_096 * 4 },
+    projected: { buffer: buffers[3]!, byteLength: 2_560 * 4 },
+    uniforms: [4, 5, 6, 7].map((index) => ({ buffer: buffers[index]!, byteLength: 16 })),
+  };
+  const limits = { minStorageBufferOffsetAlignment: 4, minUniformBufferOffsetAlignment: 4, maxStorageBufferBindingSize: 128 * MIB, maxUniformBufferBindingSize: 16, maxComputeWorkgroupsPerDimension: 16_384 };
+  const plans = planQwen35VisionMergerDispatches({ bootstrap, workspace, patchCount: 4, limits });
+  assert.deepEqual(plans.map((plan) => plan.kernel.id), ["qwen35-vision-layernorm-f32", "qwen35-vision-bf16-linear-f32", "qwen35-vision-exact-gelu-f32", "qwen35-vision-bf16-linear-f32"]);
+  assert.deepEqual(plans.map((plan) => plan.uniformWords), [[4, 1_024, new Uint32Array(new Float32Array([0.000001]).buffer)[0], 0], [1, 4_096, 4_096, 0], [1, 0, 0, 0], [1, 4_096, 2_560, 0]]);
+  assert.equal(plans[1]!.bindings[0]!.size, 4 * 1_024 * 4, "mm.0 reads four contiguous normalized patch rows without a shuffle buffer");
+  assert.equal(plans[3]!.bindings[3]!.size, 2_560 * 4);
+  await bootstrap.destroy(); ledger.assertAllReleased();
 });
 
 test("requires COPY_DST and STORAGE usage for every vision GPU buffer", async () => {

@@ -42,6 +42,10 @@ import {
   visionTanhGeluCpu,
 } from "../dist/src/qwen35-vision-layer-kernels.js";
 import {
+  QWEN35_VISION_MERGER_KERNELS,
+  visionExactGeluCpu,
+} from "../dist/src/qwen35-vision-merger-kernels.js";
+import {
   packFloat16PairCpu,
   qwen35OnlineAttentionHeadCpu,
   splitQwen35QueryGateProjection,
@@ -1570,6 +1574,16 @@ async function runVisionLayerKernel(device, kernel) {
   return { id: kernel.id, status: "executed" };
 }
 
+async function runVisionMergerKernel(device, kernel) {
+  const values = Float32Array.from({ length: 4096 }, (_, index) => Math.fround(((index % 31) - 15) / 5));
+  const expected = visionExactGeluCpu(values);
+  const output = storageBuffer(device, floatBytes(values), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+  const uniforms = storageBuffer(device, uintBytes(Uint32Array.of(1, 0, 0, 0)), GPUBufferUsage.UNIFORM);
+  const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: uniforms } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 64, y: 1, z: 1 });
+  validateParity(kernel.id, expected, new Float32Array(actual), 2e-6);
+  return { id: kernel.id, status: "executed" };
+}
+
 export async function runWebGpuKernelHarness() {
   if (!navigator.gpu) {
     throw new Error("WebGPU is not available in this browser");
@@ -1595,6 +1609,9 @@ export async function runWebGpuKernelHarness() {
   }
   for (const kernel of QWEN35_VISION_LAYER_KERNELS) {
     results.push(await runVisionLayerKernel(device, kernel));
+  }
+  for (const kernel of QWEN35_VISION_MERGER_KERNELS) {
+    results.push(await runVisionMergerKernel(device, kernel));
   }
   device.destroy();
   return results;

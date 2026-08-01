@@ -5,9 +5,9 @@ const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
 const GPU_BUFFER_USAGE_MAP_READ = 0x0001;
 const GPU_MAP_MODE_READ = 0x0001;
 
-// The fixed ABI has 32 existing shader identities plus the six vision-layer
-// identities. This bounds origin cache growth, not device/model feasibility.
-const QWEN35_FIXED_ABI_KERNEL_CAPACITY = 38;
+// The fixed ABI has 32 existing shader identities, six vision-layer identities,
+// and one exact-GELU merger identity. This bounds cache growth only.
+const QWEN35_FIXED_ABI_KERNEL_CAPACITY = 39;
 
 /** Opaque buffer identity accepted for binding without transferring ownership. */
 export type Qwen35WebGpuBuffer = object;

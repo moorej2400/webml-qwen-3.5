@@ -108,6 +108,8 @@ test("public build contains no local control agent or private connection materia
     "qwen35-vision-gpu-staging.js",
     "qwen35-vision-layer-kernels.d.ts",
     "qwen35-vision-layer-kernels.js",
+    "qwen35-vision-merger-kernels.d.ts",
+    "qwen35-vision-merger-kernels.js",
     "qwen35-vision-package-bootstrap.d.ts",
     "qwen35-vision-package-bootstrap.js",
     "qwen35-vision-package-loader.d.ts",
