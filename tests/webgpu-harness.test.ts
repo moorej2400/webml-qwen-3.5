@@ -34,6 +34,7 @@ test("ships a deterministic browser execution and CPU parity harness", async () 
   assert.match(script, /LANGUAGE_GEMV_KERNELS/);
   assert.match(script, /QWEN_PRIMITIVE_KERNELS/);
   assert.match(script, /PACKED_EMBEDDING_KERNELS/);
+  assert.match(script, /QWEN35_VISION_FOUNDATION_KERNELS/);
   assert.match(script, /for \(const kernel of LANGUAGE_GEMV_KERNELS\)/);
   assert.match(script, /for \(const kernel of QWEN_PRIMITIVE_KERNELS\)/);
   assert.match(script, /for \(const kernel of PACKED_EMBEDDING_KERNELS\)/);
@@ -41,6 +42,19 @@ test("ships a deterministic browser execution and CPU parity harness", async () 
   assert.match(script, /results\.push\(await runKernel\(device, kernel\)\)/);
   assert.match(script, /runPrimitive/);
   assert.match(script, /runEmbedding/);
+  assert.match(script, /runVisionFoundationKernel/);
+  assert.match(script, /visionPatchConv3dCpu/);
+  assert.doesNotMatch(script, /visionPatchConv3dReferenceCpu/);
+  assert.match(script, /visionPrepare2dRopeCpu/);
+  assert.match(script, /const convWeightIndex/);
+  assert.match(script, /for \(let channel = 0; channel < 3; channel \+= 1\)/);
+  assert.match(script, /for \(const hidden of \[0, 1\]\)/);
+  assert.match(script, /gridHeight: 4, gridWidth: 4/);
+  assert.match(script, /const split = \(31 \* 48 \+ 16\) \* 1024/);
+  assert.match(script, /uniform\(\[16, 4, 4, split\]\)/);
+  assert.match(script, /gridHeight: 10, gridWidth: 1_600/);
+  assert.match(script, /uniform\(\[16_000, 10, 1_600, 0\]\)/);
+  assert.match(script, /nonIdentityRope = prepared\.values\.subarray\(\(16_000 - 1\) \* 64, 16_000 \* 64\)/);
   assert.match(script, /partialMropeCpu/);
   assert.match(script, /stableTiledTopK/);
   assert.match(script, /embeddingCpu/);

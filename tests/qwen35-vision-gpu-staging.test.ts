@@ -14,11 +14,13 @@ import {
   type Qwen35IntegrityValidatedVisionPackage,
 } from "../src/qwen35-vision-package-loader.js";
 import {
+  assertAuthenticatedQwen35VisionGpuStagedGroup,
   stageQwen35VisionGpuGroup,
   type Qwen35VisionGpuAllocator,
   type Qwen35VisionGpuBuffer,
   type Qwen35VisionGpuQueue,
 } from "../src/qwen35-vision-gpu-staging.js";
+import { planQwen35VisionBootstrapFoundationDispatches } from "../src/qwen35-vision-foundation-kernels.js";
 import { createQwen35VisionProgram } from "../src/qwen35-vision-program.js";
 import type { Qwen35VisionProgram } from "../src/qwen35-vision-program.js";
 import type { RangeFetch } from "../src/http-range-reader.js";
@@ -370,7 +372,67 @@ test("stages bootstrap shards transactionally and maps immutable BF16/F32 views 
   assert.ok(Object.isFrozen(staged.tensors));
   assert.equal(fake.buffers[0]!.writes.reduce((total, write) => total + write.bytes.byteLength, 0), input.shardLengths[0]);
   assert.equal(fake.buffers[1]!.writes.reduce((total, write) => total + write.bytes.byteLength, 0), input.shardLengths[1]);
+  // Plan only from the branded, hash-validated object. The workspace buffers
+  // are small handles because this test verifies binding assembly, not GPU work.
+  const workspaceStorage = (byteLength: number) => ({ buffer: new BufferFake(byteLength), byteLength });
+  const workspace = {
+    patches: workspaceStorage(4 * 1_536 * 4),
+    embeddings: workspaceStorage(4 * 1_024 * 4),
+    rope: workspaceStorage(4 * 64 * 4),
+    patchUniform: workspaceStorage(16),
+    positionUniform: workspaceStorage(16),
+    ropeUniform: workspaceStorage(16),
+  };
+  const limits = {
+    minStorageBufferOffsetAlignment: 256,
+    minUniformBufferOffsetAlignment: 256,
+    maxStorageBufferBindingSize: 16 * MIB,
+    maxUniformBufferBindingSize: 256,
+    maxComputeWorkgroupsPerDimension: 64,
+  };
+  const plans = planQwen35VisionBootstrapFoundationDispatches({
+    bootstrap: staged,
+    workspace,
+    gridHeight: 2,
+    gridWidth: 2,
+    limits,
+  });
+  assert.equal(plans.length, 3);
+  assert.deepEqual(plans.map((plan) => plan.workgroups), [
+    { x: 16, y: 4, z: 1 },
+    { x: 16, y: 4, z: 1 },
+    { x: 1, y: 4, z: 1 },
+  ]);
+  assert.deepEqual(plans.map((plan) => plan.uniformWords), [
+    [4, 0, 0, 0],
+    [4, 2, 2, 1_564_672],
+    [4, 2, 2, 0],
+  ]);
+  assert.deepEqual(plans[0]!.bindings.map((binding) => binding.size), [
+    24_576, 3_145_728, 3_145_728, 4_096, 16_384, 16,
+  ]);
+  const position = staged.tensors.find((entry) => entry.name === "v.position_embd.weight")!;
+  assert.deepEqual(plans[1]!.bindings.slice(1, 3).map((binding) => ({
+    buffer: binding.buffer,
+    offset: binding.offset,
+    size: binding.size,
+  })), position.segments.map((segment) => ({
+    buffer: segment.buffer,
+    offset: segment.bufferOffset,
+    size: segment.byteLength,
+  })));
+  assert.throws(() => planQwen35VisionBootstrapFoundationDispatches({
+    bootstrap: staged,
+    workspace,
+    gridHeight: 2,
+    gridWidth: 2,
+    limits: { ...limits, maxComputeWorkgroupsPerDimension: 15 },
+  }), { code: "vision-foundation-dispatch-invalid" });
   await staged.destroy();
+  assert.throws(
+    () => assertAuthenticatedQwen35VisionGpuStagedGroup(staged),
+    { code: "vision-stage-group-unauthenticated" },
+  );
   assert.equal(ledger.snapshot().currentBytes, 0n);
   assert.equal(fake.buffers[0]!.destroyed, 1);
   await staged.destroy();

@@ -48,6 +48,7 @@ export type {
 } from "./qwen35-vision-package-loader.js";
 export * from "./qwen35-vision-package-bootstrap.js";
 export * from "./qwen35-vision-program.js";
+export * from "./qwen35-vision-foundation-kernels.js";
 export * from "./qwen35-webgpu-executor.js";
 export type {
   Qwen35BrowserLoadOptions,

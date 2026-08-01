@@ -32,6 +32,7 @@ export * from "./qwen35-program.js";
 export * from "./qwen35-session.js";
 export * from "./qwen35-uniform-arena.js";
 export * from "./qwen35-vision-program.js";
+export * from "./qwen35-vision-foundation-kernels.js";
 export * from "./qwen35-webgpu-executor.js";
 export type {
   Qwen35BrowserLoadOptions,

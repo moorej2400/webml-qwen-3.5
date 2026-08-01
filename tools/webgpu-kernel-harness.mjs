@@ -28,6 +28,13 @@ import {
 } from "../dist/src/qwen-embedding.js";
 import { QWEN35_HYBRID_KERNELS } from "../dist/src/hybrid-kernels.js";
 import {
+  QWEN35_VISION_FOUNDATION_KERNELS,
+  visionAddLearnedPositionCpu,
+  visionApply2dRopeCpu,
+  visionPatchConv3dCpu,
+  visionPrepare2dRopeCpu,
+} from "../dist/src/qwen35-vision-foundation-kernels.js";
+import {
   packFloat16PairCpu,
   qwen35OnlineAttentionHeadCpu,
   splitQwen35QueryGateProjection,
@@ -1460,6 +1467,67 @@ async function runHybridKernel(device, kernel) {
   }
 }
 
+async function runVisionFoundationKernel(device, kernel) {
+  const uniform = (words) => storageBuffer(device, uintBytes(Uint32Array.from(words)), GPUBufferUsage.UNIFORM);
+  if (kernel.key.operation === "vision-patch-conv3d") {
+    // This is deliberately sparse. Every channel and temporal slice feeds
+    // both checked output rows, so parity detects a C/T/H/W packing error.
+    const patches = new Float32Array(1536);
+    const weights0 = new Float32Array(16 * 16 * 3 * 1024);
+    const weights1 = new Float32Array(weights0.length);
+    const bias = Float32Array.from({ length: 1024 }, (_, i) => Math.fround(i / 1024));
+    const convWeightIndex = (channel, row, column, hidden) =>
+      column + 16 * (row + 16 * (channel + 3 * hidden));
+    for (let channel = 0; channel < 3; channel += 1) {
+      const row0 = channel * 3;
+      const column0 = channel * 5;
+      const row1 = 15 - channel * 2;
+      const column1 = 14 - channel * 3;
+      patches[channel * 512 + row0 * 16 + column0] = Math.fround(channel + 1.25);
+      patches[channel * 512 + 256 + row1 * 16 + column1] = Math.fround(channel + 2.5);
+      for (const hidden of [0, 1]) {
+        weights0[convWeightIndex(channel, row0, column0, hidden)] = Math.fround((hidden + 1) * (channel + 0.5));
+        weights1[convWeightIndex(channel, row1, column1, hidden)] = Math.fround((hidden + 1.5) * (channel + 0.75));
+      }
+    }
+    const expected = visionPatchConv3dCpu({ patches, patchCount: 1, hiddenSize: 1024, patchSize: 16, temporalPatchSize: 2, weightsTemporalZero: weights0, weightsTemporalOne: weights1, bias });
+    const output = storageBuffer(device, floatBytes(new Float32Array(1024)), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const [actual] = await dispatchAndRead(device, kernel, [
+      { binding: 0, resource: { buffer: storageBuffer(device, floatBytes(patches), GPUBufferUsage.STORAGE) } },
+      { binding: 1, resource: { buffer: storageBuffer(device, floatBytes(weights0), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(weights1), GPUBufferUsage.STORAGE) } },
+      { binding: 3, resource: { buffer: storageBuffer(device, floatBytes(bias), GPUBufferUsage.STORAGE) } }, { binding: 4, resource: { buffer: output } }, { binding: 5, resource: { buffer: uniform([1, 0, 0, 0]) } },
+    ], [{ buffer: output, byteLength: expected.byteLength }], { x: 16, y: 1, z: 1 });
+    validateParity(kernel.id, expected, new Float32Array(actual));
+  } else if (kernel.key.operation === "vision-add-learned-position") {
+    // A 4x4 grid reaches fractional align-corners coordinates. This split
+    // falls within the taps of the row-31, column-15.66 sample.
+    const embeddings = Float32Array.from({ length: 16 * 1024 }, (_, i) => Math.fround((i % 17) / 17));
+    const table = Float32Array.from(
+      { length: 2304 * 1024 },
+      (_, i) => Math.fround((((i * 17) % 101) - 50) / 13),
+    );
+    const split = (31 * 48 + 16) * 1024;
+    const expected = visionAddLearnedPositionCpu({ embeddings, gridHeight: 4, gridWidth: 4, hiddenSize: 1024, tableHeight: 48, tableWidth: 48, table });
+    const output = storageBuffer(device, floatBytes(embeddings), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const [actual] = await dispatchAndRead(device, kernel, [
+      { binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: storageBuffer(device, floatBytes(table.subarray(0, split)), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(table.subarray(split)), GPUBufferUsage.STORAGE) } }, { binding: 3, resource: { buffer: uniform([16, 4, 4, split]) } },
+    ], [{ buffer: output, byteLength: expected.byteLength }], { x: 16, y: 16, z: 1 }); validateParity(kernel.id, expected, new Float32Array(actual));
+  } else if (kernel.key.operation === "vision-prepare-2d-rope") {
+    // The 16,000-patch grid exercises long-axis merge coordinates and the
+    // shader's pow/cos path while keeping the readback at about four MiB.
+    const expected = visionPrepare2dRopeCpu({ gridHeight: 10, gridWidth: 1_600, headDimension: 64 }); const output = storageBuffer(device, floatBytes(new Float32Array(expected.values.length)), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: uniform([16_000, 10, 1_600, 0]) } }], [{ buffer: output, byteLength: expected.values.byteLength }], { x: 1, y: 16_000, z: 1 }); validateParity(kernel.id, expected.values, new Float32Array(actual));
+  } else {
+    const prepared = visionPrepare2dRopeCpu({ gridHeight: 10, gridWidth: 1_600, headDimension: 64 }); const query = Float32Array.from({ length: 1024 }, (_, i) => Math.fround(i / 97)); const key = Float32Array.from(query, (v) => Math.fround(v * 0.5));
+    // The final patch is coordinate (9, 1599), so this checks long-axis 2D rotation.
+    const nonIdentityRope = prepared.values.subarray((16_000 - 1) * 64, 16_000 * 64);
+    const expected = visionApply2dRopeCpu({ query, key, rope: nonIdentityRope, patchCount: 1, headCount: 16, headDimension: 64 });
+    const q = storageBuffer(device, floatBytes(query), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC); const k = storageBuffer(device, floatBytes(key), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const results = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: q } }, { binding: 1, resource: { buffer: k } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(nonIdentityRope), GPUBufferUsage.STORAGE) } }, { binding: 3, resource: { buffer: uniform([1, 0, 0, 0]) } }], [{ buffer: q, byteLength: 4096 }, { buffer: k, byteLength: 4096 }], { x: 1, y: 1, z: 16 }); validateParity(`${kernel.id}-q`, expected.query, new Float32Array(results[0])); validateParity(`${kernel.id}-k`, expected.key, new Float32Array(results[1]));
+  }
+  return { id: kernel.id, status: "executed" };
+}
+
 export async function runWebGpuKernelHarness() {
   if (!navigator.gpu) {
     throw new Error("WebGPU is not available in this browser");
@@ -1479,6 +1547,9 @@ export async function runWebGpuKernelHarness() {
   }
   for (const kernel of QWEN35_HYBRID_KERNELS) {
     results.push(await runHybridKernel(device, kernel));
+  }
+  for (const kernel of QWEN35_VISION_FOUNDATION_KERNELS) {
+    results.push(await runVisionFoundationKernel(device, kernel));
   }
   device.destroy();
   return results;

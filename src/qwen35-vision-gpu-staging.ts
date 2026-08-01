@@ -113,6 +113,23 @@ export interface Qwen35VisionGpuStagedGroup {
   destroy(): Promise<void>;
 }
 
+// Tensor views become executable bindings only after the authenticated loader
+// committed every shard hash and GPU uploads retired. Structural lookalikes
+// must not point foundation kernels at arbitrary buffers.
+const AUTHENTICATED_STAGED_GROUPS = new WeakSet<Qwen35VisionGpuStagedGroup>();
+
+export function assertAuthenticatedQwen35VisionGpuStagedGroup(
+  value: unknown,
+): Qwen35VisionGpuStagedGroup {
+  if (
+    typeof value !== "object" || value === null ||
+    !AUTHENTICATED_STAGED_GROUPS.has(value as Qwen35VisionGpuStagedGroup)
+  ) {
+    fail("vision-stage-group-unauthenticated", "Vision GPU staged group was not authenticated");
+  }
+  return value as Qwen35VisionGpuStagedGroup;
+}
+
 interface CreateQwen35VisionGpuLayerSinkOptions {
   readonly shardPlan: readonly Qwen35VisionGpuShardPlan[];
   readonly ledger: AllocationLedger;
@@ -702,12 +719,20 @@ export async function stageQwen35VisionGpuGroup(
     await package_.streamLayer(input.layer, sink, input.signal);
     const shards = sink.stagedShards();
     const views = createViews(program, tensors, shards);
-    return freeze({
+    let stagedGroup!: Qwen35VisionGpuStagedGroup;
+    stagedGroup = freeze({
       layer: input.layer,
       shards,
       tensors: views,
-      destroy: () => sink.abort(),
+      destroy: async () => {
+        // Retire publication before async cleanup: a rejected destroy cannot
+        // leave callers able to bind buffers that it has begun to release.
+        AUTHENTICATED_STAGED_GROUPS.delete(stagedGroup);
+        await sink.abort();
+      },
     });
+    AUTHENTICATED_STAGED_GROUPS.add(stagedGroup);
+    return stagedGroup;
   } catch (error) {
     try {
       // Loader failures already call abort. A post-commit view failure does not,
