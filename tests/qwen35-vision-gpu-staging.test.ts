@@ -21,6 +21,7 @@ import {
   type Qwen35VisionGpuQueue,
 } from "../src/qwen35-vision-gpu-staging.js";
 import { planQwen35VisionBootstrapFoundationDispatches } from "../src/qwen35-vision-foundation-kernels.js";
+import { planQwen35VisionLayerDispatches } from "../src/qwen35-vision-layer-kernels.js";
 import { createQwen35VisionProgram } from "../src/qwen35-vision-program.js";
 import type { Qwen35VisionProgram } from "../src/qwen35-vision-program.js";
 import type { RangeFetch } from "../src/http-range-reader.js";
@@ -449,6 +450,86 @@ test("uses the authenticated loader transaction to roll back GPU buffers after a
   }), { code: "vision-layer-shard-hash-mismatch" });
   assert.equal(fake.buffers.length, 1);
   assert.equal(fake.buffers[0]!.destroyed, 1);
+  assert.equal(ledger.snapshot().currentBytes, 0n);
+});
+
+test("plans one authenticated staged vision layer with planar QKV and fixed residual order", async () => {
+  const input = fixture();
+  const fake = gpuFakes();
+  const ledger = new AllocationLedger(32n * BigInt(MIB));
+  const staged = await stageQwen35VisionGpuGroup({
+    package: input.package_, program: input.program, layer: 0, ledger,
+    allocator: fake.allocator, queue: fake.queue, allocationId: "vision-layer-plan-test",
+  });
+  const storage = (byteLength: number) => ({ buffer: new BufferFake(byteLength), byteLength });
+  const hidden = 4 * 1_024 * 4;
+  const workspace = {
+    hidden: storage(hidden), normalized: storage(hidden), qkv: storage(hidden * 3), attention: storage(hidden),
+    mlp: storage(4 * 4_096 * 4), rope: storage(4 * 64 * 4), segmentOffsets: storage(8),
+    uniforms: Array.from({ length: 10 }, () => storage(16)),
+  };
+  const limits = {
+    minStorageBufferOffsetAlignment: 256, minUniformBufferOffsetAlignment: 256,
+    maxStorageBufferBindingSize: 16 * MIB, maxUniformBufferBindingSize: 256,
+    maxComputeWorkgroupsPerDimension: 64,
+  };
+  const plan = planQwen35VisionLayerDispatches({
+    layer: 0,
+    staged,
+    workspace,
+    tokenCount: 4,
+    segmentCount: 1,
+    limits,
+  });
+  assert.deepEqual(plan.map((entry) => entry.kernel.id), [
+    "qwen35-vision-layernorm-f32", "qwen35-vision-qkv-bf16-linear-f32", "qwen35-vision-apply-2d-rope-f32",
+    "qwen35-vision-online-attention-f32", "qwen35-vision-bf16-linear-f32", "qwen35-vision-residual-add-f32",
+    "qwen35-vision-layernorm-f32", "qwen35-vision-bf16-linear-f32", "qwen35-vision-tanh-gelu-f32",
+    "qwen35-vision-bf16-linear-f32", "qwen35-vision-residual-add-f32",
+  ]);
+  assert.deepEqual(plan.map((entry) => entry.workgroups), [
+    { x: 1, y: 4, z: 1 }, { x: 48, y: 4, z: 1 }, { x: 1, y: 4, z: 16 }, { x: 1, y: 4, z: 16 },
+    { x: 16, y: 4, z: 1 }, { x: 16, y: 4, z: 1 }, { x: 1, y: 4, z: 1 }, { x: 64, y: 4, z: 1 },
+    { x: 64, y: 4, z: 1 }, { x: 16, y: 4, z: 1 }, { x: 16, y: 4, z: 1 },
+  ]);
+  assert.deepEqual(plan[2]!.bindings.slice(0, 2).map((binding) => binding.offset), [0, hidden]);
+  assert.deepEqual(plan[3]!.bindings.slice(0, 3).map((binding) => binding.offset), [0, hidden, hidden * 2]);
+  assert.deepEqual(plan.map((entry) => entry.uniformWords), [
+    [4, 1_024, 897_988_541, 0], [4, 0, 0, 0], [4, 0, 0, 0], [4, 1, 0, 0], [4, 1_024, 1_024, 0],
+    [4_096, 0, 0, 0], [4, 1_024, 897_988_541, 0], [4, 1_024, 4_096, 0], [16_384, 0, 0, 0],
+    [4, 4_096, 1_024, 0], [4_096, 0, 0, 0],
+  ]);
+  assert.throws(() => planQwen35VisionLayerDispatches({
+    layer: 0, staged, workspace, tokenCount: 4, segmentCount: 1,
+    limits: { ...limits, maxComputeWorkgroupsPerDimension: 15 },
+  }), { code: "vision-layer-dispatch-invalid" });
+  const aliasedUniforms = [...workspace.uniforms];
+  aliasedUniforms[1] = aliasedUniforms[0]!;
+  assert.throws(() => planQwen35VisionLayerDispatches({
+    layer: 0, staged, tokenCount: 4, segmentCount: 1,
+    workspace: { ...workspace, uniforms: aliasedUniforms }, limits,
+  }), { code: "vision-layer-uniform-alias-invalid" });
+  const boundaryTokens = 16_384;
+  const boundaryHidden = boundaryTokens * 1_024 * 4;
+  const boundaryMlp = boundaryTokens * 4_096 * 4;
+  const boundaryWorkspace = {
+    hidden: storage(boundaryHidden), normalized: storage(boundaryHidden), qkv: storage(boundaryHidden * 3),
+    attention: storage(boundaryHidden), mlp: storage(boundaryMlp), rope: storage(boundaryTokens * 64 * 4),
+    segmentOffsets: storage(8), uniforms: Array.from({ length: 10 }, () => storage(16)),
+  };
+  const boundaryLimits = {
+    ...limits, maxStorageBufferBindingSize: 256 * MIB, maxComputeWorkgroupsPerDimension: boundaryTokens,
+  };
+  const boundaryPlan = planQwen35VisionLayerDispatches({
+    layer: 0, staged, workspace: boundaryWorkspace, tokenCount: boundaryTokens, segmentCount: 1, limits: boundaryLimits,
+  });
+  assert.equal(boundaryPlan[7]!.bindings[3]!.size, boundaryMlp);
+  assert.equal(boundaryMlp, 256 * MIB);
+  assert.throws(() => planQwen35VisionLayerDispatches({
+    layer: 0, staged, workspace: boundaryWorkspace, tokenCount: boundaryTokens, segmentCount: 1,
+    limits: { ...boundaryLimits, maxStorageBufferBindingSize: boundaryMlp - 1 },
+  }), { code: "vision-layer-binding-invalid" });
+  await staged.destroy();
   assert.equal(ledger.snapshot().currentBytes, 0n);
 });
 

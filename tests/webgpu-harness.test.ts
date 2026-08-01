@@ -35,6 +35,7 @@ test("ships a deterministic browser execution and CPU parity harness", async () 
   assert.match(script, /QWEN_PRIMITIVE_KERNELS/);
   assert.match(script, /PACKED_EMBEDDING_KERNELS/);
   assert.match(script, /QWEN35_VISION_FOUNDATION_KERNELS/);
+  assert.match(script, /QWEN35_VISION_LAYER_KERNELS/);
   assert.match(script, /for \(const kernel of LANGUAGE_GEMV_KERNELS\)/);
   assert.match(script, /for \(const kernel of QWEN_PRIMITIVE_KERNELS\)/);
   assert.match(script, /for \(const kernel of PACKED_EMBEDDING_KERNELS\)/);
@@ -43,6 +44,15 @@ test("ships a deterministic browser execution and CPU parity harness", async () 
   assert.match(script, /runPrimitive/);
   assert.match(script, /runEmbedding/);
   assert.match(script, /runVisionFoundationKernel/);
+  assert.match(script, /runVisionLayerKernel/);
+  assert.match(script, /visionLayerNormCpu/);
+  assert.match(script, /visionLinearBf16Cpu/);
+  assert.match(script, /visionOnlineAttentionCpu/);
+  assert.match(script, /visionTanhGeluCpu/);
+  assert.match(script, /bf16Fixture/);
+  assert.match(script, /const tokenCount = qkv \? 2 : 1/);
+  assert.match(script, /planar QKV fixture did not differ from token-major QKV/);
+  assert.match(script, /for \(const kernel of QWEN35_VISION_LAYER_KERNELS\)/);
   assert.match(script, /visionPatchConv3dCpu/);
   assert.doesNotMatch(script, /visionPatchConv3dReferenceCpu/);
   assert.match(script, /visionPrepare2dRopeCpu/);

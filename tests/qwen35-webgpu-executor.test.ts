@@ -222,7 +222,7 @@ test("shares pipeline and bind-group caches across identical cloned kernels", as
   assert.equal(events.filter((event) => event === "submit").length, 2);
 });
 
-test("bounds the fixed-program kernel cache at exactly 32 lifetime entries", async () => {
+test("bounds the fixed-program kernel cache at exactly 38 lifetime entries", async () => {
   const { device, events } = fakeDevice();
   const executor = new Qwen35WebGpuExecutor(device);
   const request = (index: number) => ({
@@ -235,17 +235,17 @@ test("bounds the fixed-program kernel cache at exactly 32 lifetime entries", asy
     workgroups: { x: 1, y: 1, z: 1 },
   });
 
-  for (let index = 0; index < 32; index += 1) {
+  for (let index = 0; index < 38; index += 1) {
     await executor.dispatch(request(index));
   }
-  await assert.rejects(executor.dispatch(request(32)), {
+  await assert.rejects(executor.dispatch(request(38)), {
     code: "webgpu-kernel-capacity-exceeded",
     message: "Qwen3.5 WebGPU kernel capacity was exceeded",
   });
 
-  assert.equal(events.filter((event) => event === "module").length, 32);
-  assert.equal(events.filter((event) => event === "pipeline").length, 32);
-  assert.equal(events.filter((event) => event === "submit").length, 32);
+  assert.equal(events.filter((event) => event === "module").length, 38);
+  assert.equal(events.filter((event) => event === "pipeline").length, 38);
+  assert.equal(events.filter((event) => event === "submit").length, 38);
   await assert.rejects(executor.dispatch(request(0)), {
     code: "webgpu-executor-poisoned",
   });

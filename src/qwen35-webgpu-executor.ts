@@ -5,10 +5,9 @@ const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
 const GPU_BUFFER_USAGE_MAP_READ = 0x0001;
 const GPU_MAP_MODE_READ = 0x0001;
 
-// This versioned scheduler limit covers the fixed ABI's 28 registered shader
-// sources. It bounds origin memory, not device or model feasibility, and must
-// be revised when page-aware or device-specific kernel families are added.
-const QWEN35_FIXED_ABI_KERNEL_CAPACITY = 32;
+// The fixed ABI has 32 existing shader identities plus the six vision-layer
+// identities. This bounds origin cache growth, not device/model feasibility.
+const QWEN35_FIXED_ABI_KERNEL_CAPACITY = 38;
 
 /** Opaque buffer identity accepted for binding without transferring ownership. */
 export type Qwen35WebGpuBuffer = object;

@@ -35,6 +35,13 @@ import {
   visionPrepare2dRopeCpu,
 } from "../dist/src/qwen35-vision-foundation-kernels.js";
 import {
+  QWEN35_VISION_LAYER_KERNELS,
+  visionLayerNormCpu,
+  visionLinearBf16Cpu,
+  visionOnlineAttentionCpu,
+  visionTanhGeluCpu,
+} from "../dist/src/qwen35-vision-layer-kernels.js";
+import {
   packFloat16PairCpu,
   qwen35OnlineAttentionHeadCpu,
   splitQwen35QueryGateProjection,
@@ -1528,6 +1535,41 @@ async function runVisionFoundationKernel(device, kernel) {
   return { id: kernel.id, status: "executed" };
 }
 
+function bf16Fixture(length) {
+  return Uint16Array.from({ length }, (_, index) => 0x3f00 + (index % 5) * 0x0080);
+}
+
+function f32Bits(value) {
+  return new Uint32Array(new Float32Array([value]).buffer)[0];
+}
+
+async function runVisionLayerKernel(device, kernel) {
+  const uniform = (words) => storageBuffer(device, uintBytes(Uint32Array.from(words)), GPUBufferUsage.UNIFORM);
+  if (kernel.key.operation === "vision-layernorm") {
+    const input = Float32Array.from({ length: 1024 }, (_, i) => Math.fround(1_000 + Math.sin(i * 0.17) * 1.5));
+    const weight = Float32Array.from({ length: 1024 }, (_, i) => Math.fround(0.5 + (i % 7) / 10)); const bias = Float32Array.from({ length: 1024 }, (_, i) => Math.fround((i % 5) / 20));
+    const expected = visionLayerNormCpu({ input, tokenCount: 1, hiddenSize: 1024, weight, bias }); const output = storageBuffer(device, floatBytes(new Float32Array(1024)), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: storageBuffer(device, floatBytes(input), GPUBufferUsage.STORAGE) } }, { binding: 1, resource: { buffer: storageBuffer(device, floatBytes(weight), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(bias), GPUBufferUsage.STORAGE) } }, { binding: 3, resource: { buffer: output } }, { binding: 4, resource: { buffer: uniform([1, 1024, f32Bits(1e-6), 0]) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 1, y: 1, z: 1 }); validateParity(kernel.id, expected, new Float32Array(actual), 1e-4);
+  } else if (kernel.key.operation === "vision-bf16-linear" || kernel.key.operation === "vision-qkv-bf16-linear") {
+    const qkv = kernel.key.operation === "vision-qkv-bf16-linear"; const outputWidth = qkv ? 3072 : 1024; const tokenCount = qkv ? 2 : 1; const input = Float32Array.from({ length: tokenCount * 1024 }, (_, i) => Math.fround(((i % 17) - 8) / 17)); const weight = bf16Fixture(1024 * outputWidth); const bias = Float32Array.from({ length: outputWidth }, (_, i) => Math.fround((i % 11) / 11));
+    const tokenMajor = visionLinearBf16Cpu({ input, tokenCount, inputWidth: 1024, outputWidth, weight, bias }); const expected = new Float32Array(tokenMajor.length);
+    if (qkv) { for (let branch = 0; branch < 3; branch += 1) for (let token = 0; token < tokenCount; token += 1) expected.set(tokenMajor.subarray(token * 3072 + branch * 1024, token * 3072 + (branch + 1) * 1024), (branch * tokenCount + token) * 1024); if (expected.every((value, index) => value === tokenMajor[index])) throw new Error(`${kernel.id}: planar QKV fixture did not differ from token-major QKV`); } else expected.set(tokenMajor);
+    const output = storageBuffer(device, floatBytes(new Float32Array(expected.length)), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC); const params = qkv ? [tokenCount, 0, 0, 0] : [tokenCount, 1024, 1024, 0];
+    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: storageBuffer(device, floatBytes(input), GPUBufferUsage.STORAGE) } }, { binding: 1, resource: { buffer: storageBuffer(device, uintBytes(weight), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(bias), GPUBufferUsage.STORAGE) } }, { binding: 3, resource: { buffer: output } }, { binding: 4, resource: { buffer: uniform(params) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: outputWidth / 64, y: tokenCount, z: 1 }); validateParity(kernel.id, expected, new Float32Array(actual), 1e-3);
+  } else if (kernel.key.operation === "vision-online-attention") {
+    const query = Float32Array.from({ length: 2 * 1024 }, (_, i) => Math.fround(((i % 29) - 14) / 29)); const key = Float32Array.from({ length: query.length }, (_, i) => Math.fround(((i % 23) - 11) / 23)); const value = Float32Array.from({ length: query.length }, (_, i) => Math.fround(((i % 19) - 9) / 19)); const offsets = Uint32Array.of(0, 2);
+    const expected = visionOnlineAttentionCpu({ query, key, value, tokenCount: 2, headCount: 16, headDimension: 64, segmentOffsets: offsets }); const output = storageBuffer(device, floatBytes(new Float32Array(expected.length)), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: storageBuffer(device, floatBytes(query), GPUBufferUsage.STORAGE) } }, { binding: 1, resource: { buffer: storageBuffer(device, floatBytes(key), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(value), GPUBufferUsage.STORAGE) } }, { binding: 3, resource: { buffer: storageBuffer(device, uintBytes(offsets), GPUBufferUsage.STORAGE) } }, { binding: 4, resource: { buffer: output } }, { binding: 5, resource: { buffer: uniform([2, 1, 0, 0]) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 1, y: 2, z: 16 }); validateParity(kernel.id, expected, new Float32Array(actual), 1e-4);
+  } else if (kernel.key.operation === "vision-tanh-gelu") {
+    const values = Float32Array.from({ length: 4096 }, (_, i) => Math.fround(((i % 31) - 15) / 5)); const expected = visionTanhGeluCpu(values); const output = storageBuffer(device, floatBytes(values), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: uniform([4096, 0, 0, 0]) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 64, y: 1, z: 1 }); validateParity(kernel.id, expected, new Float32Array(actual), 1e-5);
+  } else {
+    const input = Float32Array.from({ length: 1024 }, (_, i) => Math.fround(i / 97)); const update = Float32Array.from({ length: 1024 }, (_, i) => Math.fround(-i / 193)); const expected = Float32Array.from(input, (value, i) => Math.fround(value + update[i])); const output = storageBuffer(device, floatBytes(input), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: storageBuffer(device, floatBytes(update), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: uniform([1024, 0, 0, 0]) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 16, y: 1, z: 1 }); validateParity(kernel.id, expected, new Float32Array(actual));
+  }
+  return { id: kernel.id, status: "executed" };
+}
+
 export async function runWebGpuKernelHarness() {
   if (!navigator.gpu) {
     throw new Error("WebGPU is not available in this browser");
@@ -1550,6 +1592,9 @@ export async function runWebGpuKernelHarness() {
   }
   for (const kernel of QWEN35_VISION_FOUNDATION_KERNELS) {
     results.push(await runVisionFoundationKernel(device, kernel));
+  }
+  for (const kernel of QWEN35_VISION_LAYER_KERNELS) {
+    results.push(await runVisionLayerKernel(device, kernel));
   }
   device.destroy();
   return results;
