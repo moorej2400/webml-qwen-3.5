@@ -102,6 +102,8 @@ test("public build contains no local control agent or private connection materia
     "qwen35-session.js",
     "qwen35-uniform-arena.d.ts",
     "qwen35-uniform-arena.js",
+    "qwen35-vision-encoder.d.ts",
+    "qwen35-vision-encoder.js",
     "qwen35-vision-foundation-kernels.d.ts",
     "qwen35-vision-foundation-kernels.js",
     "qwen35-vision-gpu-staging.d.ts",

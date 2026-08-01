@@ -90,6 +90,7 @@ test("the browser entrypoint exports authenticated runtime APIs but not Node com
   assert.equal(typeof browser.preprocessQwen35VisionRgb, "function");
   assert.equal(typeof browser.loadProductionQwen35VisionPackage, "function");
   assert.equal(typeof browser.createQwen35VisionProgram, "function");
+  assert.equal(typeof browser.Qwen35VisionEncoder, "function");
   assert.equal("createIntegrityValidatedQwen35VisionPackage" in browser, false);
   assert.equal("createProductionQwen35VisionPackage" in browser, false);
   assert.equal("streamQwen35CachedWeights" in browser, false);
