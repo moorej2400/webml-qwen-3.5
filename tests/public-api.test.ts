@@ -30,6 +30,7 @@ test("exports mixed tensor conversion and GEMV APIs from the package entrypoint"
     typeof runtime.createQwen35GreedyExecutionDriverFactory,
     "function",
   );
+  assert.equal(typeof runtime.createQwen35VisionProgram, "function");
   assert.equal("streamQwen35CachedWeights" in runtime, false);
   assert.equal("compileTokenizerSource" in runtime, false);
 });

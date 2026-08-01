@@ -17,6 +17,37 @@ export * from "./qwen35-logits-dispatch.js";
 export * from "./qwen35-logits-reduction.js";
 export * from "./qwen35-session.js";
 export * from "./qwen35-uniform-arena.js";
+export {
+  QWEN35_DEFAULT_DECODED_SOURCE_BYTE_BUDGET,
+  QWEN35_DEFAULT_MAX_VISUAL_TOKENS,
+  packQwen35VisionRgb,
+  planQwen35VisionImage,
+  preprocessQwen35VisionRgb,
+  resizeQwen35VisionRgbBicubic,
+} from "./qwen35-vision-preprocess.js";
+export type {
+  Qwen35VisionImagePlan,
+  Qwen35VisionMaterializationEstimate,
+  Qwen35VisionPatchBatch,
+  Qwen35VisionResizeMetrics,
+  Qwen35VisionRgbResize,
+  Qwen35VisionTaskScheduler,
+} from "./qwen35-vision-preprocess.js";
+// Production browser callers receive the fixed release only through the
+// bootstrap. Generic caller-pinned validation is a development low-level API.
+export {
+  assertProductionTrustedQwen35VisionPackage,
+  QWEN35_PRODUCTION_VISION_PACKAGE_PINS,
+} from "./qwen35-vision-package-loader.js";
+export type {
+  Qwen35ProductionVisionPackage,
+  Qwen35VisionLayer,
+  Qwen35VisionLayerShard,
+  Qwen35VisionLayerSink,
+  Qwen35VisionPackage,
+} from "./qwen35-vision-package-loader.js";
+export * from "./qwen35-vision-package-bootstrap.js";
+export * from "./qwen35-vision-program.js";
 export * from "./qwen35-webgpu-executor.js";
 export type {
   Qwen35BrowserLoadOptions,
