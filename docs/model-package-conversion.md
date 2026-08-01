@@ -76,9 +76,22 @@ writes a shard, it exclusively creates the requested output directory. It
 writes only inside that reserved directory and retains it after a failure for
 inspection; it never replaces an output that appears during conversion.
 
-Vision package publication is the next separate operation. There is no vision
-staging or upload command yet; do not use the language flat-staging command
-below for a vision package.
+Vision package publication uses a separate flat staging operation. Do not use
+the language flat-staging command below for a vision package.
+
+```sh
+npm run stage:qwen35-vision-huggingface -- \
+  --package <converted-vision-package-path> \
+  --output <new-vision-upload-directory>
+```
+
+The vision staging tool authenticates the converted package, copies every
+shard through bounded 8 MiB reads, and creates only collision-safe flat names:
+`vision-00000.bin` through `vision-00025.bin`, `vision-manifest.json`,
+`vision-layer-index.json`, `vision-source-provenance.json`,
+`vision-LICENSES.json`, `vision-SHA256SUMS`, and vision publication provenance.
+It preserves the processor identity, preprocessing settings, runtime ABI, and
+source metadata while rewriting manifest shard URLs to the flat vision names.
 
 ## Language package publication
 
