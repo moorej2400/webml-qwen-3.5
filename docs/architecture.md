@@ -143,6 +143,26 @@ local control protocol, and greedy text driver are connected. Physical-device
 validation, vision execution, the final application UI, and public model-shard
 publication remain later runtime phases.
 
+## Local iPhone control boundary
+
+The local HTTPS development server injects the control agent only into its own
+response. A document automatically requests one short-lived WSS ticket from the
+same origin. The server requires the exact configured `Host` and `Origin` for
+ticket issuance and WebSocket upgrade, then consumes the ticket before it
+accepts the first protocol frame. No pairing code, device token, or reusable
+browser secret exists in the page or its storage. The ticket is a same-origin,
+trusted-local-network gate rather than cryptographic phone authentication: a
+network client able to forge those browser headers is not cryptographically
+identified. Short ticket lifetimes, one-use consumption, a pending-ticket cap,
+and an issue-rate cap bound reconnect abuse. The independently authenticated
+operator API remains bearer-authenticated and bound to `127.0.0.1`.
+
+The server, rather than the browser protocol payload, enriches ignored local
+JSONL with durable device/tab/document IDs, a coarse OS family/version parsed
+from the TLS handshake user agent, and the direct socket IP. It ignores all
+forwarding headers and discards raw user-agent text. This information is solely
+for local correlation and is excluded from public builds and tracked artifacts.
+
 ## Experimental feasibility
 
 A failure on one device is evidence about that tested implementation, not

@@ -1,7 +1,7 @@
 /**
- * The public local-agent response is credential-free. A user must enter the
- * process-only pairing code on the phone before this script can obtain a
- * device-bound session and single-use WSS ticket.
+ * The local-agent response contains no reusable secret. Each document obtains
+ * a one-use WSS ticket from the same local HTTPS origin immediately before it
+ * opens the socket.
  */
 export const createBrowserAgentSource = (): string => `(() => {
   "use strict";
@@ -62,14 +62,12 @@ export const createBrowserAgentSource = (): string => `(() => {
     throw new Error("tab_identity_collision");
   };
   const identity = () => ({ deviceId, tabId, documentId });
-  const requestJson = async (url, body, capability) => {
+  const requestJson = async (url, body) => {
     const response = await fetch(url, {
       method: "POST",
       cache: "no-store",
-      headers: {
-        "content-type": "application/json",
-        ...(capability ? { authorization: "Bearer " + capability } : {})
-      },
+      credentials: "omit",
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(body)
     });
     if (!response.ok) throw new Error("control_auth_failed");
@@ -187,46 +185,6 @@ export const createBrowserAgentSource = (): string => `(() => {
     }
     return JSON.stringify(result).length <= 8192 ? result : {};
   };
-  const showPairing = () => {
-    if (document.getElementById("qwen-control-pairing-form")) return;
-    const dialog = document.createElement("dialog");
-    dialog.setAttribute("aria-labelledby", "qwen-control-pairing-title");
-    const form = document.createElement("form");
-    form.id = "qwen-control-pairing-form";
-    form.method = "dialog";
-    const title = document.createElement("strong");
-    title.id = "qwen-control-pairing-title";
-    title.textContent = "Pair development controls";
-    const input = document.createElement("input");
-    input.type = "password";
-    input.required = true;
-    input.autocomplete = "one-time-code";
-    input.setAttribute("aria-label", "One-time pairing code");
-    const button = document.createElement("button");
-    button.type = "submit";
-    button.textContent = "Pair";
-    const status = document.createElement("span");
-    status.setAttribute("role", "status");
-    form.append(title, input, button, status);
-    dialog.append(form);
-    document.body.append(dialog);
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      button.disabled = true;
-      status.textContent = "";
-      try {
-        await globalThis.__QWEN_LOCAL_PAIR__(input.value);
-        input.value = "";
-        dialog.close();
-        dialog.remove();
-      } catch {
-        input.value = "";
-        status.textContent = "Pairing failed.";
-        button.disabled = false;
-      }
-    });
-    dialog.showModal();
-  };
   const handleCommand = async (message) => {
     if (!ALLOWED_COMMANDS.has(message.command)) return;
     const previous = records.get(message.commandId);
@@ -307,16 +265,21 @@ export const createBrowserAgentSource = (): string => `(() => {
       sendFrame(frame);
     }
     send({ type: "ready" });
+    // The first local journal record joins server-derived socket metadata to
+    // durable browser IDs even when the runtime has not produced metrics yet.
+    send({
+      type: "telemetry",
+      event: {
+        category: "device",
+        name: "connected",
+        timestampMs: Date.now(),
+        metrics: { status: "connected" }
+      }
+    });
   };
   const connectOnce = async () => {
-    const capability = sessionStorage.getItem("qwen.control.session");
-    if (!capability) {
-      dispatchEvent(new CustomEvent("qwen-control-pairing-required"));
-      showPairing();
-      return;
-    }
     try {
-      const { ticket } = await requestJson("/.local-ticket", identity(), capability);
+      const { ticket } = await requestJson("/.local-ticket", identity());
       const scheme = location.protocol === "https:" ? "wss:" : "ws:";
       const candidate = new WebSocket(
         scheme + "//" + location.host + "/.local-control",
@@ -367,9 +330,10 @@ export const createBrowserAgentSource = (): string => `(() => {
         reconnectDelay = Math.min(5000, reconnectDelay * 2);
       });
     } catch {
-      sessionStorage.removeItem("qwen.control.session");
-      dispatchEvent(new CustomEvent("qwen-control-pairing-required"));
-      showPairing();
+      // This can fail while the local server is reloading; retry only through
+      // a fresh same-origin request so an old WSS ticket never survives it.
+      setTimeout(() => void connect(), reconnectDelay);
+      reconnectDelay = Math.min(5000, reconnectDelay * 2);
     }
   };
   const connect = () => {
@@ -382,11 +346,6 @@ export const createBrowserAgentSource = (): string => `(() => {
       connectPromise = undefined;
     });
     return connectPromise;
-  };
-  globalThis.__QWEN_LOCAL_PAIR__ = async (pairingCode) => {
-    const paired = await requestJson("/.local-pair", { pairingCode, ...identity() });
-    sessionStorage.setItem("qwen.control.session", paired.sessionCapability);
-    await connect();
   };
   addEventListener("qwen-local-runtime-ready", () => {
     if (typeof globalThis.__QWEN_LOCAL_CONTROL__ !== "object") return;

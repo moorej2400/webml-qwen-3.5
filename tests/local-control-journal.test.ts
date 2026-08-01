@@ -9,8 +9,54 @@ import {
   listRunSummaries,
   sanitizeTelemetryEvent,
 } from "../dev/control/run-journal.js";
+import { deriveSocketDeviceMetadata } from "../dev/control/device-correlation.js";
 
-test("telemetry uses an allowlist and recursively removes private content", () => {
+test("server-derived local metadata keeps only coarse OS and the direct socket IP", () => {
+  assert.deepEqual(
+    deriveSocketDeviceMetadata({
+      remoteAddress: "::ffff:192.0.2.44",
+      userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X)",
+    }),
+    { osFamily: "ios", osVersion: "18.4", remoteIp: "192.0.2.44" },
+  );
+  assert.deepEqual(
+    deriveSocketDeviceMetadata({
+      remoteAddress: "not-an-ip",
+      userAgent: "untrusted raw value 100.200.300.400",
+    }),
+    { osFamily: "other", remoteIp: "unknown" },
+  );
+});
+
+test("journal records only server-authoritative device metadata", () => {
+  const sanitized = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "device",
+    name: "connected",
+    timestampMs: 100,
+    deviceId: "device_0123456789abcdef",
+    tabId: "tab_0123456789abcdef",
+    documentId: "document_0123456789abcdef",
+    eventSeq: 1,
+    deviceMetadata: {
+      osFamily: "ios",
+      osVersion: "18.4.1",
+      remoteIp: "192.0.2.44",
+      forwardedFor: "203.0.113.10",
+      rawUserAgent: "private",
+    },
+    metrics: { status: "connected" },
+  });
+
+  assert.deepEqual(sanitized.deviceMetadata, {
+    osFamily: "ios",
+    osVersion: "18.4.1",
+    remoteIp: "192.0.2.44",
+  });
+  assert.doesNotMatch(JSON.stringify(sanitized), /forwarded|private|userAgent/i);
+});
+
+test("telemetry uses a flat allowlist and omits private content", () => {
   const sanitized = sanitizeTelemetryEvent({
     schemaVersion: 1,
     category: "generation",
@@ -29,8 +75,34 @@ test("telemetry uses an allowlist and recursively removes private content", () =
 
   const encoded = JSON.stringify(sanitized);
   assert.match(encoded, /tokensPerSecond/);
-  assert.match(encoded, /cpuBytes/);
+  assert.doesNotMatch(encoded, /cpuBytes|nested/i);
   assert.doesNotMatch(encoded, /private|secret|authorization|cookie|prompt|response|url|stack/i);
+});
+
+test("journal omits free-form telemetry strings, nested values, arrays, and unknown event names", () => {
+  const privateText = "prompt and response text must never reach the journal";
+  const sanitized = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "generation",
+    name: privateText,
+    timestampMs: 100,
+    metrics: {
+      status: privateText,
+      reason: privateText,
+      code: privateText,
+      phase: privateText,
+      lifecycle: privateText,
+      nested: { status: privateText, cpuBytes: 4096 },
+      list: [privateText, { status: privateText }],
+      tokensPerSecond: 31.5,
+      cacheHit: true,
+    },
+  });
+
+  const encoded = JSON.stringify(sanitized);
+  assert.equal(sanitized.name, "telemetry_omitted");
+  assert.deepEqual(sanitized.metrics, { tokensPerSecond: 31.5, cacheHit: true });
+  assert.doesNotMatch(encoded, /prompt|response|never|journal|privateText|nested|list/i);
 });
 
 test("JSONL is written only inside the caller-supplied run directory", async () => {

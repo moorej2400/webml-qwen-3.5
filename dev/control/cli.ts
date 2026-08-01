@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { loadControlEnvironment } from "./config.js";
 import { ControlPlane } from "./control-plane.js";
-import { PairingAuthority } from "./pairing.js";
+import { SessionTicketAuthority } from "./session-ticket-authority.js";
 import {
   loadBrowserRuntimeConfiguration,
   loadBrowserRuntimeEnvironment,
@@ -35,14 +35,14 @@ const journal = new RunJournal({
 const controlPlane = new ControlPlane({
   onTelemetry: (event) => journal.append(event),
 });
-const pairingAuthority = new PairingAuthority({
-  pairingCode: config.pairingCode,
+const ticketAuthority = new SessionTicketAuthority({
   randomToken: () => randomBytes(32).toString("base64url"),
 });
 const appServer = createDevelopmentServer({
   tls,
   controlPlane,
-  pairingAuthority,
+  ticketAuthority,
+  publicOrigin: new URL(`https://${config.publicHost}:${config.publicPort}`).origin,
   runtimeConfiguration,
   staticModuleRoots: [
     {

@@ -114,10 +114,19 @@ Build the measurement and recovery system before full-model tuning.
 
 - Serve local development over iPhone-trusted HTTPS.
 - Inject the browser agent only in the local development build.
-- Authenticate the phone WSS connection.
+- Automatically connect each local phone document without a pairing code or
+  phone token entry. Issue a one-use, short-lived WSS ticket only after exact
+  same-origin `Host` and `Origin` checks; do not persist that ticket in the page.
+- Gate the phone WSS connection with that single-use ticket and repeat the exact
+  origin checks at upgrade. This is a trusted-local-network same-origin boundary,
+  not cryptographic client authentication; apply ticket lifetime, one-use, rate,
+  and pending-ticket caps.
 - Bind the separate operator API only to `127.0.0.1`.
 - Use durable device and tab IDs, a new document ID per reload, command IDs,
   benchmark IDs, and monotonic event sequences.
+- Add local-only server-derived correlation to control state and ignored JSONL:
+  coarse OS family/version and the direct socket IP. Never trust forwarded
+  headers or record raw user agents.
 - Support `load`, `dispose`, `runPrompt`, `cancelPrompt`, `getState`,
   `warmReload`, and `coldAppReload`.
 - Report `accepted`, `started`, and one terminal state: `completed`, `failed`,
@@ -128,9 +137,11 @@ Build the measurement and recovery system before full-model tuning.
 - Prefer protocol-driven recovery. Use iPhone Mirroring or remote desktop only
   when the page or socket cannot recover, then return to the protocol.
 
-Write bounded, sanitized JSONL only under ignored `.local/runs/` paths. Do not
-record raw prompts, responses, URLs, cookies, addresses, tokens, or unredacted
-stacks. Collect load phases, range and cache behavior, shader compilation,
+Write bounded, sanitized JSONL only under ignored `.local/runs/` paths. Omit
+unknown fields and free-form strings; do not redact and store raw prompts,
+responses, URLs, cookies, forwarded or private addresses, tokens, or unredacted
+stacks. The direct socket IP is the sole allowed address
+field and is local-only device correlation. Collect load phases, range and cache behavior, shader compilation,
 tracked CPU and GPU bytes, image processing, prompt processing, TTFT, token
 rate, thermal drift, lifecycle changes, socket loss, errors, and `device.lost`.
 
@@ -227,7 +238,7 @@ the 16K total context.
 
 Apply the repository's `gpt-taste` design preflight during UI implementation,
 adapted to a chat application. Never bundle private control endpoints, local
-addresses, pairing material, or operator credentials in the public build.
+addresses, local WSS tickets, or operator credentials in the public build.
 
 ## CI and GitHub Pages
 

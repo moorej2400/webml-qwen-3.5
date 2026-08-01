@@ -61,13 +61,13 @@ from the local manifest with the runtime's own canonicalizer:
 export QWEN_RUNTIME_MANIFEST_SHA256="$(node --import tsx --input-type=module -e 'import { readFileSync } from "node:fs"; import { modelCacheKey } from "./src/opfs-model-cache.ts"; process.stdout.write(modelCacheKey(JSON.parse(readFileSync(process.env.QWEN_RUNTIME_MANIFEST, "utf8"))))')"
 ```
 
-## Process-only credentials
+## Operator credential and automatic phone connection
 
-Generate a one-time pairing code and a different operator token in the current
-shell. The commands below keep the values in process environment only:
+Generate only the operator token in the current shell. The phone does not use a
+code, token entry, persistent device secret, or dialog. The commands below keep
+the operator token in process environment only:
 
 ```sh
-export QWEN_CONTROL_PAIRING_CODE="$(openssl rand -base64 48 | tr -d '\n' | tr '+/' '-_')"
 export QWEN_CONTROL_OPERATOR_TOKEN="$(openssl rand -base64 48 | tr -d '\n' | tr '+/' '-_')"
 export QWEN_CONTROL_TLS_CERT=".local/tls/cert.pem"
 export QWEN_CONTROL_TLS_KEY=".local/tls/key.pem"
@@ -75,24 +75,30 @@ export QWEN_CONTROL_PUBLIC_HOST="<development-hostname>"
 npm run control:dev
 ```
 
-Do not put the pairing code or token in `.env`, shell scripts, command
-arguments, source files, or logs. Enter the pairing code through the on-device
-pairing flow. The code expires after five minutes and works once. The resulting
-device session requests a single-use, short-lived ticket for each WebSocket
-connection. The public browser-agent response contains no reusable credential.
-The local-only page shows a pairing dialog when it has no valid device session.
+Do not put the operator token in `.env`, shell scripts, command arguments,
+source files, or logs. Each locally served document automatically requests one
+short-lived, single-use WSS ticket from its exact same HTTPS origin. The server
+checks both `Host` and `Origin` before it issues the ticket and checks them again
+at the WebSocket upgrade. The ticket is only in the immediate browser request
+and WebSocket handshake; it is never stored in HTML, JavaScript, local storage,
+or session storage. This is a trusted-local-network, browser same-origin and
+CSRF boundary, not cryptographic phone authentication: a network client that
+can forge the required headers is not cryptographically identified. Ticket
+issuance has a short lifetime, a one-use rule, a bounded pending-ticket pool,
+and a bounded issue rate to limit accidental reconnect storms.
 
-The service fails closed if TLS material, either credential, or the explicit
-public host is missing. The operator API always binds to the IPv4 loopback
-interface. Only the HTTPS app and authenticated phone WebSocket use the
-configured development host.
+The service fails closed if TLS material, the operator credential, or the
+explicit public host is missing. The operator API always binds to the IPv4 loopback
+interface. Only the HTTPS app and same-origin-gated phone WebSocket use the
+configured development host. The operator API remains bearer-authenticated and
+loopback-only.
 
 ## Phone and operator flow
 
 Open `https://<development-hostname>:<public-port>/` in Safari on the iPhone.
-Enter the one-time pairing code in the page dialog. The minimal page has Load,
-Run prompt, Cancel, Dispose, and Get state controls. These controls call the
-same session handlers used by the authenticated operator commands.
+It connects to the local protocol automatically. The minimal page has Load, Run
+prompt, Cancel, Dispose, and Get state controls. These controls call the same
+session handlers used by the authenticated operator commands.
 
 The loopback operator API accepts `load`, `runPrompt`, `cancelPrompt`,
 `dispose`, `getState`, `warmReload`, and `coldAppReload`. `load` uses only the
@@ -118,7 +124,12 @@ retry before it asks for an external fallback. A cold app reload reports
 the phone or a remote desktop.
 
 Structured telemetry is written under ignored `.local/runs/`. The journal uses
-an allowlist and does not store prompts, responses, URLs, cookies, headers,
-addresses, or stack traces. A run uses capped segments and stops accepting new
-events at its hard cap instead of overwriting prior evidence. The operator API
-returns sanitized benchmark identifiers and numeric metric summaries.
+an allowlist and omits unknown fields and free-form strings; it does not redact
+and store prompts, responses, URLs, cookies, forwarded addresses, or stack
+traces. For local device correlation only, each record may
+include the durable device, tab, and document IDs, a coarse server-parsed OS
+family/version, and the direct TLS socket IP. It never uses forwarded headers.
+These local fields are ignored by Git and excluded from the public build. A run
+uses capped segments and stops accepting new events at its hard cap instead of
+overwriting prior evidence. The operator API returns sanitized benchmark
+identifiers and numeric metric summaries.

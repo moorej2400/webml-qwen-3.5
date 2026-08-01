@@ -4,10 +4,10 @@ import test from "node:test";
 
 import { createBrowserAgentSource } from "../dev/control/browser-agent-source.js";
 import { ControlPlane } from "../dev/control/control-plane.js";
-import { PairingAuthority } from "../dev/control/pairing.js";
+import { SessionTicketAuthority } from "../dev/control/session-ticket-authority.js";
 import {
-  authenticatePhoneProtocols,
-  connectAuthenticatedPhone,
+  consumePhoneTicketProtocols,
+  connectTicketBoundPhone,
 } from "../dev/control/server.js";
 
 class FakeStorage {
@@ -65,13 +65,10 @@ const flush = async (): Promise<void> => {
   await new Promise<void>((resolve) => setImmediate(resolve));
 };
 
-const createAgentHarness = (sessionCapability?: string) => {
+const createAgentHarness = () => {
   FakeWebSocket.instances = [];
   const localStorage = new FakeStorage();
   const sessionStorage = new FakeStorage();
-  if (sessionCapability !== undefined) {
-    sessionStorage.setItem("qwen.control.session", sessionCapability);
-  }
   const lifecycle = new Map<string, (() => void)[]>();
   const fetches: string[] = [];
   let reloads = 0;
@@ -113,9 +110,7 @@ const createAgentHarness = (sessionCapability?: string) => {
       return {
         ok: true,
         async json() {
-          return url === "/.local-pair"
-            ? { sessionCapability: "session_0123456789abcdef" }
-            : { ticket: "ticket_0123456789abcdef" };
+          return { ticket: "ticket_0123456789abcdef" };
         },
       };
     },
@@ -138,7 +133,6 @@ const createAgentHarness = (sessionCapability?: string) => {
   vm.runInNewContext(createBrowserAgentSource(), context);
   return {
     context: context as Record<string, unknown> & {
-      __QWEN_LOCAL_PAIR__: (code: string) => Promise<void>;
       __QWEN_LOCAL_CONTROL__?: Record<string, unknown>;
     },
     fetches,
@@ -154,7 +148,7 @@ const createAgentHarness = (sessionCapability?: string) => {
   };
 };
 
-test("generated agent executes pairing, replay, deduplication, reload, and fail-closed behavior", async () => {
+test("generated agent connects automatically, replays, deduplicates, and reloads", async () => {
   const harness = createAgentHarness();
   let generations = 0;
   harness.context.__QWEN_LOCAL_CONTROL__ = {
@@ -163,8 +157,11 @@ test("generated agent executes pairing, replay, deduplication, reload, and fail-
     },
   };
   harness.signalRuntimeReady();
-  await harness.context.__QWEN_LOCAL_PAIR__("pairing-code");
-  assert.deepEqual(harness.fetches, ["/.local-pair", "/.local-ticket"]);
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  assert.deepEqual(harness.fetches, ["/.local-ticket"]);
   const socket = FakeWebSocket.instances[0];
   assert.ok(socket);
   socket.emit("open");
@@ -172,6 +169,24 @@ test("generated agent executes pairing, replay, deduplication, reload, and fail-
   assert.equal(opened[0]?.type, "hello");
   assert.equal(opened[1]?.type, "ready");
   assert.equal(opened[1]?.eventSeq, 1);
+  const connected = opened[2] as {
+    event: { timestampMs: number; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  assert.deepEqual({ ...connected, event: { ...connected.event, timestampMs: 0 } }, {
+    schemaVersion: 1,
+    deviceId: (opened[1] as { deviceId: string }).deviceId,
+    tabId: (opened[1] as { tabId: string }).tabId,
+    documentId: (opened[1] as { documentId: string }).documentId,
+    eventSeq: 2,
+    type: "telemetry",
+    event: {
+      category: "device",
+      name: "connected",
+      timestampMs: 0,
+      metrics: { status: "connected" },
+    },
+  });
 
   socket.emit("message", {
     schemaVersion: 1,
@@ -223,7 +238,7 @@ test("generated agent executes pairing, replay, deduplication, reload, and fail-
 });
 
 test("generated agent prevents overlapping reconnects and inherited handlers", async () => {
-  const harness = createAgentHarness("session_0123456789abcdef");
+  const harness = createAgentHarness();
   let inheritedCalls = 0;
   const pageshow = harness.lifecycle.get("pageshow")?.[0];
   assert.ok(pageshow);
@@ -261,7 +276,7 @@ test("generated agent prevents overlapping reconnects and inherited handlers", a
 });
 
 test("generated agent does not identify or accept queued work before runtime handlers are ready", async () => {
-  const harness = createAgentHarness("session_0123456789abcdef");
+  const harness = createAgentHarness();
   const pageshow = harness.lifecycle.get("pageshow")?.[0];
   assert.ok(pageshow);
   pageshow();
@@ -292,7 +307,7 @@ test("generated agent does not identify or accept queued work before runtime han
 });
 
 test("generated agent classifies an interrupted active prompt as cancelled", async () => {
-  const harness = createAgentHarness("session_0123456789abcdef");
+  const harness = createAgentHarness();
   let rejectPrompt: ((error: Error) => void) | undefined;
   harness.context.__QWEN_LOCAL_CONTROL__ = {
     runPrompt() {
@@ -346,22 +361,19 @@ test("authenticated in-memory server boundary dispatches only after ticket consu
     tabId: "tab_0123456789abcdef",
     documentId: "document_0123456789abcdef",
   };
-  const pairingCode = "A".repeat(43);
   let tokenIndex = 0;
-  const authority = new PairingAuthority({
-    pairingCode,
+  const authority = new SessionTicketAuthority({
     now: () => 1,
     randomToken: () => `${String(++tokenIndex).padStart(2, "0")}${"B".repeat(41)}`,
   });
-  const session = authority.pair(pairingCode, identity);
-  const ticket = authority.issueTicket(session.sessionCapability, identity);
-  const auth = authenticatePhoneProtocols(
+  const ticket = authority.issueTicket(identity);
+  const auth = consumePhoneTicketProtocols(
     `qwen-control.v1, ${ticket.ticket}`,
     (candidate) => authority.consumeTicket(candidate),
   );
   assert.equal(auth.accepted, true);
   assert.deepEqual(
-    authenticatePhoneProtocols(
+    consumePhoneTicketProtocols(
       `qwen-control.v1, ${ticket.ticket}`,
       (candidate) => authority.consumeTicket(candidate),
     ),
@@ -370,13 +382,13 @@ test("authenticated in-memory server boundary dispatches only after ticket consu
   if (!auth.accepted) return;
   const sent: { type: string }[] = [];
   const plane = new ControlPlane();
-  const connectionId = connectAuthenticatedPhone(plane, auth.identity, identity, (message) => {
+  const connectionId = connectTicketBoundPhone(plane, auth.identity, identity, (message) => {
     sent.push(message);
     return true;
   });
   assert.throws(
     () =>
-      connectAuthenticatedPhone(
+      connectTicketBoundPhone(
         plane,
         auth.identity,
         { ...identity, documentId: "document_spoofed_0123456789" },

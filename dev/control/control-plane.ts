@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import type { SocketDeviceMetadata } from "./device-correlation.js";
 import {
   CONTROL_SCHEMA_VERSION,
   CommandTracker,
@@ -52,6 +53,7 @@ export const classifyDisconnect = (
 interface Connection {
   connectionId: string;
   identity: PhoneIdentity;
+  deviceMetadata?: SocketDeviceMetadata;
   send: (message: ServerToPhoneMessage) => boolean;
   lastEvidence?: DisconnectEvidence;
 }
@@ -158,7 +160,11 @@ export class ControlPlane {
     this.#onTelemetry = options.onTelemetry;
   }
 
-  connect(identityInput: PhoneIdentity, send: Connection["send"]): string {
+  connect(
+    identityInput: PhoneIdentity,
+    send: Connection["send"],
+    deviceMetadata?: SocketDeviceMetadata,
+  ): string {
     this.#prune();
     const identity = {
       deviceId: validateProtocolId(identityInput.deviceId, "deviceId"),
@@ -167,7 +173,12 @@ export class ControlPlane {
     };
     const key = tabKey(identity);
     const connectionId = `connection_${randomUUID()}`;
-    const connection = { connectionId, identity, send };
+    const connection = {
+      connectionId,
+      identity,
+      send,
+      ...(deviceMetadata === undefined ? {} : { deviceMetadata: structuredClone(deviceMetadata) }),
+    };
     // Reserve bounded sequence ownership before publishing the connection.
     const expectedSeq = this.#sequences.acquire(identity.documentId);
     this.#connections.set(connectionId, connection);
@@ -381,6 +392,9 @@ export class ControlPlane {
             tabId: connection.identity.tabId,
             documentId: connection.identity.documentId,
             eventSeq: message.eventSeq,
+            ...(connection.deviceMetadata === undefined
+              ? {}
+              : { deviceMetadata: connection.deviceMetadata }),
           }),
         ).catch(() => undefined);
       }
@@ -447,9 +461,14 @@ export class ControlPlane {
     return this.#commands.get(commandId)?.tracker.snapshot();
   }
 
-  getConnectedState(): PhoneIdentity[] {
+  getConnectedState(): Array<PhoneIdentity & { deviceMetadata?: SocketDeviceMetadata }> {
     this.#prune();
-    return [...this.#connections.values()].map(({ identity }) => structuredClone(identity));
+    return [...this.#connections.values()].map(({ identity, deviceMetadata }) =>
+      structuredClone({
+        ...identity,
+        ...(deviceMetadata === undefined ? {} : { deviceMetadata }),
+      }),
+    );
   }
 
   getBenchmark(benchmarkId: string): CommandSnapshot[] {

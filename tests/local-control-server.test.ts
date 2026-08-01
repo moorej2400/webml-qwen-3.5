@@ -9,14 +9,16 @@ import test from "node:test";
 
 import {
   assertHighEntropyCredential,
-  authenticatePhoneProtocols,
+  consumePhoneTicketProtocols,
   createOperatorRequestHandler,
   createOperatorServer,
+  isControlUpgradePath,
+  isSameOriginRequest,
   listenOperatorServer,
   loadLocalTlsMaterial,
 } from "../dev/control/server.js";
 import { ControlPlane } from "../dev/control/control-plane.js";
-import { PairingAuthority } from "../dev/control/pairing.js";
+import { SessionTicketAuthority } from "../dev/control/session-ticket-authority.js";
 import { CONTROL_COMMANDS } from "../dev/control/protocol.js";
 
 test("credentials must be high entropy and are not accepted as short secrets", () => {
@@ -24,9 +26,71 @@ test("credentials must be high entropy and are not accepted as short secrets", (
   assert.doesNotThrow(() => assertHighEntropyCredential(randomBytes(32).toString("base64url"), "credential"));
 });
 
-test("phone authentication accepts only the exact token via WebSocket subprotocol", () => {
-  const authority = new PairingAuthority({
-    pairingCode: randomBytes(32).toString("base64url"),
+test("ticket and WSS origin guard accepts only the exact local HTTPS origin", () => {
+  const request = (headers: Record<string, string>): IncomingMessage => ({ headers } as IncomingMessage);
+  assert.equal(
+    isSameOriginRequest(request({ host: "development.invalid:8443", origin: "https://development.invalid:8443" }), "https://development.invalid:8443"),
+    true,
+  );
+  assert.equal(
+    isSameOriginRequest(request({ host: "development.invalid:8443", origin: "https://elsewhere.invalid" }), "https://development.invalid:8443"),
+    false,
+  );
+  assert.equal(
+    isSameOriginRequest(request({ host: "development.invalid", origin: "https://development.invalid:8443" }), "https://development.invalid:8443"),
+    false,
+  );
+  for (const host of [
+    "development.invalid:8443/path",
+    "development.invalid:8443?query",
+    "development.invalid:8443#fragment",
+    "user@development.invalid:8443",
+  ]) {
+    assert.equal(
+      isSameOriginRequest(request({ host, origin: "https://development.invalid:8443" }), "https://development.invalid:8443"),
+      false,
+      `reject malformed Host: ${host}`,
+    );
+  }
+  for (const origin of [
+    "https://development.invalid:8443/path",
+    "https://development.invalid:8443?query",
+    "https://development.invalid:8443#fragment",
+    "https://user@development.invalid:8443",
+  ]) {
+    assert.equal(
+      isSameOriginRequest(request({ host: "development.invalid:8443", origin }), "https://development.invalid:8443"),
+      false,
+      `reject non-origin Origin header: ${origin}`,
+    );
+  }
+  assert.equal(
+    isSameOriginRequest(request({ host: "DEVELOPMENT.INVALID:8443", origin: "https://development.invalid:8443" }), "https://development.invalid:8443"),
+    true,
+  );
+  assert.equal(
+    isSameOriginRequest(request({ host: "[::1]:8443", origin: "https://[::1]:8443" }), "https://[::1]:8443"),
+    true,
+  );
+  assert.equal(
+    isSameOriginRequest(request({ host: "development.invalid:8443", origin: "https://development.invalid:8443" }), "https://user@development.invalid:8443"),
+    false,
+  );
+});
+
+test("only the control WebSocket path can reach ticket consumption", () => {
+  assert.equal(isControlUpgradePath("/.local-control"), true);
+  assert.equal(isControlUpgradePath("/.local-control?reconnect=1"), false);
+  assert.equal(isControlUpgradePath("/.local-control#fragment"), false);
+  assert.equal(isControlUpgradePath("https://user@development.invalid/.local-control"), false);
+  assert.equal(isControlUpgradePath("/.local-control/../.local-control"), false);
+  assert.equal(isControlUpgradePath("//development.invalid/.local-control"), false);
+  assert.equal(isControlUpgradePath("/.local-control-wrong"), false);
+  assert.equal(isControlUpgradePath("/.local-ticket"), false);
+});
+
+test("ticket-bound phone connection accepts only one exact ticket via WebSocket subprotocol", () => {
+  const authority = new SessionTicketAuthority({
     now: () => 1_000,
     randomToken: () => randomBytes(32).toString("base64url"),
   });
@@ -35,16 +99,13 @@ test("phone authentication accepts only the exact token via WebSocket subprotoco
     tabId: "tab_0123456789abcdef",
     documentId: "document_0123456789abcdef",
   };
-  const pairingCode = randomBytes(32).toString("base64url");
-  const ticketAuthority = new PairingAuthority({
-    pairingCode,
+  const ticketAuthority = new SessionTicketAuthority({
     now: () => 1_000,
     randomToken: () => randomBytes(32).toString("base64url"),
   });
-  const session = ticketAuthority.pair(pairingCode, identity);
-  const ticket = ticketAuthority.issueTicket(session.sessionCapability, identity);
+  const ticket = ticketAuthority.issueTicket(identity);
   assert.deepEqual(
-    authenticatePhoneProtocols(
+    consumePhoneTicketProtocols(
       `qwen-control.v1, ${ticket.ticket}`,
       (candidate) => ticketAuthority.consumeTicket(candidate),
     ),
@@ -54,7 +115,7 @@ test("phone authentication accepts only the exact token via WebSocket subprotoco
       identity,
     },
   );
-  assert.deepEqual(authenticatePhoneProtocols("qwen-control.v1, wrong", (candidate) =>
+  assert.deepEqual(consumePhoneTicketProtocols("qwen-control.v1, wrong", (candidate) =>
     authority.consumeTicket(candidate),
   ), {
     accepted: false,

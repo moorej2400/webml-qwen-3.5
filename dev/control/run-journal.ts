@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
+import type { CoarseOsFamily } from "./device-correlation.js";
 import { validateProtocolId } from "./protocol.js";
 
 const MAX_EVENT_BYTES = 16_384;
@@ -20,8 +21,33 @@ const ALLOWED_CATEGORIES = new Set([
   "device",
   "benchmark",
 ]);
-const ALLOWED_METRIC_KEYS = new Set([
-  "phase",
+const ALLOWED_EVENT_NAMES = new Set([
+  "connected",
+  "pagehide",
+  "load_started",
+  "load_completed",
+  "load_failed",
+  "download_started",
+  "download_completed",
+  "cache_hit",
+  "cache_miss",
+  "shader_compiled",
+  "allocation",
+  "image_encoded",
+  "prefill_completed",
+  "token_rate",
+  "generation_started",
+  "generation_completed",
+  "generation_cancelled",
+  "device_lost",
+  "socket_disconnected",
+  "socket_reconnected",
+  "benchmark_started",
+  "benchmark_completed",
+  "runtime_error",
+  "telemetry_omitted",
+]);
+const NUMERIC_METRIC_KEYS = new Set([
   "durationMs",
   "bytes",
   "cpuBytes",
@@ -34,42 +60,38 @@ const ALLOWED_METRIC_KEYS = new Set([
   "prefillTokensPerSecond",
   "ttftMs",
   "tokensPerSecond",
-  "thermalState",
   "allocationBytes",
   "peakBytes",
-  "code",
-  "status",
   "count",
   "expected",
   "observed",
-  "reason",
-  "lifecycle",
-  "deviceLost",
   "sequence",
-  "nested",
 ]);
+const BOOLEAN_METRIC_KEYS = new Set(["cacheHit", "deviceLost"]);
+const STRING_METRIC_VALUES: Readonly<Record<string, ReadonlySet<string>>> = {
+  phase: new Set(["adapter", "model", "download", "cache", "shader", "vision", "prefill", "generation", "ready", "disposed"]),
+  thermalState: new Set(["unknown", "nominal", "fair", "serious", "critical"]),
+  code: new Set(["unknown", "device_lost", "out_of_memory", "network_error", "timeout", "cancelled", "unsupported", "runtime_error"]),
+  status: new Set(["accepted", "started", "completed", "failed", "cancelled", "timed_out", "indeterminate", "connected", "disconnected", "ready", "idle", "loading", "loaded", "unavailable"]),
+  reason: new Set(["unknown", "device_lost", "out_of_memory", "network_error", "timeout", "cancelled", "unsupported"]),
+  lifecycle: new Set(["pagehide", "navigation", "visibilitychange", "freeze", "resume", "reload"]),
+};
 
-const sanitizeMetricValue = (value: unknown, depth: number): unknown => {
-  if (depth > 4) return undefined;
-  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
-  if (typeof value === "boolean") return value;
-  if (typeof value === "string") return value.slice(0, 128).replace(/[^\x20-\x7e]/g, "");
-  if (Array.isArray(value)) {
-    return value
-      .slice(0, 64)
-      .map((entry) => sanitizeMetricValue(entry, depth + 1))
-      .filter((entry) => entry !== undefined);
-  }
-  if (typeof value === "object" && value !== null) {
-    const result: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value).slice(0, 64)) {
-      if (!ALLOWED_METRIC_KEYS.has(key)) continue;
-      const sanitized = sanitizeMetricValue(entry, depth + 1);
-      if (sanitized !== undefined) result[key] = sanitized;
+const sanitizeMetrics = (value: unknown): Record<string, unknown> => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (NUMERIC_METRIC_KEYS.has(key) && typeof entry === "number" && Number.isFinite(entry)) {
+      result[key] = entry;
+      continue;
     }
-    return result;
+    if (BOOLEAN_METRIC_KEYS.has(key) && typeof entry === "boolean") {
+      result[key] = entry;
+      continue;
+    }
+    if (typeof entry === "string" && STRING_METRIC_VALUES[key]?.has(entry)) result[key] = entry;
   }
-  return undefined;
+  return result;
 };
 
 export interface SanitizedTelemetryEvent {
@@ -84,7 +106,32 @@ export interface SanitizedTelemetryEvent {
   commandId?: string;
   benchmarkId?: string;
   eventSeq?: number;
+  deviceMetadata?: {
+    osFamily: CoarseOsFamily;
+    osVersion?: string;
+    remoteIp: string;
+  };
 }
+
+const OS_FAMILIES = new Set<CoarseOsFamily>([
+  "ios", "macos", "android", "windows", "linux", "other",
+]);
+
+const sanitizeDeviceMetadata = (input: unknown): SanitizedTelemetryEvent["deviceMetadata"] => {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+  const value = input as Record<string, unknown>;
+  if (typeof value.osFamily !== "string" || !OS_FAMILIES.has(value.osFamily as CoarseOsFamily)) {
+    return undefined;
+  }
+  const remoteIp = typeof value.remoteIp === "string" && /^(?:[0-9a-fA-F:.]{1,45}|unknown)$/.test(value.remoteIp)
+    ? value.remoteIp
+    : "unknown";
+  const osVersion =
+    typeof value.osVersion === "string" && /^\d{1,2}(?:\.\d{1,2}){0,2}$/.test(value.osVersion)
+      ? value.osVersion
+      : undefined;
+  return { osFamily: value.osFamily as CoarseOsFamily, ...(osVersion === undefined ? {} : { osVersion }), remoteIp };
+};
 
 /**
  * The journal is an allowlist boundary. Unknown fields are discarded instead
@@ -98,20 +145,14 @@ export const sanitizeTelemetryEvent = (input: Record<string, unknown>): Sanitize
   const event: SanitizedTelemetryEvent = {
     schemaVersion: 1,
     category,
-    name:
-      typeof input.name === "string"
-        ? input.name.slice(0, 64).replace(/[^A-Za-z0-9_.:-]/g, "_")
-        : "invalid_event",
+    name: typeof input.name === "string" && ALLOWED_EVENT_NAMES.has(input.name) ? input.name : "telemetry_omitted",
     timestampMs:
       typeof input.timestampMs === "number" && Number.isFinite(input.timestampMs)
         ? Math.max(0, Math.trunc(input.timestampMs))
         : 0,
     metrics: {},
   };
-  if (typeof input.metrics === "object" && input.metrics !== null) {
-    event.metrics =
-      (sanitizeMetricValue(input.metrics, 0) as Record<string, unknown> | undefined) ?? {};
-  }
+  event.metrics = sanitizeMetrics(input.metrics);
   for (const key of ["deviceId", "tabId", "documentId", "commandId", "benchmarkId"] as const) {
     try {
       if (input[key] !== undefined) event[key] = validateProtocolId(input[key], key);
@@ -122,6 +163,8 @@ export const sanitizeTelemetryEvent = (input: Record<string, unknown>): Sanitize
   if (Number.isSafeInteger(input.eventSeq) && (input.eventSeq as number) > 0) {
     event.eventSeq = input.eventSeq as number;
   }
+  const deviceMetadata = sanitizeDeviceMetadata(input.deviceMetadata);
+  if (deviceMetadata !== undefined) event.deviceMetadata = deviceMetadata;
   if (Buffer.byteLength(JSON.stringify(event)) > MAX_EVENT_BYTES) {
     event.metrics = { reason: "event_size_limit" };
   }

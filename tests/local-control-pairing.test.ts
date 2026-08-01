@@ -8,7 +8,7 @@ import { Readable } from "node:stream";
 import test from "node:test";
 
 import { createBrowserAgentSource } from "../dev/control/browser-agent-source.js";
-import { PairingAuthority } from "../dev/control/pairing.js";
+import { SessionTicketAuthority } from "../dev/control/session-ticket-authority.js";
 import { createDevelopmentRequestHandler } from "../dev/control/server.js";
 
 const identity = {
@@ -16,16 +16,21 @@ const identity = {
   tabId: "tab_0123456789abcdef",
   documentId: "document_0123456789abcdef",
 };
+const publicOrigin = "https://development.invalid:8443";
 
-test("public browser agent contains no reusable or one-time credential", () => {
-  const pairingCode = randomBytes(32).toString("base64url");
+const createAuthority = (): SessionTicketAuthority =>
+  new SessionTicketAuthority({
+    now: () => 1_000,
+    randomToken: () => randomBytes(32).toString("base64url"),
+  });
+
+test("local browser agent connects automatically without a reusable credential or a dialog", () => {
   const source = createBrowserAgentSource();
 
-  assert.doesNotMatch(source, new RegExp(pairingCode));
-  assert.doesNotMatch(source, /PHONE_TOKEN|PAIRING_CODE|const TOKEN/);
-  assert.match(source, /__QWEN_LOCAL_PAIR__/);
-  assert.match(source, /qwen-control-pairing-form/);
-  assert.match(source, /autocomplete = "one-time-code"/);
+  assert.match(source, /requestJson\("\/.local-ticket", identity\(\)\)/);
+  assert.doesNotMatch(source, /pairing|one-time-code|sessionCapability|Bearer /i);
+  assert.match(source, /credentials: "omit"/);
+  assert.doesNotMatch(source, /dialog|input\.type|password/i);
 });
 
 test("injected browser agent retains and replays bounded unacknowledged events", () => {
@@ -43,108 +48,117 @@ test("injected browser agent retains and replays bounded unacknowledged events",
   const retained = source.indexOf("outbox.set(eventSeq, frame)");
   const committed = source.indexOf("sequence = eventSeq");
   const transmitted = source.indexOf("sendFrame(frame)", committed);
-  assert.ok(
-    candidate >= 0 &&
-      candidate < retained &&
-      retained < committed &&
-      committed < transmitted,
-  );
+  assert.ok(candidate >= 0 && candidate < retained && retained < committed && committed < transmitted);
 });
 
-test("pairing code is one-time and creates a short-lived session capability", () => {
+test("same-origin ticket is short-lived, document-bound, and single use", () => {
   let nowMs = 1_000;
-  const pairingCode = randomBytes(32).toString("base64url");
-  const authority = new PairingAuthority({
-    pairingCode,
+  const authority = new SessionTicketAuthority({
     now: () => nowMs,
     randomToken: () => randomBytes(32).toString("base64url"),
-    pairingExpiresMs: 5_000,
-    sessionExpiresMs: 10_000,
+    ticketExpiresMs: 5_000,
   });
-
-  const session = authority.pair(pairingCode, identity);
-  assert.ok(session.sessionCapability.length >= 43);
-  assert.throws(() => authority.pair(pairingCode, identity), /consumed/i);
-  nowMs += 10_001;
-  assert.throws(
-    () => authority.issueTicket(session.sessionCapability, identity),
-    /expired/i,
-  );
-});
-
-test("WSS ticket is bound to identity and cannot be replayed", () => {
-  const pairingCode = randomBytes(32).toString("base64url");
-  const authority = new PairingAuthority({
-    pairingCode,
-    now: () => 1_000,
-    randomToken: () => randomBytes(32).toString("base64url"),
-  });
-  const session = authority.pair(pairingCode, identity);
-  const ticket = authority.issueTicket(session.sessionCapability, identity);
+  const ticket = authority.issueTicket(identity);
 
   assert.deepEqual(authority.consumeTicket(ticket.ticket), identity);
   assert.throws(() => authority.consumeTicket(ticket.ticket), /replay|consumed/i);
+
+  const expired = authority.issueTicket(identity);
+  nowMs += 5_001;
+  assert.throws(() => authority.consumeTicket(expired.ticket), /expired/i);
 });
 
-test("invalid LAN pairing attempt receives no session capability", () => {
-  const authority = new PairingAuthority({
-    pairingCode: randomBytes(32).toString("base64url"),
-    now: () => 1_000,
-    randomToken: () => randomBytes(32).toString("base64url"),
+test("ticket authority prunes expired reconnect tickets and fails safely at its pending cap", () => {
+  let nowMs = 1_000;
+  let tokenNumber = 0;
+  const authority = new SessionTicketAuthority({
+    now: () => nowMs,
+    randomToken: () => `ticket_${String(++tokenNumber).padStart(40, "0")}`,
+    ticketExpiresMs: 5_000,
+    maxPendingTickets: 2,
   });
 
-  assert.throws(() => authority.pair(randomBytes(32).toString("base64url"), identity), /invalid/i);
-  assert.equal(authority.activeSessionCount(), 0);
+  authority.issueTicket(identity);
+  authority.issueTicket(identity);
+  assert.throws(() => authority.issueTicket(identity), /capacity/i);
+
+  // Failed reconnect storms cannot retain expired records: the next issue prunes them.
+  nowMs += 5_001;
+  assert.doesNotThrow(() => authority.issueTicket(identity));
+  assert.doesNotThrow(() => authority.issueTicket(identity));
+  assert.throws(() => authority.issueTicket(identity), /capacity/i);
 });
 
-test("unauthenticated development responses never disclose reusable authentication", async () => {
-  const pairingCode = randomBytes(32).toString("base64url");
-  const authority = new PairingAuthority({
-    pairingCode,
-    now: () => 1_000,
+test("ticket authority bounds repeated ticket requests even when each ticket is consumed", () => {
+  let nowMs = 1_000;
+  const authority = new SessionTicketAuthority({
+    now: () => nowMs,
     randomToken: () => randomBytes(32).toString("base64url"),
+    maxPendingTickets: 4,
+    maxIssuesPerWindow: 2,
+    issueWindowMs: 5_000,
   });
+
+  for (let index = 0; index < 2; index += 1) {
+    const ticket = authority.issueTicket(identity);
+    authority.consumeTicket(ticket.ticket);
+  }
+  assert.throws(() => authority.issueTicket(identity), /rate/i);
+  nowMs += 5_001;
+  assert.doesNotThrow(() => authority.issueTicket(identity));
+});
+
+test("ticket endpoint admits only an exact same-origin request and exposes no reusable secret", async () => {
   const handler = createDevelopmentRequestHandler({
-    pairingAuthority: authority,
+    ticketAuthority: createAuthority(),
+    publicOrigin,
     html: "<main></main>",
   });
   const invoke = async (
     method: string,
     url: string,
+    headers: Record<string, string>,
     body?: Record<string, unknown>,
   ): Promise<{ status: number; body: string }> => {
     const request = Readable.from(body === undefined ? [] : [JSON.stringify(body)]);
-    Object.assign(request, { method, url, headers: {} });
+    Object.assign(request, { method, url, headers });
     let status = 0;
     let responseBody = "";
-    const response = {
-      writeHead(code: number) {
-        status = code;
-        return this;
-      },
-      end(chunk?: string) {
-        responseBody += chunk ?? "";
-        return this;
-      },
-    };
     await handler(
       request as unknown as IncomingMessage,
-      response as unknown as ServerResponse,
+      {
+        writeHead(code: number) { status = code; return this; },
+        end(chunk?: string) { responseBody += chunk ?? ""; return this; },
+      } as unknown as ServerResponse,
     );
     return { status, body: responseBody };
   };
 
-  const script = await invoke("GET", "/.local-agent.js");
+  const script = await invoke("GET", "/.local-agent.js", { host: "development.invalid:8443" });
   assert.equal(script.status, 200);
-  assert.doesNotMatch(script.body, new RegExp(pairingCode));
-  assert.doesNotMatch(script.body, /sessionCapability\s*[:=]\s*["'][A-Za-z0-9_-]{20}/);
+  assert.doesNotMatch(script.body, /pairing|sessionCapability|Bearer /i);
 
-  const rejected = await invoke("POST", "/.local-pair", {
-    pairingCode: randomBytes(32).toString("base64url"),
-    ...identity,
-  });
-  assert.equal(rejected.status, 401);
-  assert.doesNotMatch(rejected.body, /sessionCapability/);
+  const ticket = await invoke(
+    "POST",
+    "/.local-ticket",
+    { host: "development.invalid:8443", origin: publicOrigin },
+    identity,
+  );
+  assert.equal(ticket.status, 200);
+  assert.match(ticket.body, /"ticket":"[A-Za-z0-9_-]{43,}"/);
+
+  const crossOrigin = await invoke(
+    "POST",
+    "/.local-ticket",
+    { host: "development.invalid:8443", origin: "https://elsewhere.invalid" },
+    identity,
+  );
+  assert.equal(crossOrigin.status, 403);
+  assert.doesNotMatch(crossOrigin.body, /ticket|secret|credential/i);
+  assert.equal(
+    (await invoke("POST", "/.local-pair", { host: "development.invalid:8443", origin: publicOrigin }, identity)).status,
+    404,
+  );
 });
 
 test("development server serves only real JavaScript files under explicit module roots", async () => {
@@ -155,16 +169,11 @@ test("development server serves only real JavaScript files under explicit module
   await writeFile(path.join(root, "src", "private.txt"), "not served\n");
   await writeFile(path.join(outside, "outside.js"), "export const escaped = true;\n");
   await symlink(path.join(outside, "outside.js"), path.join(root, "src", "linked.js"));
-  const authority = new PairingAuthority({
-    pairingCode: randomBytes(32).toString("base64url"),
-    randomToken: () => randomBytes(32).toString("base64url"),
-  });
   const handler = createDevelopmentRequestHandler({
-    pairingAuthority: authority,
+    ticketAuthority: createAuthority(),
+    publicOrigin,
     html: "<main></main>",
-    staticModuleRoots: [
-      { routePrefix: "/assets/src/", directory: path.join(root, "src") },
-    ],
+    staticModuleRoots: [{ routePrefix: "/assets/src/", directory: path.join(root, "src") }],
   });
   const invoke = async (url: string): Promise<{ status: number; body: string; headers: Record<string, string> }> => {
     let status = 0;
@@ -173,15 +182,8 @@ test("development server serves only real JavaScript files under explicit module
     await handler(
       { method: "GET", url, headers: {} } as IncomingMessage,
       {
-        writeHead(code: number, values?: Record<string, string>) {
-          status = code;
-          headers = values ?? {};
-          return this;
-        },
-        end(chunk?: string | Buffer) {
-          responseBody += chunk?.toString() ?? "";
-          return this;
-        },
+        writeHead(code: number, values?: Record<string, string>) { status = code; headers = values ?? {}; return this; },
+        end(chunk?: string | Buffer) { responseBody += chunk?.toString() ?? ""; return this; },
       } as unknown as ServerResponse,
     );
     return { status, body: responseBody, headers };
@@ -198,10 +200,6 @@ test("development server serves only real JavaScript files under explicit module
 });
 
 test("development page exposes no-store credential-free runtime configuration", async () => {
-  const authority = new PairingAuthority({
-    pairingCode: randomBytes(32).toString("base64url"),
-    randomToken: () => randomBytes(32).toString("base64url"),
-  });
   const runtimeConfiguration = {
     manifest: { format: "fixture" },
     packageBaseUrl: `https://huggingface.co/example/package/resolve/${"a".repeat(40)}/`,
@@ -210,7 +208,8 @@ test("development page exposes no-store credential-free runtime configuration", 
     compiledTokenizerUrl: `https://huggingface.co/example/package/resolve/${"a".repeat(40)}/tokenizer.bin`,
   };
   const handler = createDevelopmentRequestHandler({
-    pairingAuthority: authority,
+    ticketAuthority: createAuthority(),
+    publicOrigin,
     html: "<main></main>",
     runtimeConfiguration,
   });
@@ -220,11 +219,7 @@ test("development page exposes no-store credential-free runtime configuration", 
   await handler(
     { method: "GET", url: "/.local-runtime-config.json", headers: {} } as IncomingMessage,
     {
-      writeHead(code: number, values?: Record<string, string>) {
-        status = code;
-        headers = values ?? {};
-        return this;
-      },
+      writeHead(code: number, values?: Record<string, string>) { status = code; headers = values ?? {}; return this; },
       end(chunk?: string) { body += chunk ?? ""; return this; },
     } as unknown as ServerResponse,
   );
@@ -232,5 +227,5 @@ test("development page exposes no-store credential-free runtime configuration", 
   assert.equal(status, 200);
   assert.equal(headers["cache-control"], "no-store");
   assert.deepEqual(JSON.parse(body), runtimeConfiguration);
-  assert.doesNotMatch(body, /pairing|operator|credential|manifestPath/i);
+  assert.doesNotMatch(body, /operator|credential|manifestPath/i);
 });

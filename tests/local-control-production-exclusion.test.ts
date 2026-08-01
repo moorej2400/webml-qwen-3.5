@@ -102,6 +102,8 @@ test("public build contains no local control agent or private connection materia
     "qwen35-session.js",
     "qwen35-uniform-arena.d.ts",
     "qwen35-uniform-arena.js",
+    "qwen35-vision-preprocess.d.ts",
+    "qwen35-vision-preprocess.js",
     "qwen35-webgpu-executor.d.ts",
     "qwen35-webgpu-executor.js",
     "qwen35-weight-directory.d.ts",

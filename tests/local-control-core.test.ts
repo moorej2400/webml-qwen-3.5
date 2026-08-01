@@ -70,6 +70,25 @@ test("two tabs are tracked independently for one durable device", () => {
   );
 });
 
+test("server-derived device metadata is attached to local telemetry and state", () => {
+  const telemetry: Record<string, unknown>[] = [];
+  const plane = new ControlPlane({ onTelemetry: (event) => telemetry.push(event) });
+  const currentIdentity = identity("document_0123456789abcdef");
+  const metadata = { osFamily: "ios" as const, osVersion: "18.4", remoteIp: "192.0.2.44" };
+  const connectionId = plane.connect(currentIdentity, () => true, metadata);
+
+  plane.receive(connectionId, {
+    schemaVersion: 1,
+    type: "telemetry",
+    ...currentIdentity,
+    eventSeq: 1,
+    event: { category: "device", name: "connected", timestampMs: 1, metrics: {} },
+  });
+
+  assert.deepEqual(telemetry[0]?.deviceMetadata, metadata);
+  assert.deepEqual(plane.getConnectedState()[0]?.deviceMetadata, metadata);
+});
+
 test("retrying a command id never sends runPrompt twice", () => {
   const plane = new ControlPlane({ clock: new FakeClock() });
   const phone = connect(plane, identity("document_0123456789abcdef"));

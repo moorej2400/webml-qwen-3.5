@@ -12,7 +12,8 @@ import {
   type IssueCommandRequest,
   type ServerToPhoneMessage,
 } from "./control-plane.js";
-import { PairingAuthority } from "./pairing.js";
+import { deriveSocketDeviceMetadata, type SocketDeviceMetadata } from "./device-correlation.js";
+import { SessionTicketAuthority } from "./session-ticket-authority.js";
 import {
   CONTROL_COMMANDS,
   CONTROL_SCHEMA_VERSION,
@@ -34,7 +35,7 @@ const constantTimeEqual = (left: string, right: string): boolean => {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
 };
 
-export const authenticatePhoneProtocols = (
+export const consumePhoneTicketProtocols = (
   header: string | string[] | undefined,
   consumeTicket: (ticket: string) => PhoneIdentity,
 ):
@@ -56,20 +57,72 @@ export const authenticatePhoneProtocols = (
   }
 };
 
-export const connectAuthenticatedPhone = (
+export const connectTicketBoundPhone = (
   controlPlane: ControlPlane,
-  authenticatedIdentity: PhoneIdentity,
+  ticketIdentity: PhoneIdentity,
   hello: PhoneIdentity,
   send: (message: ServerToPhoneMessage) => boolean,
+  deviceMetadata?: SocketDeviceMetadata,
 ): string => {
   if (
-    authenticatedIdentity.deviceId !== hello.deviceId ||
-    authenticatedIdentity.tabId !== hello.tabId ||
-    authenticatedIdentity.documentId !== hello.documentId
+    ticketIdentity.deviceId !== hello.deviceId ||
+    ticketIdentity.tabId !== hello.tabId ||
+    ticketIdentity.documentId !== hello.documentId
   ) {
     throw new Error("hello identity does not match WSS ticket");
   }
-  return controlPlane.connect(hello, send);
+  return controlPlane.connect(hello, send, deviceMetadata);
+};
+
+/** Reject non-control routes before any one-use ticket is consumed. */
+export const isControlUpgradePath = (requestUrl: string | undefined): boolean => {
+  return requestUrl === "/.local-control";
+};
+
+/** Enforces the same local HTTPS authority for ticket issuance and WSS upgrade. */
+export const isSameOriginRequest = (request: IncomingMessage, publicOrigin: string): boolean => {
+  let expected: URL;
+  try {
+    expected = new URL(publicOrigin);
+  } catch {
+    return false;
+  }
+  if (
+    expected.protocol !== "https:" ||
+    expected.username !== "" ||
+    expected.password !== "" ||
+    expected.pathname !== "/" ||
+    expected.search ||
+    expected.hash
+  ) {
+    return false;
+  }
+  const host = request.headers.host;
+  const originHeader = request.headers.origin;
+  if (typeof host !== "string" || typeof originHeader !== "string") return false;
+  try {
+    const parsedHost = new URL(`https://${host}`);
+    const parsedOrigin = new URL(originHeader);
+    const hostIsAuthorityOnly =
+      parsedHost.protocol === "https:" &&
+      parsedHost.username === "" &&
+      parsedHost.password === "" &&
+      parsedHost.pathname === "/" &&
+      parsedHost.search === "" &&
+      parsedHost.hash === "";
+    const originIsSerializedOriginOnly =
+      parsedOrigin.protocol === "https:" &&
+      parsedOrigin.username === "" &&
+      parsedOrigin.password === "" &&
+      parsedOrigin.pathname === "/" &&
+      parsedOrigin.search === "" &&
+      parsedOrigin.hash === "" &&
+      originHeader === parsedOrigin.origin;
+    // Host case and IPv6 syntax are normalized, but neither header may carry a URL path or credentials.
+    return hostIsAuthorityOnly && originIsSerializedOriginOnly && parsedHost.host === expected.host && parsedOrigin.origin === expected.origin;
+  } catch {
+    return false;
+  }
 };
 
 const resolveLocalFile = async (projectRoot: string, relativePath: string): Promise<string> => {
@@ -245,7 +298,9 @@ export const listenOperatorServer = async (
 export interface DevelopmentServerOptions {
   tls: { cert: Buffer; key: Buffer };
   controlPlane: ControlPlane;
-  pairingAuthority: PairingAuthority;
+  ticketAuthority: SessionTicketAuthority;
+  /** Exact HTTPS origin served to the phone, including the development port. */
+  publicOrigin: string;
   html: string;
   runtimeConfiguration?: unknown;
   staticModuleRoots?: readonly DevelopmentStaticModuleRoot[];
@@ -308,7 +363,7 @@ const readStaticModule = async (
 export const createDevelopmentRequestHandler = (
   options: Pick<
     DevelopmentServerOptions,
-    "pairingAuthority" | "html" | "runtimeConfiguration" | "staticModuleRoots"
+    "ticketAuthority" | "publicOrigin" | "html" | "runtimeConfiguration" | "staticModuleRoots"
   >,
 ): ((request: IncomingMessage, response: ServerResponse) => Promise<void>) => {
   const agentSource = createBrowserAgentSource();
@@ -343,31 +398,14 @@ export const createDevelopmentRequestHandler = (
         return;
       }
     }
-    if (request.method === "POST" && url.pathname === "/.local-pair") {
-      try {
-        const body = await readJsonBody(request);
-        const identity = parsePhoneIdentity(body);
-        const paired = options.pairingAuthority.pair(
-          typeof body.pairingCode === "string" ? body.pairingCode : "",
-          identity,
-        );
-        sendJson(response, 200, paired);
-      } catch {
-        sendJson(response, 401, { error: "pairing_failed" });
-      }
-      return;
-    }
     if (request.method === "POST" && url.pathname === "/.local-ticket") {
+      if (!isSameOriginRequest(request, options.publicOrigin)) {
+        sendJson(response, 403, { error: "forbidden" });
+        return;
+      }
       try {
-        const authorization = request.headers.authorization;
-        if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) {
-          throw new Error("missing session capability");
-        }
         const body = await readJsonBody(request);
-        const ticket = options.pairingAuthority.issueTicket(
-          authorization.slice("Bearer ".length),
-          parsePhoneIdentity(body),
-        );
+        const ticket = options.ticketAuthority.issueTicket(parsePhoneIdentity(body));
         sendJson(response, 200, ticket);
       } catch {
         sendJson(response, 401, { error: "ticket_failed" });
@@ -403,26 +441,35 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
     },
     maxPayload: 64 * 1024,
   });
-  const authenticatedIdentities = new WeakMap<WebSocket, PhoneIdentity>();
+  const ticketBoundIdentities = new WeakMap<WebSocket, PhoneIdentity>();
 
   server.on("upgrade", (request, socket, head) => {
-    const url = new URL(request.url ?? "/", "https://development.invalid");
-    const auth = authenticatePhoneProtocols(
+    const isControlRoute = isControlUpgradePath(request.url);
+    const auth = isControlRoute && isSameOriginRequest(request, options.publicOrigin)
+      ? consumePhoneTicketProtocols(
       request.headers["sec-websocket-protocol"],
-      (ticket) => options.pairingAuthority.consumeTicket(ticket),
-    );
-    if (url.pathname !== "/.local-control" || !auth.accepted) {
+      (ticket) => options.ticketAuthority.consumeTicket(ticket),
+    )
+      : { accepted: false as const };
+    if (!isControlRoute || !auth.accepted) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
     websocketServer.handleUpgrade(request, socket, head, (websocket) => {
-      authenticatedIdentities.set(websocket, auth.identity);
+      ticketBoundIdentities.set(websocket, auth.identity);
       websocketServer.emit("connection", websocket, request);
     });
   });
 
-  websocketServer.on("connection", (websocket: WebSocket) => {
+  websocketServer.on("connection", (websocket: WebSocket, request: IncomingMessage) => {
+    // This reads the direct TLS peer only; forwarded headers never affect local attribution.
+    const remoteAddress = request.socket.remoteAddress;
+    const userAgent = request.headers["user-agent"];
+    const deviceMetadata = deriveSocketDeviceMetadata({
+      ...(remoteAddress === undefined ? {} : { remoteAddress }),
+      ...(userAgent === undefined ? {} : { userAgent }),
+    });
     let connectionId: string | undefined;
     websocket.on("message", (data, isBinary) => {
       const byteLength = Array.isArray(data)
@@ -436,17 +483,18 @@ export const createDevelopmentServer = (options: DevelopmentServerOptions): http
         const parsed: unknown = JSON.parse(data.toString());
         if (connectionId === undefined) {
           const hello = parseHello(parsed);
-          const authenticatedIdentity = authenticatedIdentities.get(websocket);
-          if (authenticatedIdentity === undefined) throw new Error("missing WSS ticket identity");
-          connectionId = connectAuthenticatedPhone(
+          const ticketIdentity = ticketBoundIdentities.get(websocket);
+          if (ticketIdentity === undefined) throw new Error("missing WSS ticket identity");
+          connectionId = connectTicketBoundPhone(
             options.controlPlane,
-            authenticatedIdentity,
+            ticketIdentity,
             hello,
             (message) => {
               if (websocket.readyState !== websocket.OPEN) return false;
               websocket.send(JSON.stringify(message));
               return true;
             },
+            deviceMetadata,
           );
           return;
         }

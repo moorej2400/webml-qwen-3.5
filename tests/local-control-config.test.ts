@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -16,16 +15,15 @@ import { modelCacheKey } from "../src/opfs-model-cache.js";
 const validEnvironment = {
   QWEN_CONTROL_TLS_CERT: ".local/tls/cert.pem",
   QWEN_CONTROL_TLS_KEY: ".local/tls/key.pem",
-  QWEN_CONTROL_PAIRING_CODE: randomBytes(32).toString("base64url"),
-  QWEN_CONTROL_OPERATOR_TOKEN: randomBytes(32).toString("base64url"),
+  QWEN_CONTROL_OPERATOR_TOKEN: "A".repeat(43),
   QWEN_CONTROL_PUBLIC_HOST: "development-host.invalid",
 };
 
-test("control environment fails closed without TLS, auth, or an explicit public host", () => {
+test("control environment fails closed without TLS, operator auth, or an explicit public host", () => {
   assert.throws(() => loadControlEnvironment({}), /TLS certificate/i);
   assert.throws(
-    () => loadControlEnvironment({ ...validEnvironment, QWEN_CONTROL_PAIRING_CODE: undefined }),
-    /pairing code/i,
+    () => loadControlEnvironment({ ...validEnvironment, QWEN_CONTROL_OPERATOR_TOKEN: undefined }),
+    /operator credential/i,
   );
   assert.throws(
     () => loadControlEnvironment({ ...validEnvironment, QWEN_CONTROL_PUBLIC_HOST: undefined }),
@@ -33,7 +31,7 @@ test("control environment fails closed without TLS, auth, or an explicit public 
   );
 });
 
-test("control environment keeps TLS paths under .local and tokens distinct", () => {
+test("control environment keeps TLS paths under .local and accepts no phone credential", () => {
   assert.throws(
     () =>
       loadControlEnvironment({
@@ -42,18 +40,10 @@ test("control environment keeps TLS paths under .local and tokens distinct", () 
       }),
     /\.local/,
   );
-  assert.throws(
-    () =>
-      loadControlEnvironment({
-        ...validEnvironment,
-        QWEN_CONTROL_OPERATOR_TOKEN: validEnvironment.QWEN_CONTROL_PAIRING_CODE,
-      }),
-    /distinct/i,
-  );
-
   const config = loadControlEnvironment(validEnvironment);
   assert.equal(config.certPath, ".local/tls/cert.pem");
   assert.equal(config.publicHost, "development-host.invalid");
+  assert.equal("pairingCode" in config, false);
 });
 
 test("recovery policy exhausts protocol recovery before external fallback", () => {
