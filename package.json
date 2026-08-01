@@ -8,11 +8,12 @@
   },
   "scripts": {
     "test": "node --import tsx --test tests/*.test.ts",
-    "test:converter": "node --import tsx --test tests/converter.test.ts tests/q3k.test.ts tests/qwen35-language-converter-tool.test.ts",
+    "test:converter": "node --import tsx --test tests/converter.test.ts tests/q3k.test.ts tests/qwen35-language-converter-tool.test.ts tests/qwen35-vision-converter-tool.test.ts",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.dev.json --noEmit",
     "build": "tsc",
     "build:public": "node tools/build-public.mjs --out-dir public-dist",
     "convert:qwen35-language": "node --import tsx tools/convert-qwen35-language.ts",
+    "convert:qwen35-vision": "node --import tsx tools/convert-qwen35-vision.ts",
     "stage:qwen35-huggingface": "node --import tsx tools/stage-qwen35-huggingface.ts",
     "control:dev": "tsc --project tsconfig.dev.json && node dev-dist/dev/control/cli.js"
   },

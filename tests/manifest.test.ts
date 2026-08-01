@@ -79,7 +79,63 @@ test("requires processor identity for vision packages", () => {
     size: "256",
     sha256: SHA_A,
   };
+  assert.throws(
+    () => validateModelPackageManifest(manifest),
+    /processor settings.*required/i,
+  );
+  manifest.processorSettings = {
+    processorClass: "Qwen3VLProcessor",
+    imageProcessorType: "Qwen2VLImageProcessorFast",
+    patchSize: 16,
+    temporalPatchSize: 2,
+    mergeSize: 2,
+    shortestEdge: 65_536,
+    longestEdge: 16_777_216,
+    imageMean: [0.5, 0.5, 0.5],
+    imageStd: [0.5, 0.5, 0.5],
+  };
   assert.doesNotThrow(() => validateModelPackageManifest(manifest));
+});
+
+test("rejects invalid vision preprocessing settings and language settings", () => {
+  const vision = validManifest();
+  vision.packageKind = "vision";
+  vision.processor = {
+    repository: "example/processor",
+    revision: "3".repeat(40),
+    file: "processor_config.json",
+    size: "256",
+    sha256: SHA_A,
+  };
+  vision.processorSettings = {
+    processorClass: "Qwen3VLProcessor",
+    imageProcessorType: "Qwen2VLImageProcessorFast",
+    patchSize: 16,
+    temporalPatchSize: 2,
+    mergeSize: 2,
+    shortestEdge: 65_536,
+    longestEdge: 16_777_216,
+    imageMean: [0.5, 0.5, 0.5],
+    imageStd: [0.5, 0.5, 0.5],
+  };
+  vision.processorSettings.shortestEdge = 16_777_217;
+  assert.throws(
+    () => validateModelPackageManifest(vision),
+    /shortest edge.*longest edge/i,
+  );
+  vision.processorSettings.shortestEdge = 65_536;
+  vision.processorSettings.imageMean = [0.5, Number.POSITIVE_INFINITY, 0.5];
+  assert.throws(
+    () => validateModelPackageManifest(vision),
+    /finite channel values/i,
+  );
+
+  const language = validManifest();
+  language.processorSettings = vision.processorSettings;
+  assert.throws(
+    () => validateModelPackageManifest(language),
+    /only valid for a vision package/i,
+  );
 });
 
 test("rejects mutable source and tokenizer revisions", () => {

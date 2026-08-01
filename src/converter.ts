@@ -15,6 +15,7 @@ import {
   type ModelPackageManifest,
   type PackageKind,
   type TensorStorageType,
+  type VisionProcessorSettings,
 } from "./manifest.js";
 import {
   repackNativeQ6K,
@@ -459,6 +460,7 @@ export interface ManifestPlanOptions {
   readonly runtimeAbi: string;
   readonly tokenizer: ImmutableArtifactIdentity;
   readonly processor?: ImmutableArtifactIdentity;
+  readonly processorSettings?: VisionProcessorSettings;
   readonly shards: readonly { url: string; sha256: string }[];
 }
 
@@ -489,6 +491,9 @@ export function createManifestFromPlan(
     runtime: { abi: options.runtimeAbi },
     tokenizer: options.tokenizer,
     ...(options.processor === undefined ? {} : { processor: options.processor }),
+    ...(options.processorSettings === undefined
+      ? {}
+      : { processorSettings: options.processorSettings }),
     tensorLayout: plan.segments.map((segment) => ({
       name: segment.tensorName,
       shape: segment.dimensions.map(String),

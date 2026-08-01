@@ -1,7 +1,8 @@
 # Model package conversion
 
 The repository-owned Node converter accepts only explicit source and output
-paths. The source must be the language GGUF pinned in `model-sources.json`.
+paths. The source must be the exact language or vision GGUF pinned for the
+selected command in `model-sources.json`.
 The output parent must already exist, and the output directory must not exist.
 The output must be outside a Git worktree so model shards cannot enter source
 control by mistake.
@@ -50,9 +51,41 @@ The converter does not overwrite output and does not remove failed work. If a
 conversion fails after staging starts, the sibling staging directory is
 retained for inspection. Review it manually before moving it to trash.
 
-Publication is a separate operation. Before publication, supply an existing
-local copy of the exact pinned GGUF, a new outside-Git output path, the final
-public model-repository identifier, and credentials for that hosting service.
+## Vision projector package
+
+The vision converter uses the separately pinned BF16 projector and its pinned
+`preprocessor_config.json` identity from `model-sources.json`. It authenticates
+the complete source before parsing its GGUF directory. It then creates a
+bootstrap shard group plus independently addressable, numerically ordered
+vision-layer shard groups. A shard never belongs to more than one group.
+
+Run the same inventory and dry-run sequence before conversion:
+
+```sh
+npm run convert:qwen35-vision -- --source <vision-gguf-path> --output <vision-package-path> --inventory
+npm run convert:qwen35-vision -- --source <vision-gguf-path> --output <vision-package-path> --dry-run
+npm run convert:qwen35-vision -- --source <vision-gguf-path> --output <vision-package-path>
+```
+
+The package manifest has `packageKind: "vision"`, the processor identity, the
+versioned vision runtime ABI, and the pinned preprocessing settings. Its
+checksummed `layer-index.json` maps bootstrap and each vision layer to exact
+shard indexes for OPFS streaming. Conversion reads at most 8 MiB at a time and
+does not expand the complete projector into a floating-point buffer. Before it
+writes a shard, it exclusively creates the requested output directory. It
+writes only inside that reserved directory and retains it after a failure for
+inspection; it never replaces an output that appears during conversion.
+
+Vision package publication is the next separate operation. There is no vision
+staging or upload command yet; do not use the language flat-staging command
+below for a vision package.
+
+## Language package publication
+
+The following flat-staging command is language-only. Before language
+publication, supply an existing local copy of the exact pinned GGUF, a new
+outside-Git output path, the final public model-repository identifier, and
+credentials for that hosting service.
 
 For Hugging Face's flat web uploader, authenticate and stage the converted
 package with the compiled tokenizer:

@@ -36,7 +36,8 @@ foundation and mixed-quant compute layer:
 [`model-sources.json`](model-sources.json) pins the public source revisions,
 artifact hashes, and inspected language tensor inventory used by this runtime.
 See [Model package conversion](docs/model-package-conversion.md) for the
-repository-owned inventory, dry-run, and streaming conversion command.
+repository-owned language and vision inventory, dry-run, and streaming
+conversion commands.
 
 ## Development
 

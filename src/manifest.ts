@@ -24,6 +24,19 @@ export interface RuntimeIdentity {
   abi: string;
 }
 
+/** Immutable preprocessing behavior paired with the pinned processor file. */
+export interface VisionProcessorSettings {
+  processorClass: string;
+  imageProcessorType: string;
+  patchSize: number;
+  temporalPatchSize: number;
+  mergeSize: number;
+  shortestEdge: number;
+  longestEdge: number;
+  imageMean: readonly number[];
+  imageStd: readonly number[];
+}
+
 export type PackageKind = "language" | "vision";
 export type TensorStorageType = "raw" | WebGpuTensorStorageType;
 
@@ -63,6 +76,7 @@ export interface ModelPackageManifest {
   runtime: RuntimeIdentity;
   tokenizer: ImmutableArtifactIdentity;
   processor?: ImmutableArtifactIdentity;
+  processorSettings?: VisionProcessorSettings;
   tensorLayout: TensorLayoutEntry[];
   shards: PackageShard[];
   excludedTensors: ExcludedTensor[];
@@ -152,6 +166,45 @@ function validateArtifact(
   }
 }
 
+function validatePositiveSafeInteger(value: unknown, label: string): void {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new Error(`${label} must be a positive safe integer`);
+  }
+}
+
+function validateChannelValues(value: unknown, label: string): void {
+  if (!Array.isArray(value) || value.length !== 3) {
+    throw new Error(`${label} must contain exactly three channels`);
+  }
+  for (const channel of value) {
+    if (typeof channel !== "number" || !Number.isFinite(channel)) {
+      throw new Error(`${label} must contain finite channel values`);
+    }
+  }
+}
+
+function validateVisionProcessorSettings(value: unknown): void {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("vision processor settings are required");
+  }
+  const settings = value as VisionProcessorSettings;
+  requireString(settings.processorClass, "vision processor class", 256);
+  requireString(settings.imageProcessorType, "vision image processor type", 256);
+  validatePositiveSafeInteger(settings.patchSize, "vision patch size");
+  validatePositiveSafeInteger(
+    settings.temporalPatchSize,
+    "vision temporal patch size",
+  );
+  validatePositiveSafeInteger(settings.mergeSize, "vision merge size");
+  validatePositiveSafeInteger(settings.shortestEdge, "vision shortest edge");
+  validatePositiveSafeInteger(settings.longestEdge, "vision longest edge");
+  if (settings.shortestEdge > settings.longestEdge) {
+    throw new Error("vision shortest edge must not exceed the longest edge");
+  }
+  validateChannelValues(settings.imageMean, "vision image mean");
+  validateChannelValues(settings.imageStd, "vision image standard deviation");
+}
+
 function validateShardUrl(value: string): void {
   requireString(value, "shard URL", 2_048);
   if (/%(?:2e|2f|5c)/i.test(value)) {
@@ -224,6 +277,11 @@ export function validateModelPackageManifest(
   }
   if (manifest.packageKind === "vision" && manifest.processor === undefined) {
     throw new Error("processor identity is required for a vision package");
+  }
+  if (manifest.packageKind === "vision") {
+    validateVisionProcessorSettings(manifest.processorSettings);
+  } else if (manifest.processorSettings !== undefined) {
+    throw new Error("processor settings are only valid for a vision package");
   }
   requireString(manifest.runtime?.abi, "runtime ABI", 256);
 
