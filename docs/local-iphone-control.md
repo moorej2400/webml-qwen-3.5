@@ -41,6 +41,12 @@ export QWEN_RUNTIME_MANIFEST_SHA256="<64-character-canonical-manifest-sha256>"
 export QWEN_RUNTIME_TOKENIZER_URL="https://huggingface.co/<owner>/<repository>/resolve/<40-character-revision>/<compiled-tokenizer-file>"
 ```
 
+For a measured allocation experiment, optionally set
+`QWEN_RUNTIME_BUFFER_SHARD_POLICY` to `evidence-128` or `evidence-64` before
+starting the local server. Omit it for the default 256 MiB per-buffer shape.
+This setting changes buffer segmentation only. It does not reduce the model,
+quantization, package, or 16K context target.
+
 `QWEN_RUNTIME_MANIFEST_SHA256` is the canonical package-manifest digest used by
 the runtime cache. It is not a digest of incidental JSON whitespace. Startup
 loads the local manifest through a realpath boundary, validates the pinned Qwen

@@ -130,6 +130,8 @@ test("browser runtime configuration requires local manifest bytes and immutable 
 
   const parsed = loadBrowserRuntimeEnvironment(environment);
   const config = await loadBrowserRuntimeConfiguration({ projectRoot: root, environment: parsed });
+  assert.equal(parsed.bufferShardPolicy, "default");
+  assert.equal(config.bufferShardPolicy, "default");
   assert.equal(config.packageBaseUrl, environment.QWEN_RUNTIME_PACKAGE_BASE_URL);
   assert.equal(config.expectedPackageBaseUrl, environment.QWEN_RUNTIME_PACKAGE_BASE_URL);
   assert.equal(config.expectedManifestSha256, modelCacheKey(manifest));
@@ -137,6 +139,33 @@ test("browser runtime configuration requires local manifest bytes and immutable 
   assert.equal(config.manifest.runtime.abi, "qwen35-webgpu-v1");
   assert.equal(Object.isFrozen(config), true);
   assert.equal("manifestPath" in config, false);
+});
+
+test("browser runtime configuration carries the selected allocation-shaping experiment", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "qwen-runtime-policy-"));
+  await mkdir(path.join(root, ".local", "model"), { recursive: true });
+  const manifest = runtimeManifest();
+  await writeFile(
+    path.join(root, ".local", "model", "manifest.json"),
+    JSON.stringify(manifest),
+  );
+  const revision = "c".repeat(40);
+  const environment = loadBrowserRuntimeEnvironment({
+    QWEN_RUNTIME_MANIFEST: ".local/model/manifest.json",
+    QWEN_RUNTIME_PACKAGE_BASE_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/`,
+    QWEN_RUNTIME_MANIFEST_SHA256: modelCacheKey(manifest),
+    QWEN_RUNTIME_TOKENIZER_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/tokenizer.bin`,
+    QWEN_RUNTIME_BUFFER_SHARD_POLICY: "evidence-64",
+  });
+
+  const config = await loadBrowserRuntimeConfiguration({
+    projectRoot: root,
+    environment,
+  });
+  assert.equal(environment.bufferShardPolicy, "evidence-64");
+  assert.equal(config.bufferShardPolicy, "evidence-64");
 });
 
 test("browser runtime configuration rejects mutable, credentialed, or mismatched inputs", async () => {
@@ -171,6 +200,13 @@ test("browser runtime configuration rejects mutable, credentialed, or mismatched
         `https://user:secret@huggingface.co/example/browser-package/resolve/${"d".repeat(40)}/tokenizer.bin`,
     }),
     /credential-free/i,
+  );
+  assert.throws(
+    () => loadBrowserRuntimeEnvironment({
+      ...base,
+      QWEN_RUNTIME_BUFFER_SHARD_POLICY: "unrecognized-policy",
+    }),
+    /buffer shard policy/i,
   );
   const environment = loadBrowserRuntimeEnvironment({
     ...base,

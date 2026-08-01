@@ -1,6 +1,7 @@
 import { AllocationLedger } from "./allocation-ledger.js";
 import {
   probeDeviceProfile,
+  type BufferShardPolicy,
   type DeviceProfile,
   type WebGpuProbeSurface,
 } from "./device-profile.js";
@@ -202,6 +203,8 @@ export interface Qwen35BrowserLoadOptions extends LoadOptions {
   readonly rangeFetch?: RangeFetch;
   readonly cacheStorage?: ModelCacheStorage;
   readonly webGpuSurface?: WebGpuProbeSurface;
+  /** Local physical-device experiment selector; it shapes each GPU buffer only. */
+  readonly bufferShardPolicy?: BufferShardPolicy;
   readonly gpuLedgerLimitBytes?: bigint;
 }
 
@@ -757,18 +760,26 @@ export async function loadQwen35BrowserResources(
       ? {}
       : { gpu: navigatorWithGpu.gpu }),
   };
+  const profileOptions = {
+    requiredFeatures: ["shader-f16"],
+    ...(options.bufferShardPolicy === undefined
+      ? {}
+      : {
+          // This changes only physical buffer segmentation. It never changes
+          // the selected model, its total residency, or the 16K context contract.
+          bufferShardPolicy: options.bufferShardPolicy,
+        }),
+    rejectedDeviceCleanup: (rejectedDevice: unknown) => {
+      destroyQwen35DeviceOrThrow(
+        rejectedDevice,
+        "webgpu-device-rejection-cleanup-failed",
+        "Rejected WebGPU device cleanup failed",
+      );
+    },
+  };
   const profile = await probeDeviceProfile(
     options.webGpuSurface ?? browserSurface,
-    {
-      requiredFeatures: ["shader-f16"],
-      rejectedDeviceCleanup: (rejectedDevice) => {
-        destroyQwen35DeviceOrThrow(
-          rejectedDevice,
-          "webgpu-device-rejection-cleanup-failed",
-          "Rejected WebGPU device cleanup failed",
-        );
-      },
-    },
+    profileOptions,
   );
   const device = profile.device as unknown;
   assertQwen35AcquiredModelDevice(device);

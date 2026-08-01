@@ -7,6 +7,7 @@ import {
   snapshotQwen35Manifest,
   type Qwen35BrowserLoadOptions,
 } from "../../src/qwen35-model-loader.js";
+import type { BufferShardPolicy } from "../../src/device-profile.js";
 
 export type BrowserRuntimeConfiguration = Readonly<
   Pick<
@@ -16,6 +17,7 @@ export type BrowserRuntimeConfiguration = Readonly<
     | "expectedPackageBaseUrl"
     | "expectedManifestSha256"
     | "compiledTokenizerUrl"
+    | "bufferShardPolicy"
   >
 >;
 
@@ -24,7 +26,14 @@ export interface BrowserRuntimeEnvironment {
   readonly packageBaseUrl: string;
   readonly expectedManifestSha256: string;
   readonly compiledTokenizerUrl: string;
+  readonly bufferShardPolicy: BufferShardPolicy;
 }
+
+const parseBufferShardPolicy = (value: string | undefined): BufferShardPolicy => {
+  if (value === undefined || value === "") return "default";
+  if (value === "evidence-128" || value === "evidence-64") return value;
+  throw new Error("Runtime buffer shard policy is invalid");
+};
 
 const requireValue = (
   environment: NodeJS.ProcessEnv,
@@ -110,6 +119,9 @@ export const loadBrowserRuntimeEnvironment = (
       "Compiled tokenizer URL",
       "file",
     ),
+    bufferShardPolicy: parseBufferShardPolicy(
+      environment.QWEN_RUNTIME_BUFFER_SHARD_POLICY,
+    ),
   });
 };
 
@@ -179,5 +191,6 @@ export const loadBrowserRuntimeConfiguration = async (options: {
     manifest,
     ...trust,
     compiledTokenizerUrl: options.environment.compiledTokenizerUrl,
+    bufferShardPolicy: options.environment.bufferShardPolicy,
   });
 };
