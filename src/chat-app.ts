@@ -11,7 +11,11 @@ import {
 } from "./qwen35-vision-preprocess.js";
 import type { ModelPackageManifest } from "./manifest.js";
 import type { Qwen35VisionPackagePins } from "./qwen35-vision-package-loader.js";
-import { presentChatGenerationFailure } from "./chat-app-state.js";
+import {
+  ChatOperationGate,
+  emptyChatContextCopy,
+  presentChatGenerationFailure,
+} from "./chat-app-state.js";
 
 const VISION_SETTINGS = Object.freeze({
   processorClass: "Qwen3VLProcessor",
@@ -66,7 +70,7 @@ function statusText(value: string): void {
 }
 
 function setBusy(value: boolean): void {
-  for (const control of document.querySelectorAll<HTMLButtonElement | HTMLTextAreaElement | HTMLInputElement>("[data-composer-control]")) {
+  for (const control of document.querySelectorAll<HTMLButtonElement | HTMLTextAreaElement | HTMLInputElement>("[data-composer-control], [data-new-chat]")) {
     if (control.matches("[data-stop]")) {
       control.disabled = !value;
     } else {
@@ -252,6 +256,8 @@ async function startApp(container: HTMLElement): Promise<void> {
   let sendController: AbortController | null = null;
   let hasPrefilled = false;
   let generationLimit = 192;
+  let loadingPromise: Promise<Qwen35Session> | null = null;
+  const operationGate = new ChatOperationGate();
 
   const renderImagePreview = (): void => {
     const slot = element<HTMLElement>("[data-image-preview]");
@@ -279,33 +285,47 @@ async function startApp(container: HTMLElement): Promise<void> {
   };
 
   const ensureSession = async (): Promise<Qwen35Session> => {
+    if (loadingPromise !== null) return loadingPromise;
     if (session !== null) return session;
     if (runtimeConfig === null) {
       throw new Error("Runtime config is not installed. Set the local model package configuration first.");
     }
-    statusText("Authenticating package");
-    const manifest = await loadManifest(runtimeConfig);
-    const created = new Qwen35Session();
-    session = created;
-    await created.load({
-      manifest,
-      packageBaseUrl: runtimeConfig.packageBaseUrl,
-      expectedPackageBaseUrl: runtimeConfig.expectedPackageBaseUrl,
-      expectedManifestSha256: runtimeConfig.expectedManifestSha256,
-      compiledTokenizerUrl: runtimeConfig.compiledTokenizerUrl,
-      ...(runtimeConfig.allowInsecureLocalhost === true
-        ? { allowInsecureLocalhost: true }
-        : {}),
-      ...(runtimeConfig.visionPackagePins === undefined
-        ? {}
-        : { visionPackagePins: runtimeConfig.visionPackagePins }),
-    });
-    statusText("Ready for a prompt");
-    updateMetrics(created.getMetrics());
-    return created;
+    const pending = (async () => {
+      statusText("Authenticating package");
+      const manifest = await loadManifest(runtimeConfig!);
+      const created = new Qwen35Session();
+      try {
+        await created.load({
+          manifest,
+          packageBaseUrl: runtimeConfig!.packageBaseUrl,
+          expectedPackageBaseUrl: runtimeConfig!.expectedPackageBaseUrl,
+          expectedManifestSha256: runtimeConfig!.expectedManifestSha256,
+          compiledTokenizerUrl: runtimeConfig!.compiledTokenizerUrl,
+          ...(runtimeConfig!.allowInsecureLocalhost === true
+            ? { allowInsecureLocalhost: true }
+            : {}),
+          ...(runtimeConfig!.visionPackagePins === undefined
+            ? {}
+            : { visionPackagePins: runtimeConfig!.visionPackagePins }),
+        });
+        session = created;
+        statusText("Ready for a prompt");
+        updateMetrics(created.getMetrics());
+        return created;
+      } catch (error) {
+        await created.dispose().catch(() => undefined);
+        throw error;
+      }
+    })();
+    loadingPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (loadingPromise === pending) loadingPromise = null;
+    }
   };
 
-  const send = async (): Promise<void> => {
+  const sendImplementation = async (): Promise<void> => {
     const prompt = element<HTMLTextAreaElement>("[data-prompt]");
     const text = prompt.value.trim();
     if (text.length === 0 && pendingImage === null) return;
@@ -324,6 +344,7 @@ async function startApp(container: HTMLElement): Promise<void> {
     try {
       loaded = await ensureSession();
       if (hasPrefilled) await loaded.reset();
+      statusText("Prefilling conversation");
       const state = await loaded.prefill(nextMessages);
       messages.push(userMessage);
       hasPrefilled = true;
@@ -331,6 +352,7 @@ async function startApp(container: HTMLElement): Promise<void> {
       const assistant = appendMessage("assistant", "");
       const output = assistant.querySelector<HTMLElement>(".message__text")!;
       let response = "";
+      statusText("Generating");
       for await (const token of loaded.generate({ maxNewTokens: generationLimit, temperature: 0, topK: 1 })) {
         response += token.text;
         output.textContent = response;
@@ -361,6 +383,10 @@ async function startApp(container: HTMLElement): Promise<void> {
       sendController = null;
       setBusy(false);
     }
+  };
+
+  const send = async (): Promise<void> => {
+    await operationGate.run(sendImplementation);
   };
 
   const chooseImage = async (file: File): Promise<void> => {
@@ -419,13 +445,30 @@ async function startApp(container: HTMLElement): Promise<void> {
     const value = Number((event.target as HTMLInputElement).value);
     if (Number.isSafeInteger(value) && value >= 1 && value <= 2_048) generationLimit = value;
   });
-  element<HTMLButtonElement>("[data-new-chat]").addEventListener("click", async () => {
-    await session?.reset().catch(() => undefined);
-    messages.length = 0;
-    hasPrefilled = false;
-    element<HTMLElement>("[data-messages]").replaceChildren();
-    appendNotice("New conversation ready.");
-    setPanel(false);
+  element<HTMLButtonElement>("[data-new-chat]").addEventListener("click", () => {
+    void operationGate.run(async () => {
+      setBusy(true);
+      statusText("Resetting conversation");
+      try {
+        await session?.reset();
+        if (pendingImage !== null) URL.revokeObjectURL(pendingImage.previewUrl);
+        pendingImage = null;
+        renderImagePreview();
+        messages.length = 0;
+        hasPrefilled = false;
+        element<HTMLElement>("[data-messages]").replaceChildren();
+        element<HTMLElement>("[data-context-copy]").textContent = emptyChatContextCopy();
+        appendNotice("New conversation ready.");
+        setPanel(false);
+        if (session !== null) updateMetrics(session.getMetrics());
+        statusText("Ready for a prompt");
+      } catch (error) {
+        appendNotice(error instanceof Error ? error.message : "The conversation could not be reset.", "error");
+        statusText("Needs attention");
+      } finally {
+        setBusy(false);
+      }
+    });
   });
   element<HTMLTextAreaElement>("[data-prompt]").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -440,10 +483,16 @@ async function startApp(container: HTMLElement): Promise<void> {
     statusText("Runtime config not installed");
     appendNotice("Add a public model package config to start the Chrome validation loop.");
   } else {
-    void ensureSession().catch((error) => {
-      statusText("Load failed");
-      appendNotice(error instanceof Error ? error.message : "Model load failed.", "error");
-    });
+    setBusy(true);
+    void ensureSession()
+      .catch((error) => {
+        session = null;
+        statusText("Load failed");
+        appendNotice(error instanceof Error ? error.message : "Model load failed.", "error");
+      })
+      .finally(() => {
+        if (!operationGate.busy) setBusy(false);
+      });
   }
 
   window.addEventListener("beforeunload", () => {

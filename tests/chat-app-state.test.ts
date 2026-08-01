@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { presentChatGenerationFailure } from "../src/chat-app-state.js";
+import {
+  ChatOperationGate,
+  emptyChatContextCopy,
+  presentChatGenerationFailure,
+} from "../src/chat-app-state.js";
 
 test("reports a cancelled prompt whose GPU state requires disposal as recoverable", () => {
   assert.deepEqual(
@@ -43,4 +47,20 @@ test("reports non-cancellation failures as attention items", () => {
       status: "Needs attention",
     },
   );
+});
+
+test("prevents a new conversation reset from overlapping a prompt operation", async () => {
+  const gate = new ChatOperationGate();
+  const release = Promise.resolve();
+  const first = gate.run(async () => {
+    await release;
+    return "first";
+  });
+  assert.equal(await gate.run(async () => "second"), undefined);
+  assert.equal(await first, "first");
+  assert.equal(await gate.run(async () => "third"), "third");
+});
+
+test("provides the empty context copy after a conversation reset", () => {
+  assert.equal(emptyChatContextCopy(), "Prefill a conversation to measure it");
 });

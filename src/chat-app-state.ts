@@ -4,6 +4,29 @@ export interface ChatGenerationFailurePresentation {
   readonly status: string;
 }
 
+/** Serializes UI actions that can mutate one loaded session. */
+export class ChatOperationGate {
+  #active = false;
+
+  get busy(): boolean {
+    return this.#active;
+  }
+
+  async run<T>(operation: () => Promise<T>): Promise<T | undefined> {
+    if (this.#active) return undefined;
+    this.#active = true;
+    try {
+      return await operation();
+    } finally {
+      this.#active = false;
+    }
+  }
+}
+
+export function emptyChatContextCopy(): string {
+  return "Prefill a conversation to measure it";
+}
+
 export function presentChatGenerationFailure(
   error: unknown,
   options: {
