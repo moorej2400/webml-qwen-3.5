@@ -304,11 +304,16 @@ export interface DevelopmentServerOptions {
   html: string;
   runtimeConfiguration?: unknown;
   staticModuleRoots?: readonly DevelopmentStaticModuleRoot[];
+  staticAssetRoots?: readonly DevelopmentStaticAssetRoot[];
 }
 
 export interface DevelopmentStaticModuleRoot {
   readonly routePrefix: string;
   readonly directory: string;
+}
+
+export interface DevelopmentStaticAssetRoot extends DevelopmentStaticModuleRoot {
+  readonly extensions: readonly string[];
 }
 
 const readStaticModule = async (
@@ -360,10 +365,103 @@ const readStaticModule = async (
   }
 };
 
+const readStaticAsset = async (
+  urlPathname: string,
+  roots: readonly DevelopmentStaticAssetRoot[],
+): Promise<{ bytes: Buffer; extension: string } | null> => {
+  const root = roots.find(({ routePrefix }) => urlPathname.startsWith(routePrefix));
+  if (root === undefined) return null;
+  let relativePath: string;
+  try {
+    relativePath = decodeURIComponent(urlPathname.slice(root.routePrefix.length));
+  } catch {
+    return null;
+  }
+  const segments = relativePath.split("/");
+  const extension = path.extname(relativePath).toLowerCase();
+  if (
+    relativePath.length === 0 ||
+    root.extensions.every((allowed) => allowed.toLowerCase() !== extension) ||
+    relativePath.includes("\\") ||
+    relativePath.includes("\0") ||
+    segments.some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    return null;
+  }
+  const directory = path.resolve(root.directory);
+  const requested = path.resolve(directory, ...segments);
+  if (!requested.startsWith(`${directory}${path.sep}`)) return null;
+  try {
+    const [directoryInfo, requestedInfo] = await Promise.all([
+      lstat(directory),
+      lstat(requested),
+    ]);
+    if (
+      !directoryInfo.isDirectory() ||
+      directoryInfo.isSymbolicLink() ||
+      !requestedInfo.isFile() ||
+      requestedInfo.isSymbolicLink()
+    ) {
+      return null;
+    }
+    const [realDirectory, realRequested] = await Promise.all([
+      realpath(directory),
+      realpath(requested),
+    ]);
+    if (!realRequested.startsWith(`${realDirectory}${path.sep}`)) return null;
+    return { bytes: await readFile(realRequested), extension };
+  } catch {
+    return null;
+  }
+};
+
+const assetContentType = (extension: string): string | null => {
+  switch (extension) {
+    case ".js":
+      return "text/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".bin":
+      return "application/octet-stream";
+    default:
+      return null;
+  }
+};
+
+const parseExactByteRange = (
+  header: string | undefined,
+  totalBytes: number,
+): { start: number; end: number } | null => {
+  if (header === undefined) return null;
+  const match = /^bytes=([0-9]+)-([0-9]+)$/.exec(header);
+  if (match === null) return null;
+  const start = Number(match[1]);
+  const requestedEnd = Number(match[2]);
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(requestedEnd) ||
+    start < 0 ||
+    requestedEnd < start ||
+    start >= totalBytes
+  ) {
+    return null;
+  }
+  return { start, end: Math.min(requestedEnd, totalBytes - 1) };
+};
+
 export const createDevelopmentRequestHandler = (
   options: Pick<
     DevelopmentServerOptions,
-    "ticketAuthority" | "publicOrigin" | "html" | "runtimeConfiguration" | "staticModuleRoots"
+    | "ticketAuthority"
+    | "publicOrigin"
+    | "html"
+    | "runtimeConfiguration"
+    | "staticModuleRoots"
+    | "staticAssetRoots"
   >,
 ): ((request: IncomingMessage, response: ServerResponse) => Promise<void>) => {
   const agentSource = createBrowserAgentSource();
@@ -398,6 +496,42 @@ export const createDevelopmentRequestHandler = (
         return;
       }
     }
+    if (request.method === "GET" && options.staticAssetRoots !== undefined) {
+      const asset = await readStaticAsset(url.pathname, options.staticAssetRoots);
+      const contentType = asset === null ? null : assetContentType(asset.extension);
+      if (asset !== null && contentType !== null) {
+        const rangeHeader = request.headers.range;
+        const range = parseExactByteRange(
+          typeof rangeHeader === "string" ? rangeHeader : undefined,
+          asset.bytes.byteLength,
+        );
+        if (rangeHeader !== undefined && range === null) {
+          response.writeHead(416, {
+            "content-range": `bytes */${asset.bytes.byteLength}`,
+            "cache-control": "no-store",
+          });
+          response.end();
+          return;
+        }
+        const bytes = range === null
+          ? asset.bytes
+          : asset.bytes.subarray(range.start, range.end + 1);
+        response.writeHead(range === null ? 200 : 206, {
+          "content-type": contentType,
+          "content-length": String(bytes.byteLength),
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          ...(range === null
+            ? {}
+            : {
+                "content-range": `bytes ${range.start}-${range.end}/${asset.bytes.byteLength}`,
+                "accept-ranges": "bytes",
+              }),
+        });
+        response.end(bytes);
+        return;
+      }
+    }
     if (request.method === "POST" && url.pathname === "/.local-ticket") {
       if (!isSameOriginRequest(request, options.publicOrigin)) {
         sendJson(response, 403, { error: "forbidden" });
@@ -413,7 +547,13 @@ export const createDevelopmentRequestHandler = (
       return;
     }
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-      const injection = '<script src="/.local-agent.js"></script>';
+      const runtimeConfig = options.runtimeConfiguration === undefined
+        ? ""
+        : `<script>window.__QWEN35_RUNTIME_CONFIG__=${JSON.stringify(options.runtimeConfiguration)
+            .replaceAll("<", "\\u003c")
+            .replaceAll(">", "\\u003e")
+            .replaceAll("&", "\\u0026")};</script>`;
+      const injection = `${runtimeConfig}<script src="/.local-agent.js"></script>`;
       const html = options.html.includes("</body>")
         ? options.html.replace("</body>", `${injection}</body>`)
         : `${options.html}${injection}`;

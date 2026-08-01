@@ -1,4 +1,5 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { loadControlEnvironment } from "./config.js";
@@ -8,6 +9,12 @@ import {
   loadBrowserRuntimeConfiguration,
   loadBrowserRuntimeEnvironment,
 } from "./runtime-config.js";
+import {
+  assertQwen35PackageIdentity,
+  type Qwen35BrowserLoadOptions,
+  snapshotQwen35Manifest,
+} from "../../src/qwen35-model-loader.js";
+import { modelCacheKey } from "../../src/opfs-model-cache.js";
 import { RunJournal } from "./run-journal.js";
 import {
   createDevelopmentServer,
@@ -22,6 +29,55 @@ const runtimeConfiguration = await loadBrowserRuntimeConfiguration({
   projectRoot,
   environment: loadBrowserRuntimeEnvironment(process.env),
 });
+const publicOrigin = new URL(`https://${config.publicHost}:${config.publicPort}`).origin;
+
+const localPackageDirectory = process.env.QWEN_RUNTIME_LOCAL_PACKAGE_DIR;
+const localTokenizerDirectory = process.env.QWEN_RUNTIME_LOCAL_TOKENIZER_DIR;
+const localVisionPackageDirectory = process.env.QWEN_RUNTIME_LOCAL_VISION_PACKAGE_DIR;
+const localRuntimeConfiguration =
+  localPackageDirectory === undefined && localTokenizerDirectory === undefined && localVisionPackageDirectory === undefined
+    ? runtimeConfiguration
+    : await (async () => {
+        if (localPackageDirectory === undefined || localTokenizerDirectory === undefined) {
+          throw new Error("Local package mode requires both model and tokenizer directories");
+        }
+        const packageManifest = JSON.parse(
+          await readFile(path.join(localPackageDirectory, "manifest.json"), "utf8"),
+        ) as Qwen35BrowserLoadOptions["manifest"];
+        const manifest = snapshotQwen35Manifest({
+          ...packageManifest,
+          shards: packageManifest.shards.map((shard) => ({
+            ...shard,
+            url: new URL(`/assets/model/${shard.url}`, publicOrigin).href,
+          })),
+        });
+        assertQwen35PackageIdentity(manifest);
+        const visionPackagePins = localVisionPackageDirectory === undefined
+          ? undefined
+          : await (async () => {
+              const visionManifestBytes = await readFile(path.join(localVisionPackageDirectory, "manifest.json"));
+              const visionLayerIndexBytes = await readFile(path.join(localVisionPackageDirectory, "layer-index.json"));
+              return Object.freeze({
+                packageBaseUrl: new URL("/assets/vision/", publicOrigin).href,
+                expectedPackageBaseUrl: new URL("/assets/vision/", publicOrigin).href,
+                expectedManifestSha256: createHash("sha256").update(visionManifestBytes).digest("hex"),
+                expectedLayerIndexSha256: createHash("sha256").update(visionLayerIndexBytes).digest("hex"),
+                allowInsecureLocalhost: true,
+                manifestFile: "manifest.json",
+                layerIndexFile: "layer-index.json",
+              });
+            })();
+        return Object.freeze({
+          ...runtimeConfiguration,
+          manifest,
+          expectedManifestSha256: modelCacheKey(manifest),
+          compiledTokenizerUrl: new URL("/assets/tokenizer/tokenizer.bin", publicOrigin).href,
+          ...(visionPackagePins === undefined ? {} : { visionPackagePins }),
+        });
+      })();
+const publicHtml = (await readFile(path.join(projectRoot, "public-dist", "index.html"), "utf8"))
+  .replaceAll('href="./app.css"', 'href="/assets/public/app.css"')
+  .replaceAll('src="./chat-app.js"', 'src="/assets/public/chat-app.js"');
 const tls = await loadLocalTlsMaterial({
   projectRoot,
   certPath: config.certPath,
@@ -42,8 +98,8 @@ const appServer = createDevelopmentServer({
   tls,
   controlPlane,
   ticketAuthority,
-  publicOrigin: new URL(`https://${config.publicHost}:${config.publicPort}`).origin,
-  runtimeConfiguration,
+  publicOrigin,
+  runtimeConfiguration: localRuntimeConfiguration,
   staticModuleRoots: [
     {
       routePrefix: "/assets/dev/browser/",
@@ -54,42 +110,35 @@ const appServer = createDevelopmentServer({
       directory: path.join(projectRoot, "dev-dist", "src"),
     },
   ],
-  html: `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Qwen WebGPU text runtime</title>
-  <style>
-    :root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
-    body { margin: 0 auto; max-width: 48rem; padding: 1rem; }
-    main { display: grid; gap: 0.75rem; }
-    textarea, input, button { box-sizing: border-box; font: inherit; padding: 0.65rem; }
-    textarea { min-height: 8rem; width: 100%; }
-    .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; }
-    output, pre { border: 1px solid currentColor; min-height: 2rem; padding: 0.75rem; white-space: pre-wrap; }
-  </style>
-  <script type="module" src="/assets/dev/browser/app.js"></script>
-</head>
-<body>
-  <main>
-    <h1>Qwen WebGPU text runtime</h1>
-    <label for="runtime-prompt">Prompt</label>
-    <textarea id="runtime-prompt">Write one short sentence about WebGPU.</textarea>
-    <label for="runtime-max-tokens">Maximum new tokens</label>
-    <input id="runtime-max-tokens" type="number" min="1" max="16384" value="128">
-    <div class="controls">
-      <button id="runtime-load" type="button">Load</button>
-      <button id="runtime-run" type="button">Run prompt</button>
-      <button id="runtime-cancel" type="button">Cancel</button>
-      <button id="runtime-dispose" type="button">Dispose</button>
-      <button id="runtime-state" type="button">Get state</button>
-    </div>
-    <output id="runtime-status" aria-live="polite"></output>
-    <pre id="runtime-output" aria-live="polite"></pre>
-  </main>
-</body>
-</html>`,
+  staticAssetRoots: [
+    {
+      routePrefix: "/assets/public/",
+      directory: path.join(projectRoot, "public-dist"),
+      extensions: [".js", ".css"],
+    },
+    ...(localPackageDirectory === undefined
+      ? []
+      : [{
+          routePrefix: "/assets/model/",
+          directory: localPackageDirectory,
+          extensions: [".bin", ".json"],
+        }]),
+    ...(localTokenizerDirectory === undefined
+      ? []
+      : [{
+          routePrefix: "/assets/tokenizer/",
+          directory: localTokenizerDirectory,
+          extensions: [".bin"],
+        }]),
+    ...(localVisionPackageDirectory === undefined
+      ? []
+      : [{
+          routePrefix: "/assets/vision/",
+          directory: localVisionPackageDirectory,
+          extensions: [".bin", ".json"],
+        }]),
+  ],
+  html: publicHtml,
 });
 const operatorServer = createOperatorServer({
   controlPlane,

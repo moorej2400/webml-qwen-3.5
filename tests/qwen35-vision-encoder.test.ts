@@ -4,7 +4,7 @@ import { Qwen35VisionEncoder } from "../src/qwen35-vision-encoder.js";
 
 test("runs bootstrap, foundation, streamed layers, and merger in fixed order", async () => {
   const events: string[] = [];
-  const projected = { storage: { buffer: {}, byteLength: 10_240 }, async dispose() { events.push("projected:dispose"); } };
+  const projected = { tokenCount: 1, storage: { buffer: {}, byteLength: 10_240 }, async dispose() { events.push("projected:dispose"); } };
   const bootstrap = { async destroy() { events.push("bootstrap:destroy"); } };
   const encoder = new Qwen35VisionEncoder({
     async stageBootstrap() { events.push("bootstrap:stage"); return bootstrap; },
@@ -20,13 +20,15 @@ test("runs bootstrap, foundation, streamed layers, and merger in fixed order", a
   assert.equal(result, projected);
   assert.deepEqual(events, ["bootstrap:stage", "foundation:patch", "foundation:position", "foundation:rope", "layers", "projected:create", "merger:plan", "merger"]);
   await encoder.dispose();
+  assert.deepEqual(events.slice(-1), ["bootstrap:destroy"]);
+  await projected.dispose();
   assert.deepEqual(events.slice(-2), ["bootstrap:destroy", "projected:dispose"]);
 });
 
 test("releases owned bootstrap and projected output when cancellation occurs before merger", async () => {
   const events: string[] = [];
   const controller = new AbortController();
-  const projected = { storage: { buffer: {}, byteLength: 10_240 }, async dispose() { events.push("projected:dispose"); } };
+  const projected = { tokenCount: 1, storage: { buffer: {}, byteLength: 10_240 }, async dispose() { events.push("projected:dispose"); } };
   const bootstrap = { async destroy() { events.push("bootstrap:destroy"); } };
   const encoder = new Qwen35VisionEncoder({
     async stageBootstrap() { return bootstrap; },

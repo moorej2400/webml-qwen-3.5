@@ -5,6 +5,7 @@ export interface Qwen35VisionEncoderBootstrap {
 }
 
 export interface Qwen35VisionProjectedTokens {
+  readonly tokenCount: number;
   readonly storage: {
     readonly buffer: object;
     readonly byteLength: number;
@@ -15,6 +16,7 @@ export interface Qwen35VisionProjectedTokens {
 export interface Qwen35VisionEncoderInput {
   readonly gridHeight: number;
   readonly gridWidth: number;
+  readonly patches?: Float32Array;
   readonly signal?: AbortSignal;
 }
 
@@ -23,6 +25,7 @@ export interface Qwen35VisionEncoderDependencies<
   MergerPlan = unknown,
 > {
   stageBootstrap(signal: AbortSignal): Promise<Qwen35VisionEncoderBootstrap>;
+  uploadPatches?(patches: Float32Array, signal: AbortSignal): Promise<void>;
   planFoundation(
     bootstrap: Qwen35VisionEncoderBootstrap,
     input: Readonly<{ gridHeight: number; gridWidth: number }>,
@@ -46,6 +49,8 @@ export interface Qwen35VisionEncoderDependencies<
     projected: Qwen35VisionProjectedTokens,
     signal: AbortSignal,
   ): Promise<Qwen35VisionProjectedTokens>;
+  /** Releases patches, activations, uniforms, and bootstrap after projection retires. */
+  releaseTransient?(): Promise<void>;
 }
 
 type EncoderState = "ready" | "running" | "complete" | "failed" | "disposed";
@@ -103,6 +108,12 @@ export class Qwen35VisionEncoder<FoundationPlan = unknown, MergerPlan = unknown>
       this.#bootstrap = bootstrap;
       signal.throwIfAborted();
       const geometry = Object.freeze({ gridHeight: input.gridHeight, gridWidth: input.gridWidth });
+      if (input.patches !== undefined) {
+        if (this.#dependencies.uploadPatches === undefined) {
+          throw diagnosticError("vision-encoder-patches-unavailable", "Vision encoder patch upload is unavailable");
+        }
+        await this.#dependencies.uploadPatches(input.patches, signal);
+      }
       await this.#dependencies.runFoundation(this.#dependencies.planFoundation(bootstrap, geometry), signal);
       signal.throwIfAborted();
       await this.#dependencies.runLayers({ bootstrap, ...geometry, signal });
@@ -121,7 +132,14 @@ export class Qwen35VisionEncoder<FoundationPlan = unknown, MergerPlan = unknown>
         throw diagnosticError("vision-encoder-output-invalid", "Vision encoder merger returned an unowned output");
       }
       signal.throwIfAborted();
+      if (this.#dependencies.releaseTransient !== undefined) {
+        await this.#dependencies.releaseTransient();
+        this.#bootstrap = null;
+      }
       this.#state = "complete";
+      // The caller owns the projected rows after a successful encode and must
+      // keep them alive through language prefill; encoder cleanup owns failures.
+      this.#projected = null;
       return output;
     } catch (error) {
       this.#state = "failed";
@@ -160,6 +178,11 @@ export class Qwen35VisionEncoder<FoundationPlan = unknown, MergerPlan = unknown>
         await projected.dispose();
         this.#projected = null;
       } catch (error) { first ??= error; }
+    }
+    try {
+      await this.#dependencies.releaseTransient?.();
+    } catch (error) {
+      first ??= error;
     }
     if (first !== undefined) throw first;
   }

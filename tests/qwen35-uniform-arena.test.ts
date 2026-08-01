@@ -127,6 +127,22 @@ test("allocates one aligned bounded arena and exposes distinct uniform slots", a
   assert.equal(fake.buffer.destroyCount, 1);
 });
 
+test("accepts a caller-owned allocation id for a second live arena", async () => {
+  const fake = harness();
+  const uniforms = await createQwen35UniformArena({
+    arena: fake.arena,
+    queue: fake.queue,
+    allocationId: "qwen35-vision-uniform-arena",
+    slotCount: 1,
+    slotWordCapacity: 4,
+    minUniformBufferOffsetAlignment: 256,
+    maxUniformBufferBindingSize: 16,
+  });
+
+  assert.equal(fake.requests[0]?.id, "qwen35-vision-uniform-arena");
+  await uniforms.dispose();
+});
+
 test("rejects invalid plans and sanitizes allocation failure", async () => {
   const fake = harness();
   const base = {

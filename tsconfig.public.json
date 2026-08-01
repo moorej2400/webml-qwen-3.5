@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "public-dist"
   },
-  "files": ["src/browser.ts"],
+  "files": ["src/browser.ts", "src/chat-app.ts"],
   "include": []
 }

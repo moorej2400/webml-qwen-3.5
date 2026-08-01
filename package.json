@@ -16,7 +16,7 @@
     "convert:qwen35-vision": "node --import tsx tools/convert-qwen35-vision.ts",
     "stage:qwen35-huggingface": "node --import tsx tools/stage-qwen35-huggingface.ts",
     "stage:qwen35-vision-huggingface": "node --import tsx tools/stage-qwen35-vision-huggingface.ts",
-    "control:dev": "tsc --project tsconfig.dev.json && node dev-dist/dev/control/cli.js"
+    "control:dev": "npm run build:public && tsc --project tsconfig.dev.json && node dev-dist/dev/control/cli.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

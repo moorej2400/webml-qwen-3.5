@@ -531,6 +531,26 @@ test("binds manifest bytes and package URL to an immutable application pin", () 
   );
 });
 
+test("requires an explicit opt-in for a localhost HTTP Chrome smoke package", () => {
+  const manifest = pinnedManifest();
+  const localBase = "http://localhost:18080/model/";
+  const expectedManifestSha256 = modelCacheKey(manifest);
+  assert.throws(
+    () => assertQwen35ConvertedPackageTrust(manifest, {
+      packageBaseUrl: localBase,
+      expectedPackageBaseUrl: localBase,
+      expectedManifestSha256,
+    }),
+    { code: "model-url-invalid" },
+  );
+  assert.doesNotThrow(() => assertQwen35ConvertedPackageTrust(manifest, {
+    packageBaseUrl: localBase,
+    expectedPackageBaseUrl: localBase,
+    expectedManifestSha256,
+    allowInsecureLocalhost: true,
+  }));
+});
+
 test("snapshots trusted manifest fields before caller mutation can cross an await", async () => {
   const callerManifest = pinnedManifest();
   const expectedManifestSha256 = modelCacheKey(callerManifest);

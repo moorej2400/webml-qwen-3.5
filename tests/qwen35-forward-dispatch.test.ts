@@ -4,6 +4,7 @@ import test from "node:test";
 import { GgmlType } from "../src/gguf.js";
 import {
   planQwen35PackedEmbeddingDispatch,
+  planQwen35VisualEmbeddingDispatch,
   planQwen35PackedGemvDispatches,
   planQwen35TiedLogitsGeometry,
   planQwen35TiedLogitsDispatches,
@@ -22,6 +23,18 @@ const limits: Qwen35ForwardDeviceLimits = {
   maxUniformBufferBindingSize: 65_536,
   maxComputeWorkgroupsPerDimension: 65_535,
 };
+
+test("plans a projected visual-token row into the language hidden workspace", () => {
+  const source = { buffer: {}, offset: 256, byteLength: 2_560 * 4 };
+  const output = { buffer: {}, offset: 0, byteLength: 2_560 * 4 };
+  const uniform = { buffer: {}, offset: 0, byteLength: 16 };
+  const plan = planQwen35VisualEmbeddingDispatch({ source, output, uniform, limits });
+  assert.equal(plan.kernel.id, "qwen35-visual-embedding-f32");
+  assert.deepEqual(plan.workgroups, { x: 10, y: 1, z: 1 });
+  assert.deepEqual(plan.uniformWords, [2_560, 0, 0, 0]);
+  assert.equal(plan.bindings[0]!.offset, source.offset);
+  assert.equal(plan.bindings[1]!.offset, output.offset);
+});
 
 function tensor(input: {
   readonly name: string;

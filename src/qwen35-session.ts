@@ -11,6 +11,9 @@ import {
   type ExclusiveLockManager,
 } from "./origin-model-lock.js";
 import type { Qwen35Tokenizer } from "./qwen-tokenizer.js";
+import type { Qwen35ForwardBufferSlice } from "./qwen35-forward-dispatch.js";
+import type { Qwen35VisionPatchBatch } from "./qwen35-vision-preprocess.js";
+import type { Qwen35WebGpuExecutor } from "./qwen35-webgpu-executor.js";
 
 export type Qwen35SessionState =
   | "idle"
@@ -46,6 +49,12 @@ export interface GeneratedToken {
 
 export interface Qwen35DriverPrefillInput {
   readonly tokenIds: readonly number[];
+  /** Replaces one image-pad token with projected rows during prefill. */
+  readonly visualEmbeddings?: readonly {
+    readonly tokenId: number;
+    readonly tokenCount: number;
+    readonly source: Qwen35ForwardBufferSlice;
+  }[];
   readonly signal: AbortSignal;
 }
 
@@ -60,6 +69,11 @@ export interface Qwen35DriverGenerateInput {
 
 /** Model-specific scheduler boundary; it is not a reusable tensor API. */
 export interface Qwen35ExecutionDriver {
+  /** Borrowed by the lazy vision runtime; the driver remains its owner. */
+  readonly sharedGpuExecutor?: Pick<
+    Qwen35WebGpuExecutor,
+    "dispatchBatch" | "submittedWorkDone" | "dispose"
+  >;
   /** A rejected or cancelled prefill may be partial; reset must clear it fully. */
   prefill(input: Qwen35DriverPrefillInput): Promise<void>;
   generate(input: Qwen35DriverGenerateInput): AsyncIterable<number>;
@@ -80,6 +94,19 @@ export interface Qwen35LoadedResources {
     readonly peakBytes: number;
   };
   readonly deviceLost?: Promise<unknown>;
+  readonly vision?: {
+    encode(input: {
+      readonly patches: Float32Array;
+      readonly gridHeight: number;
+      readonly gridWidth: number;
+      readonly signal: AbortSignal;
+    }): Promise<{
+      readonly tokenCount: number;
+      readonly storage: Qwen35ForwardBufferSlice;
+      dispose(): Promise<void>;
+    }>;
+    dispose(): Promise<void>;
+  };
   dispose(): Promise<void>;
 }
 
@@ -333,21 +360,24 @@ export class Qwen35Session {
         "Reset the session before replacing the prefetched conversation",
       );
     }
-    if (
-      input.some((message) =>
-        Array.isArray(message.content) &&
-        message.content.some((part) => part.type === "image"),
-      )
-    ) {
-      throw diagnosticError(
-        "vision-not-loaded",
-        "Vision input is not available in this runtime milestone",
-      );
-    }
     const resources = this.#resources!;
+    const images = input.flatMap((message) =>
+      Array.isArray(message.content)
+        ? message.content.filter((part): part is Extract<typeof part, { type: "image" }> => part.type === "image")
+        : [],
+    );
+    // The template reserves one image-pad token before preprocessing. Once the
+    // browser has selected an actual visual-token budget, use that same count
+    // for both context accounting and the driver expansion. Keeping the
+    // default here is correct for an unprocessed image, while a smaller local
+    // smoke-test budget must not make the driver walk past its projection.
+    const visualTokensPerImage = images.length === 1 && images[0]!.patches !== undefined
+      ? images[0]!.patches.projectedVisualTokens
+      : undefined;
     const assembled = assembleQwen35Conversation(
       resources.tokenizer,
       input,
+      visualTokensPerImage === undefined ? {} : { visualTokensPerImage },
     );
     if (!assembled.ok) {
       throw diagnosticError(
@@ -362,11 +392,37 @@ export class Qwen35Session {
     this.#operationSettled = operationSettled;
     this.#state = "prefilling";
     const started = this.#now();
+    let projected: { readonly tokenCount: number; readonly storage: Qwen35ForwardBufferSlice; dispose(): Promise<void> } | null = null;
     try {
+      if (images.length > 0) {
+        if (resources.vision === undefined || images.some((image) => image.patches === undefined)) {
+          throw diagnosticError("vision-not-loaded", "Vision input is not available in the loaded runtime");
+        }
+        if (images.length !== 1) {
+          throw diagnosticError("vision-image-count-invalid", "Only one image is supported per user turn");
+        }
+        const image = images[0]!;
+        const patches = image.patches as Qwen35VisionPatchBatch;
+        projected = await resources.vision.encode({
+          patches: patches.patches,
+          gridHeight: patches.gridTHW[1],
+          gridWidth: patches.gridTHW[2],
+          signal: controller.signal,
+        });
+      }
       await resources.driver.prefill({
         tokenIds: assembled.tokenIds,
+        ...(projected === null ? {} : {
+          visualEmbeddings: [{
+            tokenId: resources.tokenizer.addedTokenId("<|image_pad|>")!,
+            tokenCount: projected.tokenCount,
+            source: projected.storage,
+          }],
+        }),
         signal: controller.signal,
       });
+      await projected?.dispose();
+      projected = null;
       controller.signal.throwIfAborted();
       this.#sequenceTokenIds = assembled.tokenIds;
       this.#contextTokens = assembled.promptTokenCount;
@@ -380,6 +436,8 @@ export class Qwen35Session {
         remainingContextTokens: assembled.remainingContextTokens,
       });
     } catch (error) {
+      try { await projected?.dispose(); } catch { /* Preserve prefill failure. */ }
+      projected = null;
       if (controller.signal.aborted && this.#operationCancellationPromise !== null) {
         let cancellationFailure: unknown;
         let rollbackFailure: unknown;

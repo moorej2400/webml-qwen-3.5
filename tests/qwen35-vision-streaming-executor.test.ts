@@ -15,6 +15,7 @@ function fixture(options: {
   readonly failAt?: "dispatch" | "retirement" | "stage" | "destroy";
   readonly failDestroyToo?: boolean;
   readonly throwNow?: boolean;
+  readonly disposeGpu?: boolean;
 } = {}): { readonly executor: Qwen35VisionStreamingExecutor; readonly events: Event[]; readonly ledger: AllocationLedger; readonly controller: AbortController } {
   const events: Event[] = [];
   const ledger = new AllocationLedger(1_000_000n);
@@ -69,6 +70,7 @@ function fixture(options: {
       },
       async dispose() { events.push("gpu:dispose"); },
     },
+    disposeGpu: options.disposeGpu,
     now: () => { if (options.throwNow) throw new Error("clock failure"); return ++clock; },
     onLayerComplete(layer) {
       if (options.cancelAt === "between-layers" && layer === 0) controller.abort();
@@ -101,6 +103,14 @@ test("streams the fixed 24-layer order with one group resident and exact uniform
   }
   await executor.dispose();
   await executor.dispose();
+  assert.equal(ledger.snapshot().allocationCount, 0);
+});
+
+test("releases vision resources without disposing a borrowed language GPU executor", async () => {
+  const { executor, events, ledger, controller } = fixture({ disposeGpu: false });
+  await executor.run({ tokenCount: 2, segmentCount: 1, signal: controller.signal });
+  await executor.dispose();
+  assert.equal(events.includes("gpu:dispose"), false);
   assert.equal(ledger.snapshot().allocationCount, 0);
 });
 

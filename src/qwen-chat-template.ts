@@ -1,5 +1,6 @@
 import { diagnosticError } from "./diagnostics.js";
 import type { Qwen35Tokenizer } from "./qwen-tokenizer.js";
+import type { Qwen35VisionPatchBatch } from "./qwen35-vision-preprocess.js";
 
 export const QWEN35_PRODUCT_CONTEXT_TOKENS = 16_384;
 export const QWEN35_DEFAULT_VISUAL_TOKENS = 1_024;
@@ -64,6 +65,8 @@ export type Qwen35ChatContentPart =
        * token with projected visual tokens in a later runtime boundary.
        */
       readonly type: "image";
+      /** Preprocessed pixels supplied by the browser image pipeline. */
+      readonly patches?: Qwen35VisionPatchBatch;
     };
 
 export interface Qwen35ChatMessage {

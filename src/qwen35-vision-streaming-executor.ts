@@ -169,8 +169,18 @@ export async function createQwen35VisionStreamingOwnedActivationWorkspace(input:
 export function createQwen35VisionStreamingOwnedResources(input: {
   readonly activationWorkspace: Qwen35VisionStreamingOwnedActivationWorkspace;
   readonly uniformArena: Qwen35UniformArena;
+  /**
+   * The language executor may reserve the first uniform slots for its own
+   * program.  Vision still exposes local slot indexes 0..9 to its planner,
+   * while this offset selects their physical ranges in the shared arena.
+   */
+  readonly uniformSlotOffset?: number;
 }): Qwen35VisionStreamingOwnedResources {
-  const slots = Object.freeze(Array.from({ length: 10 }, (_, index) => input.uniformArena.slot(index, 4)));
+  const uniformSlotOffset = input.uniformSlotOffset ?? 0;
+  if (!Number.isSafeInteger(uniformSlotOffset) || uniformSlotOffset < 0 || uniformSlotOffset + 10 > input.uniformArena.slotCount) {
+    fail("vision-streaming-uniforms-invalid", "Vision streaming uniform slot offset is invalid");
+  }
+  const slots = Object.freeze(Array.from({ length: 10 }, (_, index) => input.uniformArena.slot(uniformSlotOffset + index, 4)));
   const uniforms = Object.freeze(slots.map((slot) => Object.freeze({
     buffer: slot.binding.buffer,
     byteOffset: slot.binding.offset,
@@ -246,6 +256,8 @@ export interface Qwen35VisionStreamingDependencies {
     readonly limits: Qwen35ForwardDeviceLimits;
   }) => readonly Qwen35VisionLayerDispatchPlan[];
   readonly gpu: Pick<Qwen35WebGpuExecutor, "dispatchBatch" | "submittedWorkDone" | "dispose">;
+  /** Shared language sessions keep the borrowed executor alive after vision cleanup. */
+  readonly disposeGpu?: boolean;
   /** Monotonic measurement source; only finite elapsed durations are recorded. */
   readonly now?: () => number;
   /** Test hook only. Production callers do not need a layer-complete callback. */
@@ -262,6 +274,7 @@ export interface CreateQwen35VisionStreamingExecutorOptions {
   readonly limits: Qwen35ForwardDeviceLimits;
   readonly resources: Qwen35VisionStreamingOwnedResources;
   readonly gpu: Pick<Qwen35WebGpuExecutor, "dispatchBatch" | "submittedWorkDone" | "dispose">;
+  readonly disposeGpu?: boolean;
 }
 
 function fail(code: string, message: string): never {
@@ -484,7 +497,9 @@ export class Qwen35VisionStreamingExecutor {
     let firstError: unknown;
     try { await this.#releaseUnresolvedStaged(); } catch (error) { firstError ??= error; }
     try { await this.#dependencies.resources.dispose(); } catch (error) { firstError ??= error; }
-    try { await this.#disposeGpu(); } catch (error) { firstError ??= error; }
+    if (this.#dependencies.disposeGpu ?? true) {
+      try { await this.#disposeGpu(); } catch (error) { firstError ??= error; }
+    }
     if (firstError !== undefined) throw firstError;
   }
 
@@ -510,6 +525,7 @@ export function createQwen35VisionStreamingExecutor(input: CreateQwen35VisionStr
     limits: input.limits,
     resources: input.resources,
     gpu: input.gpu,
+    ...(input.disposeGpu === undefined ? {} : { disposeGpu: input.disposeGpu }),
     planLayer: planQwen35VisionLayerDispatches,
     stageLayer: (layer, signal) => stageQwen35VisionGpuGroup({ package: input.package, program: input.program, layer, ledger: input.ledger, allocator: input.allocator, queue: input.queue, allocationId: `${input.allocationIdPrefix}-layer-${layer}`, signal }),
   });

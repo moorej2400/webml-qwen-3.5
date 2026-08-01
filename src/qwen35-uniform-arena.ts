@@ -33,6 +33,8 @@ export interface Qwen35UniformSlot {
 export interface CreateQwen35UniformArenaOptions {
   readonly arena: Qwen35UniformArenaAllocator;
   readonly queue: Qwen35UniformWriteQueue;
+  /** Stable allocation identity when more than one arena shares a ledger. */
+  readonly allocationId?: string;
   readonly slotCount: number;
   readonly slotWordCapacity: number;
   readonly minUniformBufferOffsetAlignment: number;
@@ -247,7 +249,7 @@ export async function createQwen35UniformArena(
   let allocation: GpuAllocation;
   try {
     allocation = await options.arena.allocate({
-      id: "qwen35-uniform-arena",
+      id: options.allocationId ?? "qwen35-uniform-arena",
       category: "scratch",
       byteLength: BigInt(plan.totalBytes),
       usage: GPU_BUFFER_USAGE_UNIFORM | GPU_BUFFER_USAGE_COPY_DST,

@@ -72,6 +72,19 @@ const QWEN35_MATHEMATICAL_LOGITS_TILES = 243;
 const QWEN35_FINAL_LOGITS_TILE_ROWS = 262;
 const QWEN35_LOGITS_REDUCTION_DISPATCHES = 244;
 
+const VISUAL_EMBEDDING_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "qwen35-visual-embedding-f32",
+  entryPoint: "main",
+  source: /* wgsl */ `
+struct Params { output_elements: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x < params.output_elements) { output[id.x] = source[id.x]; }
+}`,
+});
+
 const EMBEDDING_KERNEL_SOURCES = new Map<GemvLayout, Qwen35KernelSource>(
   PACKED_EMBEDDING_KERNELS.map((kernel) => [
     kernel.storageType,
@@ -635,6 +648,26 @@ function gemvKernel(
     );
   }
   return { layout, kernel, source };
+}
+
+/** Copies one projected visual token into the language hidden workspace. */
+export function planQwen35VisualEmbeddingDispatch(input: {
+  readonly source: Qwen35ForwardBufferSlice;
+  readonly output: Qwen35ForwardBufferSlice;
+  readonly uniform: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): Qwen35ForwardDispatchPlan {
+  const elements = QWEN35_HIDDEN_SIZE;
+  const sourceBinding = binding(0, "storage", input.source, elements * 4, input.limits);
+  const outputBinding = binding(1, "storage", input.output, elements * 4, input.limits);
+  const uniformBinding = binding(2, "uniform", input.uniform, 16, input.limits);
+  requireWritableOutputDisjoint(outputBinding, [sourceBinding, uniformBinding]);
+  return dispatchPlan({
+    kernel: VISUAL_EMBEDDING_KERNEL,
+    bindings: [sourceBinding, outputBinding, uniformBinding],
+    uniformWords: [elements, 0, 0, 0],
+    workgroups: { x: Math.ceil(elements / 256), y: 1, z: 1 },
+  });
 }
 
 function tiedLogitsGeometryData(input: {

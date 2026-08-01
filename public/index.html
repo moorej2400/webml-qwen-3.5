@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f2efe8">
+    <meta name="description" content="A private, browser-native Qwen 3.5 workspace.">
+    <title>Qwen 3.5 / browser workspace</title>
+    <link rel="stylesheet" href="./app.css">
+  </head>
+  <body>
+    <div id="qwen-app">
+      <header class="nav">
+        <a class="brand" href="./" aria-label="Qwen 3.5 workspace home">
+          <span class="brand__mark" aria-hidden="true"></span>
+          <span>Qwen 3.5 <small>browser workspace</small></span>
+        </a>
+        <div class="nav__actions">
+          <span class="runtime-chip"><span class="runtime-chip__dot" aria-hidden="true"></span><span data-runtime-status>Starting</span></span>
+          <button class="icon-button" type="button" data-settings-toggle aria-expanded="false" aria-controls="settings-panel" aria-label="Open settings">Settings</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="welcome" aria-labelledby="welcome-heading">
+          <div class="welcome__copy">
+            <p class="eyebrow">On-device reasoning, no relay</p>
+            <h1 id="welcome-heading">A small window into a <em>large</em> model.</h1>
+            <p class="welcome__lede">Qwen 3.5 runs in this tab through a model-specific WebGPU runtime. Text stays local. Add one image when the conversation needs a second point of view.</p>
+          </div>
+          <div class="welcome__signal" aria-label="Runtime telemetry">
+            <div class="signal-ring" aria-hidden="true"><span></span></div>
+            <div><strong>Chrome path</strong><span>Correctness before speed</span></div>
+          </div>
+        </section>
+
+        <section class="metrics-grid" aria-label="Runtime details">
+          <article class="metric-card metric-card--wide"><span>Context used</span><strong data-metric-context>—</strong><small data-context-copy>Prefill a conversation to measure it</small></article>
+          <article class="metric-card"><span>Decode</span><strong data-metric-speed>—</strong><small>Greedy stream</small></article>
+          <article class="metric-card"><span>GPU residency</span><strong data-metric-memory>—</strong><small>Packed model and state</small></article>
+          <article class="metric-card metric-card--status"><span>Session</span><strong data-metric-phase>idle</strong><small>Lifecycle-safe ownership</small></article>
+        </section>
+
+        <section class="conversation" aria-label="Conversation">
+          <div class="conversation__topline">
+            <div><span class="eyebrow">Conversation</span><h2>Ask without leaving the page.</h2></div>
+            <span class="privacy-note"><span aria-hidden="true">●</span> Local tab</span>
+          </div>
+          <div class="messages" data-messages>
+            <div class="empty-state">
+              <span class="empty-state__line" aria-hidden="true"></span>
+              <p>Your next prompt starts the local session.</p>
+              <small>Try a short question, or attach an image with the paperclip control.</small>
+            </div>
+          </div>
+          <form class="composer" data-composer>
+            <div class="composer__attachments" data-image-preview hidden></div>
+            <div class="composer__row">
+              <button class="attach-button" type="button" data-image-button data-composer-control aria-label="Attach one image">Attach image</button>
+              <textarea data-prompt data-composer-control rows="1" placeholder="Ask Qwen 3.5 anything" aria-label="Message Qwen 3.5"></textarea>
+              <button class="send-button" type="submit" data-composer-control>Send <span aria-hidden="true">↗</span></button>
+            </div>
+            <div class="composer__foot"><span>Shift + Enter for a new line</span><button class="stop-button" type="button" data-stop data-composer-control>Stop generation</button></div>
+            <input data-image-input type="file" accept="image/*" hidden>
+          </form>
+        </section>
+      </main>
+
+      <aside class="settings" id="settings-panel" data-settings-panel aria-hidden="true" aria-labelledby="settings-heading">
+        <div class="settings__header"><div><span class="eyebrow">Workspace controls</span><h2 id="settings-heading">Settings</h2></div><button class="icon-button" type="button" data-settings-close aria-label="Close settings">Close</button></div>
+        <label class="field"><span>Maximum new tokens</span><input data-generation-limit type="number" min="1" max="2048" step="1" value="192"></label>
+        <div class="settings__note"><strong>Qwen 3.5 4B / Q3_K_L</strong><span>16,384 total context · one image per turn · greedy decoding</span></div>
+        <button class="secondary-button" type="button" data-new-chat>Start a new conversation</button>
+      </aside>
+      <div class="settings-backdrop" data-settings-close aria-hidden="true"></div>
+    </div>
+    <script type="module" src="./chat-app.js"></script>
+  </body>
+</html>

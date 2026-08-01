@@ -280,7 +280,7 @@ fn bf16(word: u32, lane: u32) -> f32 { let bits = select(word >> 16u, word & 0xf
   let branch = row / 1024u; let lane = row % 1024u; output[(branch * params.token_count + token) * 1024u + lane] = sum;
 }`;
 
-const ONLINE_ATTENTION_WGSL = /* wgsl */ `
+const ONLINE_ATTENTION_WGSL_TEMPLATE = /* wgsl */ `
 struct Params { token_count: u32, segment_count: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> key: array<f32>;
@@ -290,22 +290,68 @@ struct Params { token_count: u32, segment_count: u32, pad0: u32, pad1: u32 }
 @group(0) @binding(5) var<uniform> params: Params;
 var<workgroup> partial: array<f32, 64>; var<workgroup> maximum: f32; var<workgroup> denominator: f32; var<workgroup> prior: f32; var<workgroup> current: f32; var<workgroup> start: u32; var<workgroup> end: u32; var<workgroup> has_key: u32;
 @compute @workgroup_size(64) fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
-  let lane = local.x; let token = group.y; let head = group.z; if (token >= params.token_count || head >= 16u) { return; }
-  if (lane == 0u) { var found = false; for (var segment = 0u; segment < params.segment_count; segment += 1u) { if (token >= segment_offsets[segment] && token < segment_offsets[segment + 1u]) { start = segment_offsets[segment]; end = segment_offsets[segment + 1u]; found = true; } } if (!found) { start = 0u; end = 0u; } maximum = -3.402823466e+38f; denominator = 0.0; has_key = 0u; }
-  workgroupBarrier(); if (start >= end) { return; } let base = (token * 16u + head) * 64u; var accumulator = 0.0f;
-  for (var key_token = start; key_token < end; key_token += 1u) { let key_base = (key_token * 16u + head) * 64u; partial[lane] = query[base + lane] * key[key_base + lane]; workgroupBarrier();
-    var stride = 32u; loop { if (lane < stride) { partial[lane] = partial[lane] + partial[lane + stride]; } workgroupBarrier(); if (stride == 1u) { break; } stride = stride / 2u; }
-    if (lane == 0u) { let score = partial[0] * 0.125f; let next_maximum = max(maximum, score); prior = select(exp(maximum - next_maximum), 0.0f, has_key == 0u); current = exp(score - next_maximum); denominator = denominator * prior + current; maximum = next_maximum; has_key = 1u; }
-    workgroupBarrier(); accumulator = accumulator * prior + current * value[key_base + lane]; workgroupBarrier();
+  let lane = local.x; let token = group.y; let head = group.z;
+  if (token >= params.token_count || head >= 16u) { return; }
+  if (lane == 0u) {
+    start = 0u; end = 0u;
+    for (var segment = 0u; segment < params.segment_count; segment += 1u) {
+      if (token >= segment_offsets[segment] && token < segment_offsets[segment + 1u]) {
+        start = segment_offsets[segment]; end = segment_offsets[segment + 1u];
+      }
+    }
+    maximum = -3.402823466e+38f; denominator = 0.0f; has_key = 0u;
   }
-  output[base + lane] = accumulator / denominator;
+  workgroupBarrier();
+  let base = (token * 16u + head) * 64u; var accumulator = 0.0f;
+  for (var key_token = 0u; key_token < __VISION_TOKEN_LIMIT__u; key_token += 1u) {
+    let key_base = (key_token * 16u + head) * 64u;
+    let enabled = key_token < params.token_count && key_token >= start && key_token < end;
+    if (enabled) {
+      partial[lane] = query[base + lane] * key[key_base + lane];
+    } else {
+      partial[lane] = 0.0f;
+    }
+    workgroupBarrier();
+    if (lane < 32u) { partial[lane] = partial[lane] + partial[lane + 32u]; }
+    workgroupBarrier();
+    if (lane < 16u) { partial[lane] = partial[lane] + partial[lane + 16u]; }
+    workgroupBarrier();
+    if (lane < 8u) { partial[lane] = partial[lane] + partial[lane + 8u]; }
+    workgroupBarrier();
+    if (lane < 4u) { partial[lane] = partial[lane] + partial[lane + 4u]; }
+    workgroupBarrier();
+    if (lane < 2u) { partial[lane] = partial[lane] + partial[lane + 2u]; }
+    workgroupBarrier();
+    if (lane == 0u) {
+      partial[0] = partial[0] + partial[1];
+      let score = select(-3.402823466e+38f, partial[0] * 0.125f, enabled); let next_maximum = max(maximum, score);
+      prior = select(exp(maximum - next_maximum), 0.0f, has_key == 0u);
+      current = select(exp(score - next_maximum), 0.0f, enabled);
+      denominator = denominator * prior + current; maximum = next_maximum;
+      has_key = select(has_key, 1u, enabled);
+    }
+    workgroupBarrier();
+    if (enabled) {
+      accumulator = accumulator * prior + current * value[key_base + lane];
+    } else {
+      accumulator = accumulator * prior;
+    }
+    workgroupBarrier();
+  }
+  output[base + lane] = select(0.0f, accumulator / denominator, denominator != 0.0f);
 }`;
+
+const ONLINE_ATTENTION_TOKEN_LIMIT = 256;
+const ONLINE_ATTENTION_WGSL = ONLINE_ATTENTION_WGSL_TEMPLATE.replace(
+  "__VISION_TOKEN_LIMIT__",
+  String(ONLINE_ATTENTION_TOKEN_LIMIT),
+);
 
 const TANH_GELU_WGSL = /* wgsl */ `
 struct Params { element_count: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<storage, read_write> values: array<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
-@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { let index = id.y * 4096u + id.x; if (index >= params.element_count) { return; } let value = values[index]; values[index] = 0.5f * value * (1.0f + tanh(0.7978845608f * (value + 0.044715f * value * value * value))); }`;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { let index = id.y * 4096u + id.x; if (index >= params.element_count) { return; } let value = values[index]; let argument = clamp(0.7978845608f * (value + 0.044715f * value * value * value), -10.0f, 10.0f); values[index] = 0.5f * value * (1.0f + tanh(argument)); }`;
 
 const RESIDUAL_WGSL = /* wgsl */ `
 struct Params { element_count: u32, pad0: u32, pad1: u32, pad2: u32 }
@@ -441,7 +487,21 @@ function tensorBinding(binding: number, value: Qwen35VisionGpuTensorView, limits
   return Object.freeze({ binding, kind: "storage", buffer: segment.buffer, offset: segment.bufferOffset, size: segment.byteLength });
 }
 
-function kernel(operation: string): { readonly id: string; readonly source: string; readonly entryPoint: string } {
+function attentionKernel(tokenCount: number): { readonly id: string; readonly source: string; readonly entryPoint: string } {
+  const definition = QWEN35_VISION_LAYER_KERNELS.find((candidate) => candidate.key.operation === "vision-online-attention");
+  if (definition === undefined) fail("vision-layer-kernel-missing", "Vision transformer layer kernel is unavailable");
+  if (tokenCount <= ONLINE_ATTENTION_TOKEN_LIMIT) {
+    return Object.freeze({ id: definition.id, source: definition.source, entryPoint: "main" });
+  }
+  return Object.freeze({
+    id: `${definition.id}-${tokenCount}`,
+    source: ONLINE_ATTENTION_WGSL_TEMPLATE.replace("__VISION_TOKEN_LIMIT__", String(tokenCount)),
+    entryPoint: "main",
+  });
+}
+
+function kernel(operation: string, tokenCount: number): { readonly id: string; readonly source: string; readonly entryPoint: string } {
+  if (operation === "vision-online-attention") return attentionKernel(tokenCount);
   const definition = [...QWEN35_VISION_LAYER_KERNELS, ...QWEN35_VISION_FOUNDATION_KERNELS].find((candidate) => candidate.key.operation === operation);
   if (definition === undefined) fail("vision-layer-kernel-missing", "Vision transformer layer kernel is unavailable");
   return Object.freeze({ id: definition.id, source: definition.source, entryPoint: "main" });
@@ -481,7 +541,7 @@ export function planQwen35VisionLayerDispatches(input: {
   const hiddenBytes = input.tokenCount * HIDDEN_SIZE * f32; const qkvBytes = hiddenBytes * 3; const mlpBytes = input.tokenCount * FEED_FORWARD_SIZE * f32; const ropeBytes = input.tokenCount * (HEAD_DIMENSION / 2) * 2 * f32;
   const uniform = (index: number) => uniformBinding(4, input.workspace.uniforms[index]!, input.limits);
   const plan = (operation: string, bindings: readonly Qwen35BufferBinding[], workgroups: { readonly x: number; readonly y: number; readonly z: number }, uniformWords: readonly [number, number, number, number]): Qwen35VisionLayerDispatchPlan => {
-    validateWorkgroups(workgroups, input.limits); return Object.freeze({ kernel: kernel(operation), bindings: Object.freeze(bindings), workgroups: Object.freeze(workgroups), uniformWords: Object.freeze(uniformWords) as readonly [number, number, number, number] });
+    validateWorkgroups(workgroups, input.limits); return Object.freeze({ kernel: kernel(operation, input.tokenCount), bindings: Object.freeze(bindings), workgroups: Object.freeze(workgroups), uniformWords: Object.freeze(uniformWords) as readonly [number, number, number, number] });
   };
   const normWords = Object.freeze([input.tokenCount, HIDDEN_SIZE, f32Bits(LAYER_NORM_EPSILON), 0]) as readonly [number, number, number, number];
   const residualWords = Object.freeze([input.tokenCount * HIDDEN_SIZE, 0, 0, 0]) as readonly [number, number, number, number];

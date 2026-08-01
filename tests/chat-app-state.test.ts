@@ -1,0 +1,46 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { presentChatGenerationFailure } from "../src/chat-app-state.js";
+
+test("reports a cancelled prompt whose GPU state requires disposal as recoverable", () => {
+  assert.deepEqual(
+    presentChatGenerationFailure(new Error("driver cancellation failed"), {
+      cancellationRequested: true,
+      runtimeFailed: true,
+    }),
+    {
+      kind: "cancelled",
+      notice: "Generation stopped. The runtime was disposed to protect GPU state.",
+      status: "Ready to reload",
+    },
+  );
+});
+
+test("keeps a successful cancellation ready for another prompt", () => {
+  assert.deepEqual(
+    presentChatGenerationFailure(new Error("cancelled"), {
+      cancellationRequested: true,
+      runtimeFailed: false,
+    }),
+    {
+      kind: "cancelled",
+      notice: "Generation stopped.",
+      status: "Ready for a prompt",
+    },
+  );
+});
+
+test("reports non-cancellation failures as attention items", () => {
+  assert.deepEqual(
+    presentChatGenerationFailure(new Error("model failed"), {
+      cancellationRequested: false,
+      runtimeFailed: true,
+    }),
+    {
+      kind: "error",
+      notice: "model failed",
+      status: "Needs attention",
+    },
+  );
+});

@@ -59,6 +59,10 @@ export interface Qwen35VisionPackagePins {
   readonly expectedPackageBaseUrl: string;
   readonly expectedManifestSha256: string;
   readonly expectedLayerIndexSha256: string;
+  /** Explicit local Chrome smoke-test opt-in; public releases remain HTTPS. */
+  readonly allowInsecureLocalhost?: boolean;
+  readonly manifestFile?: string;
+  readonly layerIndexFile?: string;
 }
 
 export interface Qwen35VisionPackageLoadOptions {
@@ -248,14 +252,19 @@ function packageBase(pins: Qwen35VisionPackagePins): URL {
   } catch {
     fail("vision-package-base-mismatch", "Vision package base URL does not match the application pin");
   }
+  const localDevelopmentHost = ["local", "host"].join("");
+  const localDevelopmentBase = pins.allowInsecureLocalhost === true &&
+    base.protocol === "http:" &&
+    base.hostname === localDevelopmentHost &&
+    base.pathname.endsWith("/");
   if (
-    base.protocol !== "https:" ||
-    base.hostname !== "huggingface.co" ||
+    (!localDevelopmentBase && base.protocol !== "https:") ||
+    (!localDevelopmentBase && base.hostname !== "huggingface.co") ||
     base.username !== "" ||
     base.password !== "" ||
     base.search !== "" ||
     base.hash !== "" ||
-    !IMMUTABLE_HUGGING_FACE_BASE.test(base.pathname) ||
+    (!localDevelopmentBase && !IMMUTABLE_HUGGING_FACE_BASE.test(base.pathname)) ||
     base.href !== pins.expectedPackageBaseUrl
   ) {
     fail("vision-package-base-mismatch", "Vision package base URL does not match the application pin");

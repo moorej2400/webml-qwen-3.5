@@ -175,12 +175,12 @@ test("development server serves only real JavaScript files under explicit module
     html: "<main></main>",
     staticModuleRoots: [{ routePrefix: "/assets/src/", directory: path.join(root, "src") }],
   });
-  const invoke = async (url: string): Promise<{ status: number; body: string; headers: Record<string, string> }> => {
+  const invoke = async (url: string, requestHeaders: Record<string, string> = {}): Promise<{ status: number; body: string; headers: Record<string, string> }> => {
     let status = 0;
     let responseBody = "";
     let headers: Record<string, string> = {};
     await handler(
-      { method: "GET", url, headers: {} } as IncomingMessage,
+      { method: "GET", url, headers: requestHeaders } as IncomingMessage,
       {
         writeHead(code: number, values?: Record<string, string>) { status = code; headers = values ?? {}; return this; },
         end(chunk?: string | Buffer) { responseBody += chunk?.toString() ?? ""; return this; },
@@ -197,6 +197,51 @@ test("development server serves only real JavaScript files under explicit module
   assert.equal((await invoke("/assets/src/private.txt")).status, 404);
   assert.equal((await invoke("/assets/src/linked.js")).status, 404);
   assert.equal((await invoke("/assets/src/%2e%2e%2foutside.js")).status, 404);
+});
+
+test("development server serves reviewed public JavaScript and CSS assets only", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "qwen-public-root-"));
+  await writeFile(path.join(root, "chat-app.js"), "export const app = true;\n");
+  await writeFile(path.join(root, "app.css"), "body { color: red; }\n");
+  await writeFile(path.join(root, "model.bin"), Buffer.from("0123456789", "ascii"));
+  await writeFile(path.join(root, "private.json"), "{\"no\":true}\n");
+  const handler = createDevelopmentRequestHandler({
+    ticketAuthority: createAuthority(),
+    publicOrigin,
+    html: "<main></main>",
+    staticAssetRoots: [{
+      routePrefix: "/assets/public/",
+      directory: root,
+      extensions: [".js", ".css", ".bin"],
+    }],
+  });
+  const invoke = async (url: string, requestHeaders: Record<string, string> = {}): Promise<{ status: number; body: string; headers: Record<string, string> }> => {
+    let status = 0;
+    let body = "";
+    let headers: Record<string, string> = {};
+    await handler(
+      { method: "GET", url, headers: requestHeaders } as IncomingMessage,
+      {
+        writeHead(code: number, values?: Record<string, string>) { status = code; headers = values ?? {}; return this; },
+        end(chunk?: string | Buffer) { body += chunk?.toString() ?? ""; return this; },
+      } as unknown as ServerResponse,
+    );
+    return { status, body, headers };
+  };
+
+  const script = await invoke("/assets/public/chat-app.js");
+  assert.equal(script.status, 200);
+  assert.equal(script.body, "export const app = true;\n");
+  assert.equal(script.headers["content-type"], "text/javascript; charset=utf-8");
+  const stylesheet = await invoke("/assets/public/app.css");
+  assert.equal(stylesheet.status, 200);
+  assert.equal(stylesheet.headers["content-type"], "text/css; charset=utf-8");
+  const range = await invoke("/assets/public/model.bin", { range: "bytes=2-5" });
+  assert.equal(range.status, 206);
+  assert.equal(range.body, "2345");
+  assert.equal(range.headers["content-range"], "bytes 2-5/10");
+  assert.equal((await invoke("/assets/public/private.json")).status, 404);
+  assert.equal((await invoke("/assets/public/%2e%2e%2foutside.js")).status, 404);
 });
 
 test("development page exposes no-store credential-free runtime configuration", async () => {
@@ -228,4 +273,15 @@ test("development page exposes no-store credential-free runtime configuration", 
   assert.equal(headers["cache-control"], "no-store");
   assert.deepEqual(JSON.parse(body), runtimeConfiguration);
   assert.doesNotMatch(body, /operator|credential|manifestPath/i);
+
+  let page = "";
+  await handler(
+    { method: "GET", url: "/", headers: {} } as IncomingMessage,
+    {
+      writeHead() { return this; },
+      end(chunk?: string) { page += chunk ?? ""; return this; },
+    } as unknown as ServerResponse,
+  );
+  assert.match(page, /__QWEN35_RUNTIME_CONFIG__/);
+  assert.match(page, /\.local-agent\.js/);
 });

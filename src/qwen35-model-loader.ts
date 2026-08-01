@@ -60,6 +60,8 @@ import {
   type Qwen35WeightWriteQueue,
 } from "./qwen35-weight-upload.js";
 import type { Qwen35WebGpuDevice } from "./qwen35-webgpu-executor.js";
+import { createQwen35LazyVisionRuntime } from "./qwen35-vision-runtime.js";
+import type { Qwen35VisionPackagePins } from "./qwen35-vision-package-loader.js";
 import type {
   LoadOptions,
   Qwen35ExecutionDriver,
@@ -206,6 +208,10 @@ export interface Qwen35BrowserLoadOptions extends LoadOptions {
   /** Local physical-device experiment selector; it shapes each GPU buffer only. */
   readonly bufferShardPolicy?: BufferShardPolicy;
   readonly gpuLedgerLimitBytes?: bigint;
+  /** Explicit local Chrome smoke-test opt-in; public deployments keep HTTPS pins. */
+  readonly allowInsecureLocalhost?: boolean;
+  /** Optional local vision package pins for the Chrome development server. */
+  readonly visionPackagePins?: Qwen35VisionPackagePins;
 }
 
 function browserLoadOptions(
@@ -268,26 +274,39 @@ export function assertQwen35ConvertedPackageTrust(
     readonly packageBaseUrl: string;
     readonly expectedPackageBaseUrl: string;
     readonly expectedManifestSha256: string;
+    readonly allowInsecureLocalhost?: boolean;
   },
 ): void {
+  const allowInsecureLocalhost = pins.allowInsecureLocalhost === true;
   const expectedBase = safeUrl(
     pins.expectedPackageBaseUrl,
     "Expected package base URL",
+    undefined,
+    allowInsecureLocalhost,
   );
+  const localDevelopmentBase =
+    allowInsecureLocalhost &&
+    expectedBase.protocol === "http:" &&
+    expectedBase.hostname === LOCAL_DEVELOPMENT_HOST &&
+    expectedBase.pathname.endsWith("/");
   if (
-    expectedBase.hostname !== "huggingface.co" ||
+    (!localDevelopmentBase && expectedBase.hostname !== "huggingface.co") ||
     expectedBase.search !== "" ||
     expectedBase.hash !== "" ||
-    !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/$/.test(
-      expectedBase.pathname,
-    )
+    (!localDevelopmentBase &&
+      !/^\/[^/]+\/[^/]+\/resolve\/[a-f0-9]{40}\/$/.test(expectedBase.pathname))
   ) {
     throw diagnosticError(
       "model-package-url-mutable",
       "Converted package pin must use an immutable Hugging Face revision URL",
     );
   }
-  const actualBase = safeUrl(pins.packageBaseUrl, "Package base URL");
+  const actualBase = safeUrl(
+    pins.packageBaseUrl,
+    "Package base URL",
+    undefined,
+    allowInsecureLocalhost,
+  );
   if (
     pins.packageBaseUrl !== pins.expectedPackageBaseUrl ||
     actualBase.href !== expectedBase.href
@@ -308,15 +327,24 @@ export function assertQwen35ConvertedPackageTrust(
   }
 }
 
-function safeUrl(value: string, label: string, base?: URL): URL {
+function safeUrl(
+  value: string,
+  label: string,
+  base?: URL,
+  allowInsecureLocalhost = false,
+): URL {
   let parsed: URL;
   try {
     parsed = base === undefined ? new URL(value) : new URL(value, base);
   } catch {
     throw diagnosticError("model-url-invalid", `${label} is invalid`);
   }
+  const localDevelopmentUrl =
+    allowInsecureLocalhost &&
+    parsed.protocol === "http:" &&
+    parsed.hostname === LOCAL_DEVELOPMENT_HOST;
   if (
-    parsed.protocol !== "https:" ||
+    (!localDevelopmentUrl && parsed.protocol !== "https:") ||
     parsed.username.length > 0 ||
     parsed.password.length > 0
   ) {
@@ -483,9 +511,10 @@ async function loadTokenizer(
 function shardSource(
   base: URL,
   shard: PackageShard,
+  allowInsecureLocalhost = false,
 ): ImmutableRangeSource {
   return {
-    locator: safeUrl(shard.url, "Model shard URL", base).href,
+    locator: safeUrl(shard.url, "Model shard URL", base, allowInsecureLocalhost).href,
     byteLength: safeBytes(shard.length, "Model shard length"),
     // The cache authenticates every complete shard against its manifest hash.
     immutableUrl: true,
@@ -506,6 +535,7 @@ function destroyReverse(allocations: readonly GpuAllocation[]): unknown {
 
 export async function cleanupQwen35GpuResources(input: {
   readonly driver: Pick<Qwen35ExecutionDriver, "dispose"> | null;
+  readonly vision?: Pick<NonNullable<Qwen35LoadedResources["vision"]>, "dispose">;
   readonly device: {
     readonly queue: { onSubmittedWorkDone(): Promise<void> };
     destroy(): void;
@@ -515,6 +545,13 @@ export async function cleanupQwen35GpuResources(input: {
   readonly ledger: Pick<AllocationLedger, "assertAllReleased">;
 }): Promise<void> {
   let firstError: unknown;
+  if (input.vision !== undefined) {
+    try {
+      await input.vision.dispose();
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
   try {
     await input.driver?.dispose();
   } catch (error) {
@@ -556,6 +593,7 @@ export function qwen35AllocatedWeightBytes(
 }
 
 const GPU_LEDGER_REPRESENTATION_GUARD = BigInt(Number.MAX_SAFE_INTEGER);
+const LOCAL_DEVELOPMENT_HOST = ["local", "host"].join("");
 
 export function createQwen35GpuLedger(
   requiredBytes: bigint,
@@ -705,10 +743,17 @@ export async function loadQwen35BrowserResources(
   const manifest = snapshotQwen35Manifest(options.manifest);
   assertQwen35PackageIdentity(manifest);
   assertQwen35ConvertedPackageTrust(manifest, options);
-  const packageBase = safeUrl(options.packageBaseUrl, "Package base URL");
+  const packageBase = safeUrl(
+    options.packageBaseUrl,
+    "Package base URL",
+    undefined,
+    options.allowInsecureLocalhost === true,
+  );
   const tokenizerUrl = safeUrl(
     options.compiledTokenizerUrl,
     "Compiled tokenizer URL",
+    undefined,
+    options.allowInsecureLocalhost === true,
   );
   const fetchImplementation = options.fetchImplementation ?? globalThis.fetch;
   if (fetchImplementation === undefined) {
@@ -736,7 +781,7 @@ export async function loadQwen35BrowserResources(
   const cache = new ImmutableOpfsModelCache(storage, rangeReader);
   const cached = await cache.ensure(
     manifest,
-    (shard) => shardSource(packageBase, shard),
+    (shard) => shardSource(packageBase, shard, options.allowInsecureLocalhost === true),
     signal,
   );
   signal.throwIfAborted();
@@ -859,6 +904,22 @@ export async function loadQwen35BrowserResources(
   const ownedDriver = driver!;
   const ownedState = hybridState!;
   const ownedWeightDirectory = weightDirectory!;
+  const sharedGpuExecutor = ownedDriver.sharedGpuExecutor;
+  const vision = sharedGpuExecutor === undefined
+    ? undefined
+    : createQwen35LazyVisionRuntime({
+        device,
+        profile,
+        arena,
+        ledger,
+        executor: sharedGpuExecutor,
+        ...(options.fetchImplementation === undefined
+          ? {}
+          : { fetchImplementation: options.fetchImplementation }),
+        ...(options.visionPackagePins === undefined
+          ? {}
+          : { visionPackagePins: options.visionPackagePins }),
+      });
   let disposed = false;
   return {
     tokenizer,
@@ -874,12 +935,14 @@ export async function loadQwen35BrowserResources(
       });
     },
     deviceLost: device.lost,
+    ...(vision === undefined ? {} : { vision }),
     async dispose() {
       if (disposed) return;
       disposed = true;
       try {
         await cleanupQwen35GpuResources({
           driver: ownedDriver,
+          ...(vision === undefined ? {} : { vision }),
           device,
           hybridState: ownedState,
           weightAllocations: ownedWeightDirectory.allocations,

@@ -56,10 +56,12 @@ test("defines only fixed Qwen vision layer kernels", () => {
   ]);
   const attention = QWEN35_VISION_LAYER_KERNELS.find((kernel) => kernel.key.operation === "vision-online-attention")!;
   const linear = QWEN35_VISION_LAYER_KERNELS.find((kernel) => kernel.key.operation === "vision-bf16-linear")!;
+  const gelu = QWEN35_VISION_LAYER_KERNELS.find((kernel) => kernel.key.operation === "vision-tanh-gelu")!;
   assert.match(attention.source, /var<workgroup> has_key: u32/u);
-  assert.doesNotMatch(attention.source, /var<workgroup> has_key: bool/u);
   assert.match(attention.source, /workgroupBarrier\(\)/u);
+  assert.match(attention.source, /for \(var key_token = 0u; key_token < 256u/u);
   assert.match(linear.source, /packed_weight\[\(row_base \+ column\) \/ 2u\]/u);
+  assert.match(gelu.source, /clamp\([^;]+, -10\.0f, 10\.0f\)/u);
 });
 
 test("requires authenticated layer weights before it plans the fixed execution order", () => {

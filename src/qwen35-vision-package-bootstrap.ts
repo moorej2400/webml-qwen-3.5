@@ -1,13 +1,17 @@
 import { diagnosticError } from "./diagnostics.js";
 import { browserRangeFetch } from "./http-range-reader.js";
 import {
+  createIntegrityValidatedQwen35VisionPackage,
   createProductionQwen35VisionPackage,
   QWEN35_PRODUCTION_VISION_PACKAGE_PINS,
+  type Qwen35IntegrityValidatedVisionPackage,
+  type Qwen35VisionPackagePins,
   type Qwen35ProductionVisionPackage,
 } from "./qwen35-vision-package-loader.js";
 
 const MAX_METADATA_BYTES = 1024 * 1024;
 const POSITIVE_DECIMAL = /^[1-9][0-9]*$/u;
+const SAFE_METADATA_FILE = /^[A-Za-z0-9._-]+$/u;
 
 export const QWEN35_PRODUCTION_VISION_PACKAGE = Object.freeze({
   repository: "moorejared97/Qwen3.5-4B-Q3-K-L-WebGPU",
@@ -27,6 +31,8 @@ export interface LoadProductionQwen35VisionPackageOptions {
   /** Allows browser-compatible tests to supply a deterministic transport. */
   readonly fetchImplementation?: typeof fetch;
   readonly signal?: AbortSignal;
+  /** Explicit local Chrome smoke-test pins; omitted for the fixed public release. */
+  readonly pins?: Qwen35VisionPackagePins;
 }
 
 function fail(code: string, message: string): never {
@@ -54,6 +60,14 @@ function declaredByteLength(response: Response): number | undefined {
     fail("vision-metadata-size-invalid", "Vision package metadata size is invalid");
   }
   return length;
+}
+
+function metadataFile(value: string | undefined, fallback: string): string {
+  const selected = value ?? fallback;
+  if (!SAFE_METADATA_FILE.test(selected)) {
+    fail("vision-metadata-file-invalid", "Vision package metadata filename is invalid");
+  }
+  return selected;
 }
 
 /**
@@ -149,17 +163,18 @@ async function fetchMetadata(
  */
 export async function loadProductionQwen35VisionPackage(
   options: LoadProductionQwen35VisionPackageOptions = {},
-): Promise<Qwen35ProductionVisionPackage> {
+): Promise<Qwen35ProductionVisionPackage | Qwen35IntegrityValidatedVisionPackage> {
   const fetchImplementation = options.fetchImplementation ?? fetch;
   const upstreamSignal = options.signal ?? new AbortController().signal;
   upstreamSignal.throwIfAborted();
   const controller = new AbortController();
   const relayAbort = (): void => controller.abort(upstreamSignal.reason);
   upstreamSignal.addEventListener("abort", relayAbort, { once: true });
+  const packageBaseUrl = options.pins?.packageBaseUrl ?? QWEN35_PRODUCTION_VISION_PACKAGE.baseUrl;
   const fetchOne = async (file: string): Promise<Uint8Array> => {
     try {
       return await fetchMetadata(
-        `${QWEN35_PRODUCTION_VISION_PACKAGE.baseUrl}${file}`,
+        `${packageBaseUrl}${file}`,
         fetchImplementation,
         controller.signal,
       );
@@ -171,9 +186,11 @@ export async function loadProductionQwen35VisionPackage(
     }
   };
   try {
+    const manifestFile = metadataFile(options.pins?.manifestFile, QWEN35_PRODUCTION_VISION_PACKAGE.manifest.file);
+    const layerIndexFile = metadataFile(options.pins?.layerIndexFile, QWEN35_PRODUCTION_VISION_PACKAGE.layerIndex.file);
     const [manifestResult, layerIndexResult] = await Promise.allSettled([
-      fetchOne(QWEN35_PRODUCTION_VISION_PACKAGE.manifest.file),
-      fetchOne(QWEN35_PRODUCTION_VISION_PACKAGE.layerIndex.file),
+      fetchOne(manifestFile),
+      fetchOne(layerIndexFile),
     ]);
     // Let the sibling finish body cancellation before returning the first
     // metadata failure; otherwise its bounded response can outlive bootstrap.
@@ -188,11 +205,18 @@ export async function loadProductionQwen35VisionPackage(
     // Both fetches can finish between their last reader check and this point.
     // Do not construct a trusted package after a late caller cancellation.
     controller.signal.throwIfAborted();
-    const package_ = createProductionQwen35VisionPackage({
-      manifestBytes,
-      layerIndexBytes,
-      rangeFetch: browserRangeFetch(fetchImplementation),
-    });
+    const package_ = options.pins === undefined
+      ? createProductionQwen35VisionPackage({
+          manifestBytes,
+          layerIndexBytes,
+          rangeFetch: browserRangeFetch(fetchImplementation),
+        })
+      : createIntegrityValidatedQwen35VisionPackage({
+          manifestBytes,
+          layerIndexBytes,
+          pins: options.pins,
+          rangeFetch: browserRangeFetch(fetchImplementation),
+        });
     // Construction is synchronous today, but keep this boundary explicit if
     // future construction obtains asynchronous resources before return.
     controller.signal.throwIfAborted();

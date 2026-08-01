@@ -82,6 +82,22 @@ test("serial prefill predicts only on the last token and generation reuses it", 
   assert.equal(engine.disposed, true);
 });
 
+test("expands one image marker into projected visual rows during prefill", async () => {
+  const engine = new FakeTokenEngine([41]);
+  const driver = createQwen35GreedyTextDriver(engine);
+  const source = { buffer: {}, offset: 0, byteLength: 2 * 2_560 * 4 };
+  await driver.prefill({
+    tokenIds: [11, 999_999, 12],
+    visualEmbeddings: [{ tokenId: 999_999, tokenCount: 2, source }],
+    signal: new AbortController().signal,
+  });
+  assert.equal(engine.steps.length, 4);
+  assert.equal(engine.steps[1]!.embeddingOverride?.offset, 0);
+  assert.equal(engine.steps[2]!.embeddingOverride?.offset, 2_560 * 4);
+  assert.equal(engine.steps[3]!.predict, true);
+  assert.equal(engine.steps[3]!.embeddingOverride, undefined);
+});
+
 test("rejects sentinel, masked, and malformed token contracts", async () => {
   for (const predicted of [0xffff_ffff, 248_070]) {
     const driver = createQwen35GreedyTextDriver(

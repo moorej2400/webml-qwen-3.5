@@ -227,8 +227,8 @@ export function visionApply2dRopeCpu(input: {
 }
 
 const PATCH_CONV3D_WGSL = /* wgsl */ `
-struct Params { patch_count: u32, pad0: u32, pad1: u32, pad2: u32 }
-@group(0) @binding(0) var<storage, read> patches: array<f32>;
+struct Params { sample_count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> samples: array<f32>;
 @group(0) @binding(1) var<storage, read> weights_t0: array<f32>;
 @group(0) @binding(2) var<storage, read> weights_t1: array<f32>;
 @group(0) @binding(3) var<storage, read> bias: array<f32>;
@@ -236,25 +236,25 @@ struct Params { patch_count: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(5) var<uniform> params: Params;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let hidden = id.x; let patch = id.y;
-  if (hidden >= 1024u || patch >= params.patch_count || params.patch_count > 16384u) { return; }
+  let hidden = id.x; let sample_index = id.y;
+  if (hidden >= 1024u || sample_index >= params.sample_count || params.sample_count > 16384u) { return; }
   var sum = bias[hidden];
   for (var channel = 0u; channel < 3u; channel += 1u) {
     for (var row = 0u; row < 16u; row += 1u) {
       for (var column = 0u; column < 16u; column += 1u) {
         let pixel = row * 16u + column;
-        let patch_base = patch * 1536u + channel * 512u + pixel;
+        let sample_base = sample_index * 1536u + channel * 512u + pixel;
         let weight = column + 16u * (row + 16u * (channel + 3u * hidden));
-        sum = sum + patches[patch_base] * weights_t0[weight];
-        sum = sum + patches[patch_base + 256u] * weights_t1[weight];
+        sum = sum + samples[sample_base] * weights_t0[weight];
+        sum = sum + samples[sample_base + 256u] * weights_t1[weight];
       }
     }
   }
-  embeddings[patch * 1024u + hidden] = sum;
+  embeddings[sample_index * 1024u + hidden] = sum;
 }`;
 
 const POSITION_WGSL = /* wgsl */ `
-struct Params { patch_count: u32, grid_height: u32, grid_width: u32, first_segment_scalars: u32 }
+struct Params { sample_count: u32, grid_height: u32, grid_width: u32, first_segment_scalars: u32 }
 @group(0) @binding(0) var<storage, read_write> embeddings: array<f32>;
 @group(0) @binding(1) var<storage, read> position_a: array<f32>;
 @group(0) @binding(2) var<storage, read> position_b: array<f32>;
@@ -262,9 +262,9 @@ struct Params { patch_count: u32, grid_height: u32, grid_width: u32, first_segme
 fn position(index: u32) -> f32 { if (index < params.first_segment_scalars) { return position_a[index]; } return position_b[index - params.first_segment_scalars]; }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let hidden = id.x; let patch = id.y;
-  if (hidden >= 1024u || patch >= params.patch_count || params.patch_count > 16384u || params.grid_height < 2u || params.grid_width < 2u || (params.grid_height & 1u) != 0u || (params.grid_width & 1u) != 0u) { return; }
-  let merged_width = params.grid_width / 2u; let group = patch / 4u; let within = patch % 4u;
+  let hidden = id.x; let sample_index = id.y;
+  if (hidden >= 1024u || sample_index >= params.sample_count || params.sample_count > 16384u || params.grid_height < 2u || params.grid_width < 2u || (params.grid_height & 1u) != 0u || (params.grid_width & 1u) != 0u) { return; }
+  let merged_width = params.grid_width / 2u; let group = sample_index / 4u; let within = sample_index % 4u;
   let row = (group / merged_width) * 2u + within / 2u; let column = (group % merged_width) * 2u + within % 2u;
   let source_y = f32(row) * 47.0f / f32(params.grid_height - 1u); let source_x = f32(column) * 47.0f / f32(params.grid_width - 1u);
   let y0 = u32(floor(source_y)); let x0 = u32(floor(source_x)); let y1 = min(y0 + 1u, 47u); let x1 = min(x0 + 1u, 47u);
@@ -272,35 +272,35 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let p00 = position((y0 * 48u + x0) * 1024u + hidden); let p01 = position((y0 * 48u + x1) * 1024u + hidden);
   let p10 = position((y1 * 48u + x0) * 1024u + hidden); let p11 = position((y1 * 48u + x1) * 1024u + hidden);
   let top = p00 * (1.0f - fx) + p01 * fx; let bottom = p10 * (1.0f - fx) + p11 * fx;
-  embeddings[patch * 1024u + hidden] = embeddings[patch * 1024u + hidden] + (top * (1.0f - fy) + bottom * fy);
+  embeddings[sample_index * 1024u + hidden] = embeddings[sample_index * 1024u + hidden] + (top * (1.0f - fy) + bottom * fy);
 }`;
 
 const ROPE_PREPARE_WGSL = /* wgsl */ `
-struct Params { patch_count: u32, grid_height: u32, grid_width: u32, pad0: u32 }
+struct Params { sample_count: u32, grid_height: u32, grid_width: u32, pad0: u32 }
 @group(0) @binding(0) var<storage, read_write> rope: array<f32>;
 @group(0) @binding(1) var<uniform> params: Params;
 @compute @workgroup_size(32)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let frequency = id.x; let patch = id.y;
-  if (frequency >= 32u || patch >= params.patch_count || params.patch_count > 16384u || params.grid_height < 2u || params.grid_width < 2u || (params.grid_height & 1u) != 0u || (params.grid_width & 1u) != 0u) { return; }
-  let merged_width = params.grid_width / 2u; let group = patch / 4u; let within = patch % 4u;
+  let frequency = id.x; let sample_index = id.y;
+  if (frequency >= 32u || sample_index >= params.sample_count || params.sample_count > 16384u || params.grid_height < 2u || params.grid_width < 2u || (params.grid_height & 1u) != 0u || (params.grid_width & 1u) != 0u) { return; }
+  let merged_width = params.grid_width / 2u; let group = sample_index / 4u; let within = sample_index % 4u;
   let height = (group / merged_width) * 2u + within / 2u; let width = (group % merged_width) * 2u + within % 2u;
   let position = select(height, width, frequency >= 16u); let local_frequency = frequency % 16u;
-  let inverse_frequency = 1.0f / pow(10000.0f, f32(2u * local_frequency) / 32.0f); let angle = f32(position) * inverse_frequency; let destination = (patch * 32u + frequency) * 2u;
+  let inverse_frequency = 1.0f / pow(10000.0f, f32(2u * local_frequency) / 32.0f); let angle = f32(position) * inverse_frequency; let destination = (sample_index * 32u + frequency) * 2u;
   rope[destination] = cos(angle); rope[destination + 1u] = sin(angle);
 }`;
 
 const ROPE_APPLY_WGSL = /* wgsl */ `
-struct Params { patch_count: u32, pad0: u32, pad1: u32, pad2: u32 }
+struct Params { sample_count: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<storage, read_write> query: array<f32>;
 @group(0) @binding(1) var<storage, read_write> key: array<f32>;
 @group(0) @binding(2) var<storage, read> rope: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 @compute @workgroup_size(32)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let lane = id.x; let patch = id.y; let head = id.z;
-  if (lane >= 32u || head >= 16u || patch >= params.patch_count || params.patch_count > 16384u) { return; }
-  let base = (patch * 16u + head) * 64u; let pair = lane + 32u; let rope_base = (patch * 32u + lane) * 2u; let cosine = rope[rope_base]; let sine = rope[rope_base + 1u];
+  let lane = id.x; let sample_index = id.y; let head = id.z;
+  if (lane >= 32u || head >= 16u || sample_index >= params.sample_count || params.sample_count > 16384u) { return; }
+  let base = (sample_index * 16u + head) * 64u; let pair = lane + 32u; let rope_base = (sample_index * 32u + lane) * 2u; let cosine = rope[rope_base]; let sine = rope[rope_base + 1u];
   let q_left = query[base + lane]; let q_right = query[base + pair]; let k_left = key[base + lane]; let k_right = key[base + pair];
   query[base + lane] = q_left * cosine - q_right * sine; query[base + pair] = q_right * cosine + q_left * sine;
   key[base + lane] = k_left * cosine - k_right * sine; key[base + pair] = k_right * cosine + k_left * sine;
@@ -327,6 +327,8 @@ export const QWEN35_VISION_FOUNDATION_LIMITS = Object.freeze({ PATCH_SIZE, TEMPO
 export interface Qwen35VisionFoundationStorage {
   readonly buffer: Qwen35WebGpuBuffer;
   readonly byteLength: number;
+  /** Offset permits foundation stages to consume shared arena slices. */
+  readonly byteOffset?: number;
 }
 
 export interface Qwen35VisionBootstrapFoundationWorkspace {
@@ -352,21 +354,24 @@ function storageBinding(
   binding: number,
   value: Qwen35VisionFoundationStorage,
   requiredBytes: number = value.byteLength,
+  limits?: Qwen35ForwardDeviceLimits,
 ): Qwen35BufferBinding {
+  const offset = value.byteOffset ?? 0;
   if (
     typeof value.buffer !== "object" || value.buffer === null || value.byteLength < requiredBytes ||
-    requiredBytes < 4 || requiredBytes % 4 !== 0
+    requiredBytes < 4 || requiredBytes % 4 !== 0 || !Number.isSafeInteger(offset) || offset < 0 || limits !== undefined && (offset % limits.minStorageBufferOffsetAlignment !== 0 || requiredBytes > limits.maxStorageBufferBindingSize)
   ) {
     fail("vision-foundation-binding-invalid", "Vision foundation GPU binding is invalid");
   }
-  return Object.freeze({ binding, kind: "storage" as const, buffer: value.buffer, offset: 0, size: requiredBytes });
+  return Object.freeze({ binding, kind: "storage" as const, buffer: value.buffer, offset, size: requiredBytes });
 }
 
-function uniformBinding(binding: number, value: Qwen35VisionFoundationStorage): Qwen35BufferBinding {
-  if (typeof value.buffer !== "object" || value.buffer === null || value.byteLength !== 16) {
+function uniformBinding(binding: number, value: Qwen35VisionFoundationStorage, limits?: Qwen35ForwardDeviceLimits): Qwen35BufferBinding {
+  const offset = value.byteOffset ?? 0;
+  if (typeof value.buffer !== "object" || value.buffer === null || value.byteLength !== 16 || !Number.isSafeInteger(offset) || offset < 0 || limits !== undefined && (offset % limits.minUniformBufferOffsetAlignment !== 0 || 16 > limits.maxUniformBufferBindingSize)) {
     fail("vision-foundation-binding-invalid", "Vision foundation GPU binding is invalid");
   }
-  return Object.freeze({ binding, kind: "uniform" as const, buffer: value.buffer, offset: 0, size: value.byteLength });
+  return Object.freeze({ binding, kind: "uniform" as const, buffer: value.buffer, offset, size: value.byteLength });
 }
 
 export interface Qwen35VisionFoundationDispatchPlan extends Qwen35DispatchRequest {
@@ -496,21 +501,21 @@ export function planQwen35VisionBootstrapFoundationDispatches(input: {
     Object.freeze({
       kernel: source("vision-patch-conv3d"), workgroups: common,
       bindings: Object.freeze([
-        storageBinding(0, input.workspace.patches, patchBytes), ...patchWeights0, ...patchWeights1, ...patchBias,
-        storageBinding(4, input.workspace.embeddings, embeddingBytes), uniformBinding(5, input.workspace.patchUniform),
+        storageBinding(0, input.workspace.patches, patchBytes, input.limits), ...patchWeights0, ...patchWeights1, ...patchBias,
+        storageBinding(4, input.workspace.embeddings, embeddingBytes, input.limits), uniformBinding(5, input.workspace.patchUniform, input.limits),
       ]),
       uniformWords: Object.freeze([patchCount, 0, 0, 0]) as readonly [number, number, number, number],
     }),
     Object.freeze({
       kernel: source("vision-add-learned-position"), workgroups: common,
       bindings: Object.freeze([
-        storageBinding(0, input.workspace.embeddings, embeddingBytes), ...position, uniformBinding(3, input.workspace.positionUniform),
+        storageBinding(0, input.workspace.embeddings, embeddingBytes, input.limits), ...position, uniformBinding(3, input.workspace.positionUniform, input.limits),
       ]),
       uniformWords: Object.freeze([patchCount, input.gridHeight, input.gridWidth, firstSegmentScalars]) as readonly [number, number, number, number],
     }),
     Object.freeze({
       kernel: source("vision-prepare-2d-rope"), workgroups: Object.freeze({ x: 1, y: patchCount, z: 1 }),
-      bindings: Object.freeze([storageBinding(0, input.workspace.rope, ropeBytes), uniformBinding(1, input.workspace.ropeUniform)]),
+      bindings: Object.freeze([storageBinding(0, input.workspace.rope, ropeBytes, input.limits), uniformBinding(1, input.workspace.ropeUniform, input.limits)]),
       uniformWords: Object.freeze([patchCount, input.gridHeight, input.gridWidth, 0]) as readonly [number, number, number, number],
     }),
   ]);
@@ -539,8 +544,8 @@ export function planQwen35VisionLayerRopeApplyDispatch(input: {
   return validatePlanBindings(Object.freeze([Object.freeze({
     kernel: source("vision-apply-2d-rope"), workgroups: Object.freeze({ x: 1, y: input.patchCount, z: HEAD_COUNT }),
     bindings: Object.freeze([
-      storageBinding(0, input.workspace.query, vectorBytes), storageBinding(1, input.workspace.key, vectorBytes), storageBinding(2, input.workspace.rope, input.patchCount * ROPE_FREQUENCIES * 2 * f32),
-      uniformBinding(3, input.workspace.applyUniform),
+      storageBinding(0, input.workspace.query, vectorBytes, input.limits), storageBinding(1, input.workspace.key, vectorBytes, input.limits), storageBinding(2, input.workspace.rope, input.patchCount * ROPE_FREQUENCIES * 2 * f32, input.limits),
+      uniformBinding(3, input.workspace.applyUniform, input.limits),
     ]),
     uniformWords: Object.freeze([input.patchCount, 0, 0, 0]) as readonly [number, number, number, number],
   })]), input.limits)[0]!;

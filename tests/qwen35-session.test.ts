@@ -111,6 +111,7 @@ function runtime(
   driver: Qwen35ExecutionDriver,
   events: string[] = [],
   manager = new ImmediateLockManager(),
+  vision?: Qwen35LoadedResources["vision"],
 ): Qwen35SessionRuntime {
   return {
     lockManager: manager,
@@ -124,6 +125,7 @@ function runtime(
         cacheHit: true,
         trackedCpuBytes: 12,
         trackedGpuBytes: 34,
+        ...(vision === undefined ? {} : { vision }),
         async dispose() {
           events.push("resources-dispose");
           await driver.dispose();
@@ -302,7 +304,7 @@ test("rejects illegal and reentrant calls with stable lifecycle diagnostics", as
   await session.dispose();
 });
 
-test("renders and prefills exact text while rejecting image input until vision loads", async () => {
+test("renders and prefills exact text while passing projected image rows to the driver", async () => {
   const fake = driver();
   const session = new Qwen35Session(runtime(fake.driver));
   await session.load({});
@@ -311,17 +313,29 @@ test("renders and prefills exact text while rejecting image input until vision l
   assert.ok(state.contextTokens > 5);
   assert.match(state.rendered, /^<\|im_start\|>user\nhello/);
   await session.reset();
-  await assert.rejects(
-    session.prefill([
-      {
-        role: "user",
-        content: [{ type: "image" }],
-      },
-    ]),
-    (error: unknown) =>
-      error instanceof RuntimeDiagnosticError &&
-      error.code === "vision-not-loaded",
-  );
+  const image = {
+    type: "image" as const,
+    patches: {
+      gridTHW: [1, 2, 2] as const,
+      projectedVisualTokens: 1,
+      patchVectorLength: 3,
+      patches: new Float32Array([1, 2, 3]),
+      resampling: "caller-supplied-resized-rgb" as const,
+    },
+  };
+  const vision = {
+    async encode(input: { readonly patches: Float32Array; readonly gridHeight: number; readonly gridWidth: number; readonly signal: AbortSignal }) {
+      assert.equal(input.gridHeight, 2);
+      assert.equal(input.gridWidth, 2);
+      assert.deepEqual(Array.from(input.patches), [1, 2, 3]);
+      return { tokenCount: 1, storage: { buffer: {}, offset: 0, byteLength: 2_560 * 4 }, async dispose() {} };
+    },
+    async dispose() {},
+  };
+  const imageSession = new Qwen35Session(runtime(fake.driver, [], new ImmediateLockManager(), vision));
+  await imageSession.load({});
+  await imageSession.prefill([{ role: "user", content: [image] }]);
+  await imageSession.dispose();
   await session.dispose();
 });
 

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
+  copyFileSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -30,6 +31,8 @@ const result = spawnSync(
 if (result.status !== 0) {
   process.exitCode = result.status ?? 1;
 } else {
+  copyFileSync(path.resolve("public/index.html"), path.join(outputDirectory, "index.html"));
+  copyFileSync(path.resolve("public/app.css"), path.join(outputDirectory, "app.css"));
   scanPublicJavaScript(outputDirectory);
 }
 

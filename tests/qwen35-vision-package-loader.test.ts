@@ -266,6 +266,25 @@ test("keeps caller-pinned integrity validation separate from production release 
   }), { code: "vision-package-manifest-hash-mismatch" });
 });
 
+test("permits a localhost vision package only with explicit development opt-in", () => {
+  const input = fixture();
+  const localPins = {
+    ...input.pins,
+    packageBaseUrl: "http://localhost:18082/vision/",
+    expectedPackageBaseUrl: "http://localhost:18082/vision/",
+  };
+  assert.throws(() => createIntegrityValidatedQwen35VisionPackage({
+    manifestBytes: input.manifestBytes,
+    layerIndexBytes: input.layerIndexBytes,
+    pins: localPins,
+  }), { code: "vision-package-base-mismatch" });
+  assert.doesNotThrow(() => createIntegrityValidatedQwen35VisionPackage({
+    manifestBytes: input.manifestBytes,
+    layerIndexBytes: input.layerIndexBytes,
+    pins: { ...localPins, allowInsecureLocalhost: true },
+  }));
+});
+
 test("rejects an invalid addressed layer index", () => {
   const input = fixture();
   const index = JSON.parse(new TextDecoder().decode(input.layerIndexBytes)) as {

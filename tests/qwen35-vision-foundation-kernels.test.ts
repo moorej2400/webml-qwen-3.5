@@ -21,7 +21,7 @@ test("defines only bounded fixed-architecture patch, position, and 2D RoPE kerne
   );
   for (const kernel of QWEN35_VISION_FOUNDATION_KERNELS) {
     assert.match(kernel.source, /@compute/u);
-    assert.match(kernel.source, /patch_count/u);
+    assert.match(kernel.source, /(?:patch_count|sample_count)/u);
     assert.match(kernel.source, /return;/u);
   }
   assert.match(QWEN35_VISION_FOUNDATION_KERNELS[3]!.source, /let q_left = query\[base \+ lane\]; let q_right = query\[base \+ pair\];/u);
