@@ -96,9 +96,13 @@ fn rotated_key(kv_head: u32, lane: u32, inverse_rms: f32) -> f32 {
   );
 }
 
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  let query_head = invocation.x;
+var<workgroup> query_partials: array<f32, 64>;
+var<workgroup> key_partials: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>) {
+  let query_head = group.x;
   if (
     query_head >= 16u ||
     params.capacity == 0u ||
@@ -108,28 +112,49 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
 
   let query_base = query_head * 512u;
   var query_sum = 0.0f;
-  for (var lane = 0u; lane < 256u; lane += 1u) {
+  for (var lane = local.x; lane < 256u; lane += 64u) {
     let raw = query_gate_values[query_base + lane];
     query_sum += raw * raw;
   }
-  let query_inverse_rms = inverseSqrt(query_sum / 256.0f + 0.000001f);
-  for (var lane = 0u; lane < 256u; lane += 1u) {
+  query_partials[local.x] = query_sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) {
+      query_partials[local.x] += query_partials[local.x + stride];
+    }
+    workgroupBarrier();
+  }
+  let query_inverse_rms =
+    inverseSqrt(query_partials[0] / 256.0f + 0.000001f);
+  for (var lane = local.x; lane < 256u; lane += 64u) {
     prepared_query_gate[query_base + lane] =
       rotated_query(query_head, lane, query_inverse_rms);
     prepared_query_gate[query_base + 256u + lane] =
       query_gate_values[query_base + 256u + lane];
   }
 
+  var key_sum = 0.0f;
   if (query_head < 4u) {
     let kv_head = query_head;
-    var key_sum = 0.0f;
-    for (var lane = 0u; lane < 256u; lane += 1u) {
+    for (var lane = local.x; lane < 256u; lane += 64u) {
       let raw = key_values[kv_head * 256u + lane];
       key_sum += raw * raw;
     }
-    let key_inverse_rms = inverseSqrt(key_sum / 256.0f + 0.000001f);
+  }
+  key_partials[local.x] = key_sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) {
+      key_partials[local.x] += key_partials[local.x + stride];
+    }
+    workgroupBarrier();
+  }
+  if (query_head < 4u) {
+    let kv_head = query_head;
+    let key_inverse_rms =
+      inverseSqrt(key_partials[0] / 256.0f + 0.000001f);
     let cache_base = params.position * 512u + kv_head * 128u;
-    for (var lane = 0u; lane < 256u; lane += 2u) {
+    for (var lane = local.x * 2u; lane < 256u; lane += 128u) {
       let word = cache_base + lane / 2u;
       packed_key_cache[word] = pack2x16float(vec2<f32>(
         rotated_key(kv_head, lane, key_inverse_rms),
@@ -167,9 +192,16 @@ fn sigmoid(value: f32) -> f32 {
   return exponential / (1.0f + exponential);
 }
 
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  let query_head = invocation.x;
+var<workgroup> dot_partials: array<f32, 256>;
+var<workgroup> shared_running_maximum: f32;
+var<workgroup> shared_running_denominator: f32;
+var<workgroup> shared_old_scale: f32;
+var<workgroup> shared_token_scale: f32;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>) {
+  let query_head = group.x;
   if (
     query_head >= 16u ||
     params.token_count == 0u ||
@@ -179,59 +211,68 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   ) { return; }
   let query_base = query_head * 512u;
   let kv_head = query_head / 4u;
-  var accumulator: array<f32, 256>;
+  let lane = local.x;
   let first_page = params.page_index == 0u;
   let final_page = params.page_index + 1u == params.page_count;
-  for (var lane = 0u; lane < 256u; lane += 1u) {
-    let output_index = query_head * 256u + lane;
-    accumulator[lane] = select(output_values[output_index], 0.0f, first_page);
-  }
+  let output_index = query_head * 256u + lane;
+  var accumulator = select(output_values[output_index], 0.0f, first_page);
   let state_base = query_head * 2u;
-  var running_maximum = select(
-    online_state[state_base],
-    -3.402823466e+38f,
-    first_page,
-  );
-  var running_denominator = select(
-    online_state[state_base + 1u],
-    0.0f,
-    first_page,
-  );
-  for (var token = 0u; token < params.token_count; token += 1u) {
-    var dot = 0.0f;
-    for (var lane = 0u; lane < 256u; lane += 1u) {
-      let scalar_index = ((token * 4u + kv_head) * 256u) + lane;
-      let packed = unpack2x16float(packed_key_values[scalar_index / 2u]);
-      let key_value = select(packed.x, packed.y, (scalar_index & 1u) == 1u);
-      dot += prepared_query_gate[query_base + lane] * key_value;
-    }
-    let logit = dot * 0.0625f;
-    let next_maximum = max(running_maximum, logit);
-    var old_scale = 0.0f;
-    if (running_denominator != 0.0f) {
-      old_scale = exp(running_maximum - next_maximum);
-    }
-    let token_scale = exp(logit - next_maximum);
-    running_denominator = running_denominator * old_scale + token_scale;
-    for (var lane = 0u; lane < 256u; lane += 1u) {
-      let scalar_index = ((token * 4u + kv_head) * 256u) + lane;
-      let packed = unpack2x16float(packed_value_values[scalar_index / 2u]);
-      let value = select(packed.x, packed.y, (scalar_index & 1u) == 1u);
-      accumulator[lane] = accumulator[lane] * old_scale + token_scale * value;
-    }
-    running_maximum = next_maximum;
-  }
-  online_state[state_base] = running_maximum;
-  online_state[state_base + 1u] = running_denominator;
-  for (var lane = 0u; lane < 256u; lane += 1u) {
-    let output_index = query_head * 256u + lane;
-    output_values[output_index] = select(
-      accumulator[lane],
-      (accumulator[lane] / running_denominator) *
-        sigmoid(prepared_query_gate[query_base + 256u + lane]),
-      final_page,
+  if (lane == 0u) {
+    shared_running_maximum = select(
+      online_state[state_base],
+      -3.402823466e+38f,
+      first_page,
+    );
+    shared_running_denominator = select(
+      online_state[state_base + 1u],
+      0.0f,
+      first_page,
     );
   }
+  workgroupBarrier();
+  for (var token = 0u; token < params.token_count; token += 1u) {
+    let scalar_index = ((token * 4u + kv_head) * 256u) + lane;
+    let key_packed = unpack2x16float(packed_key_values[scalar_index / 2u]);
+    let key_value = select(key_packed.x, key_packed.y, (scalar_index & 1u) == 1u);
+    dot_partials[lane] = prepared_query_gate[query_base + lane] * key_value;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride /= 2u) {
+      if (lane < stride) {
+        dot_partials[lane] += dot_partials[lane + stride];
+      }
+      workgroupBarrier();
+    }
+    if (lane == 0u) {
+      let logit = dot_partials[0] * 0.0625f;
+      let next_maximum = max(shared_running_maximum, logit);
+      var old_scale = 0.0f;
+      if (shared_running_denominator != 0.0f) {
+        old_scale = exp(shared_running_maximum - next_maximum);
+      }
+      let token_scale = exp(logit - next_maximum);
+      shared_running_denominator =
+        shared_running_denominator * old_scale + token_scale;
+      shared_running_maximum = next_maximum;
+      shared_old_scale = old_scale;
+      shared_token_scale = token_scale;
+    }
+    workgroupBarrier();
+    let value_packed = unpack2x16float(packed_value_values[scalar_index / 2u]);
+    let value = select(value_packed.x, value_packed.y, (scalar_index & 1u) == 1u);
+    accumulator = accumulator * shared_old_scale + shared_token_scale * value;
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    online_state[state_base] = shared_running_maximum;
+    online_state[state_base + 1u] = shared_running_denominator;
+  }
+  workgroupBarrier();
+  output_values[output_index] = select(
+    accumulator,
+    (accumulator / shared_running_denominator) *
+      sigmoid(prepared_query_gate[query_base + 256u + lane]),
+    final_page,
+  );
 }`;
 
 const DELTANET_CONV_WGSL = /* wgsl */ `
@@ -296,48 +337,84 @@ const DELTANET_RECURRENT_WGSL = /* wgsl */ `
 @group(0) @binding(3) var<storage, read_write> state_values: array<f32>;
 @group(0) @binding(4) var<storage, read_write> output_values: array<f32>;
 
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  let value_head = invocation.x;
+var<workgroup> query_partials: array<f32, 128>;
+var<workgroup> key_partials: array<f32, 128>;
+var<workgroup> delta_values: array<f32, 128>;
+
+@compute @workgroup_size(128, 2, 1)
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>) {
+  let value_head = group.x;
   if (value_head >= 32u) { return; }
+  let value_lane = local.x;
+  let key_group = local.y;
   let qk_head = value_head % 16u;
-  var query_sum = 0.0f;
-  var key_sum = 0.0f;
-  for (var lane = 0u; lane < 128u; lane += 1u) {
-    let query_raw = convolved_qkv[qk_head * 128u + lane];
-    let key_raw = convolved_qkv[2048u + qk_head * 128u + lane];
-    query_sum += query_raw * query_raw;
-    key_sum += key_raw * key_raw;
+  if (key_group == 0u) {
+    let query_raw = convolved_qkv[qk_head * 128u + value_lane];
+    let key_raw = convolved_qkv[2048u + qk_head * 128u + value_lane];
+    query_partials[value_lane] = query_raw * query_raw;
+    key_partials[value_lane] = key_raw * key_raw;
+  }
+  workgroupBarrier();
+  for (var stride = 64u; stride > 0u; stride /= 2u) {
+    if (key_group == 0u && value_lane < stride) {
+      query_partials[value_lane] += query_partials[value_lane + stride];
+      key_partials[value_lane] += key_partials[value_lane + stride];
+    }
+    workgroupBarrier();
   }
   let query_scale =
-    inverseSqrt(query_sum + 0.000001f) * inverseSqrt(128.0f);
-  let key_scale = inverseSqrt(key_sum + 0.000001f);
+    inverseSqrt(query_partials[0] + 0.000001f) * inverseSqrt(128.0f);
+  let key_scale = inverseSqrt(key_partials[0] + 0.000001f);
 
-  for (var value_lane = 0u; value_lane < 128u; value_lane += 1u) {
-    var memory = 0.0f;
+  // Decay and update each independent state cell in parallel. The two
+  // key groups cover disjoint contiguous rows; reductions below stay on the
+  // original key order so recurrent FP32 results match the CPU oracle.
+  for (var key_lane = key_group * 64u;
+       key_lane < key_group * 64u + 64u;
+       key_lane += 1u) {
+    let state_index =
+      value_head * 16384u + key_lane * 128u + value_lane;
+    let decayed = state_values[state_index] * decay_values[value_head];
+    state_values[state_index] = decayed;
+  }
+  workgroupBarrier();
+  var memory = 0.0f;
+  if (key_group == 0u) {
     for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
       let state_index =
         value_head * 16384u + key_lane * 128u + value_lane;
-      let decayed = state_values[state_index] * decay_values[value_head];
-      state_values[state_index] = decayed;
+      let decayed = state_values[state_index];
       let key_value =
         convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
       memory += key_value * decayed;
     }
-    let target_value =
-      convolved_qkv[4096u + value_head * 128u + value_lane];
-    let delta = beta_values[value_head] * (target_value - memory);
+  }
+  if (key_group == 0u) {
+    delta_values[value_lane] = beta_values[value_head] *
+      (convolved_qkv[4096u + value_head * 128u + value_lane] - memory);
+  }
+  workgroupBarrier();
+  let delta = delta_values[value_lane];
+  for (var key_lane = key_group * 64u;
+       key_lane < key_group * 64u + 64u;
+       key_lane += 1u) {
+    let state_index =
+      value_head * 16384u + key_lane * 128u + value_lane;
+    let key_value =
+      convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
+    let updated = state_values[state_index] + key_value * delta;
+    state_values[state_index] = updated;
+  }
+  workgroupBarrier();
+  if (key_group == 0u) {
     var head_output = 0.0f;
     for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
       let state_index =
         value_head * 16384u + key_lane * 128u + value_lane;
-      let key_value =
-        convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
-      let updated = state_values[state_index] + key_value * delta;
-      state_values[state_index] = updated;
       let query_value =
         convolved_qkv[qk_head * 128u + key_lane] * query_scale;
-      head_output += query_value * updated;
+      head_output += query_value * state_values[state_index];
     }
     output_values[value_head * 128u + value_lane] = head_output;
   }
@@ -353,23 +430,29 @@ fn silu(value: f32) -> f32 {
   return value / (1.0f + exp(-value));
 }
 
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  let value_head = invocation.x;
+var<workgroup> norm_partials: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>) {
+  let value_head = group.x;
   if (value_head >= 32u) { return; }
+  let lane = local.x;
   let base = value_head * 128u;
-  var sum = 0.0f;
-  for (var lane = 0u; lane < 128u; lane += 1u) {
-    let value = recurrent_values[base + lane];
-    sum += value * value;
+  let value = recurrent_values[base + lane];
+  norm_partials[lane] = value * value;
+  workgroupBarrier();
+  for (var stride = 64u; stride > 0u; stride /= 2u) {
+    if (lane < stride) {
+      norm_partials[lane] += norm_partials[lane + stride];
+    }
+    workgroupBarrier();
   }
-  let inverse_rms = inverseSqrt(sum / 128.0f + 0.000001f);
-  for (var lane = 0u; lane < 128u; lane += 1u) {
-    let index = base + lane;
-    output_values[index] =
-      recurrent_values[index] * inverse_rms *
-      norm_weight_values[lane] * silu(z_values[index]);
-  }
+  let inverse_rms = inverseSqrt(norm_partials[0] / 128.0f + 0.000001f);
+  let index = base + lane;
+  output_values[index] =
+    recurrent_values[index] * inverse_rms *
+    norm_weight_values[lane] * silu(z_values[index]);
 }`;
 
 function definition(

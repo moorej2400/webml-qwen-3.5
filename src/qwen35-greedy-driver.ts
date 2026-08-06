@@ -30,6 +30,8 @@ import {
   planQwen35FullAttentionLayerGeometry,
 } from "./qwen35-full-attention-dispatch.js";
 import {
+  assembleQwen35StagedFinalTokenCommand,
+  assembleQwen35StagedLogitsTileGpuCommands,
   assembleQwen35StagedLogitsTileCommands,
   assembleQwen35TiledLogitsCommands,
   planQwen35TiledLogitsUniformCount,
@@ -46,6 +48,7 @@ import type {
   Qwen35DriverPrefillInput,
   Qwen35ExecutionDriver,
 } from "./qwen35-session.js";
+import { createQwen35PerformanceWriteQueue } from "./qwen35-performance.js";
 import {
   createQwen35UniformArena,
   type Qwen35UniformArena,
@@ -67,9 +70,15 @@ const DECODABLE_TOKEN_COUNT = 248_070;
 const MASKED_MODEL_ROWS = 250;
 const MAX_UNIFORM_WORDS = 8;
 const STAGED_LOGITS_UNIFORM_COUNT = 2;
+const STAGED_LOGITS_BATCH_SIZE = 2;
+const STAGED_LOGITS_TILE_UNIFORM_COUNT =
+  STAGED_LOGITS_UNIFORM_COUNT * STAGED_LOGITS_BATCH_SIZE;
+const STAGED_LOGITS_TOTAL_UNIFORM_COUNT =
+  STAGED_LOGITS_TILE_UNIFORM_COUNT + STAGED_LOGITS_UNIFORM_COUNT;
 const GPU_STORAGE_AND_COPY_SRC = 0x0080 | 0x0004;
 const ROLLING_DELTANET_UNIFORM_COUNT = 13;
 const ROLLING_FULL_ATTENTION_UNIFORM_COUNT = 77;
+const PREFILL_CHUNK_SIZE = 4;
 
 type AttentionInvocation = Extract<
   Qwen35Invocation,
@@ -185,7 +194,7 @@ export function planQwen35GreedyUniformGeometry(input: {
   cursor += 1;
   const logitsUniformStart = cursor;
   const logitsUniformCount = input.diskBackedTiedEmbedding === true
-    ? STAGED_LOGITS_UNIFORM_COUNT
+    ? STAGED_LOGITS_TOTAL_UNIFORM_COUNT
     : planQwen35TiledLogitsUniformCount({
         weights: input.weights,
         limits: input.limits,
@@ -274,12 +283,100 @@ export async function selectQwen35GreedyTiedToken(input: {
   return tokenId;
 }
 
+/** Reduces streamed GPU candidates without copying intermediate winners to JS. */
+export async function selectQwen35GreedyTiedTokenGpu(input: {
+  readonly tiedEmbedding: Pick<
+    Qwen35DiskBackedTiedEmbeddingStore,
+    "selectTopKGpu"
+  >;
+  readonly phase: Qwen35GreedyTokenStep["phase"];
+  readonly signal: AbortSignal;
+  readonly scoreTile: (
+    tile: Qwen35StagedPackedRows,
+    candidateSlot: number,
+  ) => Promise<void> | void;
+  readonly flush: () => Promise<void> | void;
+  readonly finalize: () => Promise<number> | number;
+}): Promise<number> {
+  const selectTopKGpu = input.tiedEmbedding.selectTopKGpu;
+  if (typeof selectTopKGpu !== "function") {
+    throw diagnosticError(
+      "greedy-token-selection-invalid",
+      "Qwen3.5 GPU token selection is unavailable",
+    );
+  }
+  const tokenId = await selectTopKGpu.call(input.tiedEmbedding, {
+    phase: input.phase === "generation" ? "decode" : "prefill",
+    signal: input.signal,
+    scoreTile: input.scoreTile,
+    flush: input.flush,
+    finalize: input.finalize,
+  });
+  if (
+    !Number.isSafeInteger(tokenId) ||
+    tokenId < 0 ||
+    tokenId >= DECODABLE_TOKEN_COUNT
+  ) {
+    throw diagnosticError(
+      "greedy-token-selection-invalid",
+      "Qwen3.5 GPU token selection did not return a decodable token",
+    );
+  }
+  return tokenId;
+}
+
+interface Qwen35StagedLogitsBatcher {
+  enqueue(commands: readonly Qwen35DispatchRequest[]): void;
+  flush(): Promise<void>;
+}
+
+/** Batches tile kernels until the tied store must recycle an output buffer. */
+function createQwen35StagedLogitsBatcher(
+  executor: Pick<
+    Qwen35WebGpuExecutor,
+    "dispatchBatch" | "releaseBindGroups"
+  >,
+): Qwen35StagedLogitsBatcher {
+  const pending: Qwen35DispatchRequest[] = [];
+  return Object.freeze({
+    enqueue(commands: readonly Qwen35DispatchRequest[]): void {
+      pending.push(...commands);
+    },
+    async flush(): Promise<void> {
+      if (pending.length === 0) return;
+      const commands = Object.freeze(pending.splice(0));
+      await executor.dispatchBatch(commands);
+      executor.releaseBindGroups();
+    },
+  });
+}
+
+function stagedLogitsTileUniformSlots(
+  slots: readonly Qwen35UniformSlot[],
+  candidateSlot: number,
+): readonly Qwen35UniformSlot[] {
+  const start = (candidateSlot % STAGED_LOGITS_BATCH_SIZE) *
+    STAGED_LOGITS_UNIFORM_COUNT;
+  return slots.slice(start, start + STAGED_LOGITS_UNIFORM_COUNT);
+}
+
+function stagedLogitsFinalUniformSlots(
+  slots: readonly Qwen35UniformSlot[],
+): readonly Qwen35UniformSlot[] {
+  return slots.slice(STAGED_LOGITS_TILE_UNIFORM_COUNT);
+}
+
 /** Narrow boundary used by the lifecycle driver and its deterministic tests. */
 export interface Qwen35GreedyTokenEngine {
   readonly capacity: number;
   readonly position: number;
   readonly poisoned: boolean;
   execute(step: Qwen35GreedyTokenStep): Promise<number | null>;
+  /** Executes a bounded resident prefill chunk in layer-major order when supported. */
+  prefillChunk?(input: {
+    readonly steps: readonly Qwen35GreedyTokenStep[];
+    readonly signal: AbortSignal;
+  }): Promise<number | null>;
   reset(): Promise<void>;
   dispose(): Promise<void>;
 }
@@ -343,7 +440,7 @@ class Qwen35GreedyTextDriver implements Qwen35ExecutionDriver {
   readonly #engine: Qwen35GreedyTokenEngine;
   readonly sharedGpuExecutor?: Pick<
     Qwen35WebGpuExecutor,
-    "dispatchBatch" | "submittedWorkDone" | "dispose"
+    "dispatchBatch" | "submittedWorkDone" | "releaseBindGroups" | "dispose"
   >;
   #operation: "prefill" | "generation" | null = null;
   #controller: AbortController | null = null;
@@ -358,7 +455,7 @@ class Qwen35GreedyTextDriver implements Qwen35ExecutionDriver {
     engine: Qwen35GreedyTokenEngine,
     sharedGpuExecutor?: Pick<
       Qwen35WebGpuExecutor,
-      "dispatchBatch" | "submittedWorkDone" | "dispose"
+      "dispatchBatch" | "submittedWorkDone" | "releaseBindGroups" | "dispose"
     >,
   ) {
     this.#engine = engine;
@@ -407,14 +504,14 @@ class Qwen35GreedyTextDriver implements Qwen35ExecutionDriver {
     const controller = this.#begin("prefill");
     const linked = linkedSignal(input.signal, controller.signal);
     try {
+      const steps: Qwen35GreedyTokenStep[] = [];
       for (let index = 0; index < input.tokenIds.length; index += 1) {
         const tokenId = input.tokenIds[index]!;
         const visual = visualByToken.get(tokenId);
         const visualCount = visual?.tokenCount ?? 1;
         for (let visualIndex = 0; visualIndex < visualCount; visualIndex += 1) {
-          linked.signal.throwIfAborted();
           const isLast = index === input.tokenIds.length - 1 && visualIndex === visualCount - 1;
-          const step: Qwen35GreedyTokenStep = {
+          steps.push({
             tokenId: visual === undefined ? tokenId : 0,
             predict: isLast,
             phase: "prefill",
@@ -426,12 +523,21 @@ class Qwen35GreedyTextDriver implements Qwen35ExecutionDriver {
                 byteLength: 2_560 * 4,
               },
             }),
-          };
-          const selected = await this.#execute(step);
-          if (isLast) {
-            this.#cachedNextToken = this.#selectedToken(selected);
-            this.#pendingToken = null;
-          }
+          });
+        }
+      }
+      for (let start = 0; start < steps.length; start += PREFILL_CHUNK_SIZE) {
+        const chunk = steps.slice(start, start + PREFILL_CHUNK_SIZE);
+        linked.signal.throwIfAborted();
+        const selected = await this.#prefillChunk(chunk, linked.signal);
+        if (chunk.at(-1)?.predict === true) {
+          this.#cachedNextToken = this.#selectedToken(selected);
+          this.#pendingToken = null;
+        } else if (selected !== null) {
+          throw diagnosticError(
+            "greedy-token-selection-invalid",
+            "Qwen3.5 prefill returned a token before the final prompt step",
+          );
         }
       }
     } catch (error) {
@@ -625,6 +731,24 @@ class Qwen35GreedyTextDriver implements Qwen35ExecutionDriver {
     }
   }
 
+  async #prefillChunk(
+    steps: readonly Qwen35GreedyTokenStep[],
+    signal: AbortSignal,
+  ): Promise<number | null> {
+    if (this.#engine.prefillChunk === undefined) {
+      let selected: number | null = null;
+      for (const step of steps) selected = await this.#execute(step);
+      return selected;
+    }
+    const operation = this.#engine.prefillChunk({ steps, signal });
+    this.#gpuWork = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.#gpuWork === operation) this.#gpuWork = null;
+    }
+  }
+
   #selectedToken(value: number | null): number {
     if (value === null) {
       throw diagnosticError(
@@ -672,7 +796,7 @@ export function createQwen35GreedyTextDriver(
   engine: Qwen35GreedyTokenEngine,
   sharedGpuExecutor?: Pick<
     Qwen35WebGpuExecutor,
-    "dispatchBatch" | "submittedWorkDone" | "dispose"
+    "dispatchBatch" | "submittedWorkDone" | "releaseBindGroups" | "dispose"
   >,
 ): Qwen35ExecutionDriver {
   return new Qwen35GreedyTextDriver(engine, sharedGpuExecutor);
@@ -815,12 +939,16 @@ export async function executeQwen35GreedyRollingLayerDispatch(input: {
   >;
   readonly mutation: Qwen35RollingLayerMutation;
   readonly signal: AbortSignal;
+  /** Rolling-layer owners fence before destruction; permanent layers do not. */
+  readonly waitForRetirement?: boolean;
 }): Promise<void> {
   input.signal.throwIfAborted();
   try {
     input.mutation.markStateMutation();
     await input.executor.dispatchBatch(input.commands);
-    await input.executor.submittedWorkDone();
+    if (input.waitForRetirement !== false) {
+      await input.executor.submittedWorkDone();
+    }
     input.signal.throwIfAborted();
   } catch (error) {
     if (
@@ -984,10 +1112,67 @@ export async function executeQwen35GreedyTiedTileScore(input: {
   }
 }
 
+/** Executes the final streamed candidate reduction and reads one token id. */
+export async function executeQwen35GreedyStagedFinalToken(input: {
+  readonly commands: readonly Qwen35DispatchRequest[];
+  readonly executor: {
+    dispatchBatch(commands: readonly Qwen35DispatchRequest[]): Promise<void>;
+    submittedWorkDone(): Promise<void>;
+    readU32(buffer: object, byteOffset: number): Promise<number>;
+  };
+  readonly selectedTokenReadback: { readonly buffer: object; readonly offset: number };
+  readonly signal: AbortSignal;
+}): Promise<number> {
+  input.signal.throwIfAborted();
+  try {
+    await input.executor.dispatchBatch(input.commands);
+    await input.executor.submittedWorkDone();
+    input.signal.throwIfAborted();
+    const tokenId = await input.executor.readU32(
+      input.selectedTokenReadback.buffer,
+      input.selectedTokenReadback.offset,
+    );
+    input.signal.throwIfAborted();
+    if (
+      tokenId === QWEN35_NO_SELECTED_TOKEN ||
+      !Number.isSafeInteger(tokenId) ||
+      tokenId < 0 ||
+      tokenId >= DECODABLE_TOKEN_COUNT
+    ) {
+      throw diagnosticError(
+        "greedy-token-selection-invalid",
+        "Qwen3.5 staged logits returned an invalid token",
+      );
+    }
+    return tokenId;
+  } catch (error) {
+    if (
+      input.signal.aborted ||
+      (error instanceof DOMException && error.name === "AbortError")
+    ) {
+      throw abortError();
+    }
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      (error as { readonly code?: unknown }).code ===
+        "greedy-token-selection-invalid"
+    ) {
+      throw error;
+    }
+    throw diagnosticError(
+      "greedy-tied-final-selection-failed",
+      "Qwen3.5 staged logits final selection failed",
+    );
+  }
+}
+
 export async function disposeQwen35GreedyOwnedResources(input: {
   readonly executor: Pick<Qwen35WebGpuExecutor, "dispose">;
   readonly uniformArena: Pick<Qwen35UniformArena, "dispose"> | null;
   readonly workspace: Pick<Qwen35ActivationWorkspace, "dispose"> | null;
+  readonly prefillUniformArena?: Pick<Qwen35UniformArena, "dispose"> | null;
+  readonly prefillWorkspaces?: readonly Pick<Qwen35ActivationWorkspace, "dispose">[];
   readonly candidateScratch?: Pick<GpuAllocation, "destroy">;
 }): Promise<void> {
   let failed = false;
@@ -1001,6 +1186,8 @@ export async function disposeQwen35GreedyOwnedResources(input: {
     Promise.resolve().then(() => input.candidateScratch?.destroy()),
     input.uniformArena?.dispose() ?? Promise.resolve(),
     input.workspace?.dispose() ?? Promise.resolve(),
+    input.prefillUniformArena?.dispose() ?? Promise.resolve(),
+    ...(input.prefillWorkspaces ?? []).map((workspace) => workspace.dispose()),
   ]);
   if (failed || released.some((result) => result.status === "rejected")) {
     throw diagnosticError(
@@ -1027,12 +1214,12 @@ function candidateScratchSlice(
 ): Qwen35ForwardBufferSlice {
   const shard = allocation.shards[0];
   if (
-    allocation.logicalBytes !== 8n ||
+    allocation.logicalBytes !== 2_048n ||
     allocation.shards.length !== 1 ||
     shard === undefined ||
     shard.logicalByteOffset !== 0n ||
-    shard.logicalByteLength !== 8n ||
-    shard.allocatedByteLength < 8n
+    shard.logicalByteLength !== 2_048n ||
+    shard.allocatedByteLength < 2_048n
   ) {
     throw diagnosticError(
       "greedy-candidate-scratch-invalid",
@@ -1042,7 +1229,7 @@ function candidateScratchSlice(
   return Object.freeze({
     buffer: shard.buffer as object,
     offset: 0,
-    byteLength: 8,
+    byteLength: 2_048,
   });
 }
 
@@ -1062,6 +1249,9 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
   readonly #rollingLayers: Qwen35RollingLayerStore | null;
   readonly #candidateScratch: GpuAllocation | null;
   readonly #candidateOutput: Qwen35ForwardBufferSlice | null;
+  readonly #prefillWorkspaces: readonly Qwen35ActivationWorkspace[];
+  readonly #prefillUniformArena: Qwen35UniformArena | null;
+  readonly #prefillUniformSlots: readonly Qwen35UniformSlot[];
   #poisoned = false;
   #disposePromise: Promise<void> | null = null;
 
@@ -1077,6 +1267,8 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
     readonly tiedEmbedding?: Qwen35DiskBackedTiedEmbeddingStore;
     readonly rollingLayers?: Qwen35RollingLayerStore;
     readonly candidateScratch?: GpuAllocation;
+    readonly prefillWorkspaces?: readonly Qwen35ActivationWorkspace[];
+    readonly prefillUniformArena?: Qwen35UniformArena;
   }) {
     this.#program = input.program;
     this.#weights = input.weights;
@@ -1091,6 +1283,14 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
     this.#tiedEmbedding = input.tiedEmbedding ?? null;
     this.#rollingLayers = input.rollingLayers ?? null;
     this.#candidateScratch = input.candidateScratch ?? null;
+    this.#prefillWorkspaces = Object.freeze([...(input.prefillWorkspaces ?? [])]);
+    this.#prefillUniformArena = input.prefillUniformArena ?? null;
+    this.#prefillUniformSlots = this.#prefillUniformArena === null
+      ? Object.freeze([])
+      : Object.freeze(Array.from(
+          { length: input.geometry.uniformSlotCount * PREFILL_CHUNK_SIZE },
+          (_, index) => this.#prefillUniformArena!.slot(index, MAX_UNIFORM_WORDS),
+        ));
     if ((this.#tiedEmbedding === null) !== (this.#candidateScratch === null)) {
       throw diagnosticError(
         "greedy-candidate-scratch-invalid",
@@ -1116,6 +1316,438 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
 
   get poisoned(): boolean {
     return this.#poisoned;
+  }
+
+  /** Runs a bounded prompt chunk or the serial fallback when pool allocation is unavailable. */
+  async prefillChunk(input: {
+    readonly steps: readonly Qwen35GreedyTokenStep[];
+    readonly signal: AbortSignal;
+  }): Promise<number | null> {
+    if (
+      this.#prefillUniformArena !== null &&
+      this.#prefillWorkspaces.length > 0
+    ) {
+      return this.#prefillChunkLayerMajor(input);
+    }
+    let selected: number | null = null;
+    for (const step of input.steps) selected = await this.execute(step);
+    return selected;
+  }
+  /**
+   * Executes a bounded prompt chunk layer-major. This keeps rolling weights
+   * resident for one layer while all prompt rows use that layer, then releases
+   * the layer before moving on. The same schedule also batches resident layers.
+   */
+  async #prefillChunkLayerMajor(input: {
+    readonly steps: readonly Qwen35GreedyTokenStep[];
+    readonly signal: AbortSignal;
+  }): Promise<number | null> {
+    if (
+      input.steps.length < 1 ||
+      input.steps.length > PREFILL_CHUNK_SIZE ||
+      input.steps.some((step, index) =>
+        step.phase !== "prefill" ||
+        (index < input.steps.length - 1 && step.predict)
+      ) ||
+      this.position + input.steps.length > this.capacity
+    ) {
+      throw diagnosticError(
+        "greedy-prefill-chunk-invalid",
+        "Qwen3.5 prefill chunk is invalid",
+      );
+    }
+    input.signal.throwIfAborted();
+    const startPosition = this.position;
+    await this.#state.ensureCapacity(startPosition + input.steps.length, input.signal);
+    let persistentSubmission = false;
+    const tokenSlots = (index: number): readonly Qwen35UniformSlot[] => {
+      const start = index * this.#geometry.uniformSlotCount;
+      return this.#prefillUniformSlots.slice(
+        start,
+        start + this.#geometry.uniformSlotCount,
+      );
+    };
+
+    try {
+      const embeddingCommands: UniformCommand[] = [];
+      for (const [index, step] of input.steps.entries()) {
+        const workspace = this.#prefillWorkspaces[index];
+        if (workspace === undefined) {
+          throw diagnosticError(
+            "greedy-prefill-chunk-invalid",
+            "Qwen3.5 prefill workspace is incomplete",
+          );
+        }
+        const slots = tokenSlots(index);
+        const stagedInput = this.#tiedEmbedding === null
+          ? null
+          : await stageQwen35GreedyInputEmbedding({
+              tiedEmbedding: this.#tiedEmbedding,
+              step,
+            });
+        const embedding = stagedInput === null
+          ? step.embeddingOverride === undefined
+            ? planQwen35PackedEmbeddingDispatch({
+                weights: this.#weights,
+                tokenId: step.tokenId,
+                output: workspaceSlice(workspace, "packed-embedding-output"),
+                uniform: slots[this.#geometry.embeddingUniform]!.binding,
+                limits: this.#limits,
+              })
+            : planQwen35VisualEmbeddingDispatch({
+                source: step.embeddingOverride,
+                output: workspaceSlice(workspace, "packed-embedding-output"),
+                uniform: slots[this.#geometry.embeddingUniform]!.binding,
+                limits: this.#limits,
+              })
+          : stagedInput.kind === "visual"
+            ? planQwen35VisualEmbeddingDispatch({
+                source: stagedInput.source,
+                output: workspaceSlice(workspace, "packed-embedding-output"),
+                uniform: slots[this.#geometry.embeddingUniform]!.binding,
+                limits: this.#limits,
+              })
+            : planQwen35StagedPackedEmbeddingDispatch({
+                rows: stagedInput.rows,
+                output: workspaceSlice(workspace, "packed-embedding-output"),
+                uniform: slots[this.#geometry.embeddingUniform]!.binding,
+                limits: this.#limits,
+              });
+        uploadQwen35GreedyUniformCommands({
+          commands: [embedding],
+          slots: [slots[this.#geometry.embeddingUniform]!],
+          expectedSlotCount: 1,
+        });
+        embeddingCommands.push(Object.freeze({
+          ...embedding,
+          uniformWords: embedding.uniformWords,
+        }));
+      }
+
+      let embeddingSubmissionAttempted = false;
+      let embeddingRetired = false;
+      try {
+        input.signal.throwIfAborted();
+        embeddingSubmissionAttempted = true;
+        await this.#executor.dispatchBatch(embeddingCommands);
+        await this.#executor.submittedWorkDone();
+        embeddingRetired = true;
+        input.signal.throwIfAborted();
+        this.#executor.releaseBindGroups();
+      } catch (error) {
+        if (embeddingSubmissionAttempted && !embeddingRetired) {
+          this.#poisoned = true;
+        }
+        throw error;
+      }
+
+      const executeLayer = async (layerInput: {
+        readonly invocation: AttentionInvocation;
+        readonly weights: Qwen35WeightDirectoryView;
+        readonly mutation: Qwen35RollingLayerMutation;
+      }): Promise<void> => {
+        const { invocation, weights, mutation } = layerInput;
+        const geometry = this.#geometry.layers[invocation.layer];
+        if (
+          geometry === undefined ||
+          geometry.layer !== invocation.layer ||
+          geometry.kind !== invocation.kind
+        ) {
+          throw diagnosticError(
+            "greedy-uniform-schedule-invalid",
+            "Qwen3.5 prefill layer geometry is incomplete",
+          );
+        }
+        const layerCommands: UniformCommand[] = [];
+        const state = this.#state.getLayerResources(invocation.layer);
+        for (const [tokenIndex] of input.steps.entries()) {
+          const workspace = this.#prefillWorkspaces[tokenIndex];
+          if (workspace === undefined) {
+            throw diagnosticError(
+              "greedy-prefill-chunk-invalid",
+              "Qwen3.5 prefill workspace is incomplete",
+            );
+          }
+          const slots = tokenSlots(tokenIndex).slice(
+            geometry.uniformStart,
+            geometry.uniformStart + geometry.uniformCount,
+          );
+          const plan = invocation.kind === "gated-deltanet"
+            ? planQwen35DeltaNetLayerDispatch({
+                program: this.#program,
+                invocation,
+                weights,
+                workspace,
+                deltanetParameterLiveness: WORKSPACE_LIVENESS,
+                state,
+                limits: this.#limits,
+                uniforms: slots.map((slot) => slot.binding),
+              })
+            : planQwen35FullAttentionLayerDispatch({
+                program: this.#program,
+                invocation,
+                weights,
+                workspace,
+                state,
+                position: startPosition + tokenIndex,
+                capacity: this.capacity,
+                mropePositions: [
+                  startPosition + tokenIndex,
+                  startPosition + tokenIndex,
+                  startPosition + tokenIndex,
+                ],
+                limits: this.#limits,
+                uniforms: slots.map((slot) => slot.binding),
+              });
+          uploadQwen35GreedyRollingPlanUniforms({
+            planUniformCount: plan.uniformCount,
+            reservedUniformCount: geometry.uniformCount,
+            commands: plan.commands,
+            slots,
+          });
+          layerCommands.push(...plan.commands);
+        }
+        persistentSubmission = true;
+        if (this.#rollingLayers === null) {
+          mutation.markStateMutation();
+          await this.#executor.dispatchBatch(layerCommands);
+          this.#executor.releaseBindGroups();
+          return;
+        }
+        await executeQwen35GreedyRollingLayerDispatch({
+          commands: layerCommands,
+          executor: this.#executor,
+          mutation,
+          signal: input.signal,
+          waitForRetirement: !(
+            this.#rollingLayers?.streamedLayers.includes(invocation.layer) ?? false
+          ),
+        });
+        this.#executor.releaseBindGroups();
+      };
+
+      if (this.#rollingLayers === null) {
+        for (const invocation of this.#layers) {
+          await executeLayer({
+            invocation,
+            weights: this.#weights,
+            mutation: { markStateMutation() {} },
+          });
+        }
+      } else {
+        await executeQwen35RollingLayerSequence({
+          invocations: this.#layers,
+          permanentWeights: this.#weights,
+          rollingStore: this.#rollingLayers,
+          phase: "prefill",
+          signal: input.signal,
+          poison: () => { this.#poisoned = true; },
+          execute: executeLayer,
+        });
+      }
+
+      const lastStep = input.steps.at(-1)!;
+      input.signal.throwIfAborted();
+      this.#state.advance(input.steps.length);
+      if (!lastStep.predict) return null;
+      const lastIndex = input.steps.length - 1;
+      const lastWorkspace = this.#prefillWorkspaces[lastIndex];
+      if (lastWorkspace === undefined) {
+        throw diagnosticError(
+          "greedy-prefill-chunk-invalid",
+          "Qwen3.5 final prefill workspace is incomplete",
+        );
+      }
+      const lastSlots = tokenSlots(lastIndex);
+      const finalUniform = lastSlots[this.#geometry.finalNormUniform];
+      if (finalUniform === undefined) {
+        throw diagnosticError(
+          "greedy-uniform-schedule-invalid",
+          "Qwen3.5 prefill final uniform slot is incomplete",
+        );
+      }
+      const final = planQwen35FinalNormDispatch({
+        program: this.#program,
+        invocation: this.#final,
+        weights: this.#weights,
+        workspace: lastWorkspace,
+        limits: this.#limits,
+        uniform: finalUniform.binding,
+      });
+
+      if (this.#tiedEmbedding === null) {
+        const logitsSlots = lastSlots.slice(
+          this.#geometry.logitsUniformStart,
+          this.#geometry.logitsUniformStart + this.#geometry.logitsUniformCount,
+        );
+        const logits = assembleQwen35TiledLogitsCommands({
+          weights: this.#weights,
+          normalizedHidden: workspaceSlice(lastWorkspace, "normalized-hidden"),
+          workspace: lastWorkspace,
+          limits: this.#limits,
+          uniforms: logitsSlots.map((slot) => slot.binding),
+        });
+        const tailCommands: UniformCommand[] = [final.command, ...logits.commands];
+        const tailSlots = [finalUniform, ...logitsSlots];
+        uploadQwen35GreedyUniformCommands({
+          commands: tailCommands,
+          slots: tailSlots,
+          expectedSlotCount: tailSlots.length,
+        });
+        await this.#executor.dispatchBatch(tailCommands);
+        await this.#executor.submittedWorkDone();
+        this.#executor.releaseBindGroups();
+        const token = await this.#executor.readU32(
+          logits.selectedTokenReadback.buffer,
+          logits.selectedTokenReadback.offset,
+        );
+        input.signal.throwIfAborted();
+        if (
+          token === QWEN35_NO_SELECTED_TOKEN ||
+          token < 0 ||
+          token >= DECODABLE_TOKEN_COUNT
+        ) {
+          throw diagnosticError(
+            "greedy-token-selection-invalid",
+            "Qwen3.5 prefill returned an invalid token",
+          );
+        }
+        return token;
+      }
+
+      const stagedLogitsSlots = lastSlots.slice(
+        this.#geometry.logitsUniformStart,
+        this.#geometry.logitsUniformStart + STAGED_LOGITS_TOTAL_UNIFORM_COUNT,
+      );
+      if (
+        stagedLogitsSlots.length !== STAGED_LOGITS_TOTAL_UNIFORM_COUNT ||
+        this.#candidateOutput === null
+      ) {
+        throw diagnosticError(
+          "greedy-uniform-schedule-invalid",
+          "Qwen3.5 staged logits uniform capacity is incomplete",
+        );
+      }
+      uploadQwen35GreedyUniformCommands({
+        commands: [final.command],
+        slots: [finalUniform],
+        expectedSlotCount: 1,
+      });
+      await this.#executor.dispatchBatch([final.command]);
+      await this.#executor.submittedWorkDone();
+      this.#executor.releaseBindGroups();
+      const normalizedHidden = workspaceSlice(lastWorkspace, "normalized-hidden");
+      const stagedLogitsTileSlots = stagedLogitsTileUniformSlots(
+        stagedLogitsSlots,
+        0,
+      );
+      const stagedLogitsFinalSlots = stagedLogitsFinalUniformSlots(stagedLogitsSlots);
+      if (
+        stagedLogitsTileSlots.length !== STAGED_LOGITS_UNIFORM_COUNT ||
+        stagedLogitsFinalSlots.length !== STAGED_LOGITS_UNIFORM_COUNT
+      ) {
+        throw diagnosticError(
+          "greedy-uniform-schedule-invalid",
+          "Qwen3.5 staged logits uniform capacity is incomplete",
+        );
+      }
+      if (typeof this.#tiedEmbedding.selectTopKGpu === "function") {
+        const batcher = createQwen35StagedLogitsBatcher(this.#executor);
+        const token = await selectQwen35GreedyTiedTokenGpu({
+          tiedEmbedding: this.#tiedEmbedding,
+          phase: lastStep.phase,
+          signal: input.signal,
+          scoreTile: async (tile, candidateSlot) => {
+            const tileUniformSlots = stagedLogitsTileUniformSlots(
+              stagedLogitsSlots,
+              candidateSlot,
+            );
+            const planned = assembleQwen35StagedLogitsTileGpuCommands({
+              tile,
+              normalizedHidden,
+              workspace: lastWorkspace,
+              candidateOutput: this.#candidateOutput!,
+              candidateSlot,
+              limits: this.#limits,
+              uniforms: tileUniformSlots.map((slot) => slot.binding),
+            });
+            uploadQwen35GreedyUniformCommands({
+              commands: planned.commands,
+              slots: tileUniformSlots,
+              expectedSlotCount: STAGED_LOGITS_UNIFORM_COUNT,
+            });
+            batcher.enqueue(planned.commands);
+          },
+          flush: () => batcher.flush(),
+          finalize: async () => {
+            const finalSlot = stagedLogitsFinalUniformSlots(stagedLogitsSlots)[1];
+            if (finalSlot === undefined) {
+              throw diagnosticError(
+                "greedy-uniform-schedule-invalid",
+                "Qwen3.5 staged logits final uniform slot is incomplete",
+              );
+            }
+            const selectedToken = workspaceSlice(lastWorkspace, "selected-token");
+            const finalSelection = assembleQwen35StagedFinalTokenCommand({
+              candidateOutput: this.#candidateOutput!,
+              selectedToken,
+              limits: this.#limits,
+              uniform: finalSlot.binding,
+            });
+            uploadQwen35GreedyUniformCommands({
+              commands: [finalSelection],
+              slots: [finalSlot],
+              expectedSlotCount: 1,
+            });
+            const token = await executeQwen35GreedyStagedFinalToken({
+              commands: [finalSelection],
+              executor: this.#executor,
+              selectedTokenReadback: {
+                buffer: selectedToken.buffer,
+                offset: selectedToken.offset,
+              },
+              signal: input.signal,
+            });
+            this.#executor.releaseBindGroups();
+            return token;
+          },
+        });
+        return token;
+      }
+      return await selectQwen35GreedyTiedToken({
+        tiedEmbedding: this.#tiedEmbedding,
+        phase: lastStep.phase,
+        signal: input.signal,
+        scoreTile: async (tile) => {
+          const planned = assembleQwen35StagedLogitsTileCommands({
+            tile,
+            normalizedHidden,
+            workspace: lastWorkspace,
+            candidateOutput: this.#candidateOutput!,
+            limits: this.#limits,
+            uniforms: stagedLogitsTileSlots.map((slot) => slot.binding),
+          });
+          uploadQwen35GreedyUniformCommands({
+            commands: planned.commands,
+            slots: stagedLogitsTileSlots,
+            expectedSlotCount: STAGED_LOGITS_UNIFORM_COUNT,
+          });
+          const candidates = await executeQwen35GreedyTiedTileScore({
+            commands: planned.commands,
+            executor: this.#executor,
+            tile,
+            candidateScoreReadback: planned.candidateScoreReadback,
+            candidateTokenReadback: planned.candidateTokenReadback,
+            signal: input.signal,
+          });
+          this.#executor.releaseBindGroups();
+          return candidates;
+        },
+      });
+    } catch (error) {
+      if (persistentSubmission) this.#poisoned = true;
+      throw error;
+    }
   }
 
   async execute(step: Qwen35GreedyTokenStep): Promise<number | null> {
@@ -1235,11 +1867,11 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
       if (this.#tiedEmbedding !== null) {
         stagedLogitsSlots = this.#uniformSlots.slice(
           uniformCursor,
-          uniformCursor + STAGED_LOGITS_UNIFORM_COUNT,
+          uniformCursor + STAGED_LOGITS_TOTAL_UNIFORM_COUNT,
         );
         if (
-          this.#geometry.logitsUniformCount !== STAGED_LOGITS_UNIFORM_COUNT ||
-          stagedLogitsSlots.length !== STAGED_LOGITS_UNIFORM_COUNT ||
+          this.#geometry.logitsUniformCount !== STAGED_LOGITS_TOTAL_UNIFORM_COUNT ||
+          stagedLogitsSlots.length !== STAGED_LOGITS_TOTAL_UNIFORM_COUNT ||
           this.#candidateOutput === null
         ) {
           throw diagnosticError(
@@ -1297,6 +1929,82 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
     }
     try {
       const normalizedHidden = workspaceSlice(this.#workspace, "normalized-hidden");
+      const stagedLogitsTileSlots = stagedLogitsSlots.slice(
+        0,
+        STAGED_LOGITS_UNIFORM_COUNT,
+      );
+      const stagedLogitsFinalSlots = stagedLogitsSlots.slice(
+        STAGED_LOGITS_TILE_UNIFORM_COUNT,
+      );
+      if (
+        stagedLogitsTileSlots.length !== STAGED_LOGITS_UNIFORM_COUNT ||
+        stagedLogitsFinalSlots.length !== STAGED_LOGITS_UNIFORM_COUNT
+      ) {
+        throw diagnosticError(
+          "greedy-uniform-schedule-invalid",
+          "Qwen3.5 staged logits uniform capacity is incomplete",
+        );
+      }
+      if (typeof this.#tiedEmbedding.selectTopKGpu === "function") {
+        const batcher = createQwen35StagedLogitsBatcher(this.#executor);
+        return await selectQwen35GreedyTiedTokenGpu({
+          tiedEmbedding: this.#tiedEmbedding,
+          phase: step.phase,
+          signal: step.signal,
+          scoreTile: async (tile, candidateSlot) => {
+            const tileUniformSlots = stagedLogitsTileUniformSlots(
+              stagedLogitsSlots,
+              candidateSlot,
+            );
+            const planned = assembleQwen35StagedLogitsTileGpuCommands({
+              tile,
+              normalizedHidden,
+              workspace: this.#workspace,
+              candidateOutput: this.#candidateOutput!,
+              candidateSlot,
+              limits: this.#limits,
+              uniforms: tileUniformSlots.map((slot) => slot.binding),
+            });
+            uploadQwen35GreedyUniformCommands({
+              commands: planned.commands,
+              slots: tileUniformSlots,
+              expectedSlotCount: STAGED_LOGITS_UNIFORM_COUNT,
+            });
+            batcher.enqueue(planned.commands);
+          },
+          flush: () => batcher.flush(),
+          finalize: async () => {
+            const finalSlot = stagedLogitsFinalSlots[1];
+            if (finalSlot === undefined) {
+              throw diagnosticError(
+                "greedy-uniform-schedule-invalid",
+                "Qwen3.5 staged logits final uniform slot is incomplete",
+              );
+            }
+            const final = assembleQwen35StagedFinalTokenCommand({
+              candidateOutput: this.#candidateOutput!,
+              selectedToken: workspaceSlice(this.#workspace, "selected-token"),
+              limits: this.#limits,
+              uniform: finalSlot.binding,
+            });
+            uploadQwen35GreedyUniformCommands({
+              commands: [final],
+              slots: [finalSlot],
+              expectedSlotCount: 1,
+            });
+            const selectedToken = workspaceSlice(this.#workspace, "selected-token");
+            return executeQwen35GreedyStagedFinalToken({
+              commands: [final],
+              executor: this.#executor,
+              selectedTokenReadback: {
+                buffer: selectedToken.buffer,
+                offset: selectedToken.offset,
+              },
+              signal: step.signal,
+            });
+          },
+        });
+      }
       return await selectQwen35GreedyTiedToken({
         tiedEmbedding: this.#tiedEmbedding,
         phase: step.phase,
@@ -1308,11 +2016,11 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
             workspace: this.#workspace,
             candidateOutput: this.#candidateOutput!,
             limits: this.#limits,
-            uniforms: stagedLogitsSlots!.map((slot) => slot.binding),
+            uniforms: stagedLogitsTileSlots.map((slot) => slot.binding),
           });
           uploadQwen35GreedyUniformCommands({
             commands: planned.commands,
-            slots: stagedLogitsSlots!,
+            slots: stagedLogitsTileSlots,
             expectedSlotCount: STAGED_LOGITS_UNIFORM_COUNT,
           });
           return executeQwen35GreedyTiedTileScore({
@@ -1457,9 +2165,12 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
           executor: this.#executor,
           mutation,
           signal: step.signal,
+          waitForRetirement: !this.#rollingLayers!.streamedLayers.includes(
+            invocation.layer,
+          ),
         });
         // Each bind group references this layer's temporary buffers. Release
-        // it after GPU retirement, before the rolling store destroys weights.
+        // the cache before the rolling store's single ownership fence.
         this.#executor.releaseBindGroups();
       },
     });
@@ -1522,10 +2233,10 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
       } else {
         stagedLogitsSlots = this.#uniformSlots.slice(
           this.#geometry.logitsUniformStart,
-          this.#geometry.logitsUniformStart + STAGED_LOGITS_UNIFORM_COUNT,
+          this.#geometry.logitsUniformStart + STAGED_LOGITS_TOTAL_UNIFORM_COUNT,
         );
         if (
-          stagedLogitsSlots.length !== STAGED_LOGITS_UNIFORM_COUNT ||
+          stagedLogitsSlots.length !== STAGED_LOGITS_TOTAL_UNIFORM_COUNT ||
           this.#candidateOutput === null
         ) {
           throw diagnosticError(
@@ -1557,6 +2268,80 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
         return committed;
       }
       const normalizedHidden = workspaceSlice(this.#workspace, "normalized-hidden");
+      const stagedLogitsTileSlots = stagedLogitsTileUniformSlots(
+        stagedLogitsSlots,
+        0,
+      );
+      const stagedLogitsFinalSlots = stagedLogitsFinalUniformSlots(stagedLogitsSlots);
+      if (
+        stagedLogitsTileSlots.length !== STAGED_LOGITS_UNIFORM_COUNT ||
+        stagedLogitsFinalSlots.length !== STAGED_LOGITS_UNIFORM_COUNT
+      ) {
+        throw diagnosticError(
+          "greedy-uniform-schedule-invalid",
+          "Qwen3.5 staged logits uniform capacity is incomplete",
+        );
+      }
+      if (typeof this.#tiedEmbedding.selectTopKGpu === "function") {
+        const batcher = createQwen35StagedLogitsBatcher(this.#executor);
+        return await selectQwen35GreedyTiedTokenGpu({
+          tiedEmbedding: this.#tiedEmbedding,
+          phase: step.phase,
+          signal: step.signal,
+          scoreTile: async (tile, candidateSlot) => {
+            const tileUniformSlots = stagedLogitsTileUniformSlots(
+              stagedLogitsSlots,
+              candidateSlot,
+            );
+            const planned = assembleQwen35StagedLogitsTileGpuCommands({
+              tile,
+              normalizedHidden,
+              workspace: this.#workspace,
+              candidateOutput: this.#candidateOutput!,
+              candidateSlot,
+              limits: this.#limits,
+              uniforms: tileUniformSlots.map((slot) => slot.binding),
+            });
+            uploadQwen35GreedyUniformCommands({
+              commands: planned.commands,
+              slots: tileUniformSlots,
+              expectedSlotCount: STAGED_LOGITS_UNIFORM_COUNT,
+            });
+            batcher.enqueue(planned.commands);
+          },
+          flush: () => batcher.flush(),
+          finalize: async () => {
+            const finalSlot = stagedLogitsFinalSlots[1];
+            if (finalSlot === undefined) {
+              throw diagnosticError(
+                "greedy-uniform-schedule-invalid",
+                "Qwen3.5 staged logits final uniform slot is incomplete",
+              );
+            }
+            const final = assembleQwen35StagedFinalTokenCommand({
+              candidateOutput: this.#candidateOutput!,
+              selectedToken: workspaceSlice(this.#workspace, "selected-token"),
+              limits: this.#limits,
+              uniform: finalSlot.binding,
+            });
+            uploadQwen35GreedyUniformCommands({
+              commands: [final],
+              slots: [finalSlot],
+              expectedSlotCount: 1,
+            });
+            const selectedToken = workspaceSlice(this.#workspace, "selected-token");
+            return executeQwen35GreedyStagedFinalToken({
+              commands: [final],
+              executor: this.#executor,
+              selectedTokenReadback: {
+                buffer: selectedToken.buffer,
+                offset: selectedToken.offset,
+              },
+              signal: step.signal,
+            });
+          },
+        });
+      }
       return await selectQwen35GreedyTiedToken({
         tiedEmbedding: this.#tiedEmbedding,
         phase: step.phase,
@@ -1568,11 +2353,11 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
             workspace: this.#workspace,
             candidateOutput: this.#candidateOutput!,
             limits: this.#limits,
-            uniforms: stagedLogitsSlots!.map((slot) => slot.binding),
+            uniforms: stagedLogitsTileSlots.map((slot) => slot.binding),
           });
           uploadQwen35GreedyUniformCommands({
             commands: planned.commands,
-            slots: stagedLogitsSlots!,
+            slots: stagedLogitsTileSlots,
             expectedSlotCount: STAGED_LOGITS_UNIFORM_COUNT,
           });
           return executeQwen35GreedyTiedTileScore({
@@ -1601,7 +2386,10 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
     }
     try {
       await this.#state.reset();
-      await this.#workspace.reset();
+      await Promise.all([
+        this.#workspace.reset(),
+        ...this.#prefillWorkspaces.map((workspace) => workspace.reset()),
+      ]);
     } catch {
       this.#poisoned = true;
       throw diagnosticError(
@@ -1621,6 +2409,8 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
       executor: this.#executor,
       uniformArena: this.#uniformArena,
       workspace: this.#workspace,
+      prefillUniformArena: this.#prefillUniformArena,
+      prefillWorkspaces: this.#prefillWorkspaces,
       ...(this.#candidateScratch === null
         ? {}
         : { candidateScratch: this.#candidateScratch }),
@@ -1645,20 +2435,34 @@ async function createGpuDriver(
       ? {}
       : { rollingLayers: context.rollingLayers }),
   });
-  const clearer = createQwen35AllocationClearer(context.device);
-  const executor = new Qwen35WebGpuExecutor(context.device);
+  const clearer = createQwen35AllocationClearer(
+    context.device,
+    context.performanceCounters,
+  );
+  const executionQueue = context.performanceCounters === undefined
+    ? context.device.queue
+    : createQwen35PerformanceWriteQueue({
+        queue: context.device.queue,
+        counters: context.performanceCounters,
+      });
+  const executor = new Qwen35WebGpuExecutor(
+    context.device,
+    context.performanceCounters,
+  );
   let workspace: Qwen35ActivationWorkspace | null = null;
   let uniformArena: Qwen35UniformArena | null = null;
+  let prefillUniformArena: Qwen35UniformArena | null = null;
+  const prefillWorkspaces: Qwen35ActivationWorkspace[] = [];
   let candidateScratch: GpuAllocation | null = null;
   try {
     if (context.tiedEmbedding !== undefined) {
       candidateScratch = await context.arena.allocate({
         id: "tied-logits-candidate-scratch",
         category: "scratch",
-        byteLength: 8n,
+        byteLength: 2_048n,
         usage: GPU_STORAGE_AND_COPY_SRC,
         alignment: 4,
-        requiredShardQuantumBytes: 8n,
+        requiredShardQuantumBytes: 2_048n,
       });
       candidateScratchSlice(candidateScratch);
     }
@@ -1668,12 +2472,36 @@ async function createGpuDriver(
     });
     uniformArena = await createQwen35UniformArena({
       arena: context.arena,
-      queue: context.device.queue,
+      queue: executionQueue,
       slotCount: geometry.uniformSlotCount,
       slotWordCapacity: geometry.maxUniformWords,
       minUniformBufferOffsetAlignment: limits.minUniformBufferOffsetAlignment,
       maxUniformBufferBindingSize: limits.maxUniformBufferBindingSize,
     });
+    // The pool is useful for both resident and rolling paths. On a constrained
+    // device it is optional: keep the proven serial executor if the extra
+    // transient allocations do not fit the live ledger.
+    try {
+      for (let index = 0; index < PREFILL_CHUNK_SIZE; index += 1) {
+        prefillWorkspaces.push(await createQwen35ActivationWorkspace({
+          arena: context.arena,
+          clearAllocation: (allocation) => clearer.clearAllocation(allocation),
+          allocationIdPrefix: `qwen35-prefill-${index}`,
+        }));
+      }
+      prefillUniformArena = await createQwen35UniformArena({
+        arena: context.arena,
+        queue: executionQueue,
+        allocationId: "qwen35-prefill-uniforms",
+        slotCount: geometry.uniformSlotCount * PREFILL_CHUNK_SIZE,
+        slotWordCapacity: geometry.maxUniformWords,
+        minUniformBufferOffsetAlignment: limits.minUniformBufferOffsetAlignment,
+        maxUniformBufferBindingSize: limits.maxUniformBufferBindingSize,
+      });
+    } catch {
+      await Promise.all(prefillWorkspaces.splice(0).map((item) => item.dispose()));
+      prefillUniformArena = null;
+    }
     return createQwen35GreedyTextDriver(new Qwen35GpuTokenEngine({
       device: context.device,
       program: context.program,
@@ -1690,6 +2518,8 @@ async function createGpuDriver(
         ? {}
         : { rollingLayers: context.rollingLayers }),
       ...(candidateScratch === null ? {} : { candidateScratch }),
+      prefillWorkspaces,
+      ...(prefillUniformArena === null ? {} : { prefillUniformArena }),
     }), executor);
   } catch (error) {
     try {
@@ -1697,6 +2527,8 @@ async function createGpuDriver(
         executor,
         uniformArena,
         workspace,
+        prefillUniformArena,
+        prefillWorkspaces,
         ...(candidateScratch === null ? {} : { candidateScratch }),
       });
     } catch {
@@ -1711,19 +2543,32 @@ async function createGpuDriver(
 
 /** Public production factory; callers may still inject a test factory. */
 export function createQwen35GreedyExecutionDriverFactory(): Qwen35ExecutionDriverFactory {
-  const clearers = new WeakMap<object, ReturnType<typeof createQwen35AllocationClearer>>();
-  const clearer = (device: Qwen35WebGpuDevice) => {
+  const clearers = new WeakMap<object, {
+    readonly performanceCounters: Qwen35DriverFactoryContext["performanceCounters"];
+    readonly clearer: ReturnType<typeof createQwen35AllocationClearer>;
+  }>();
+  const clearer = (
+    device: Qwen35WebGpuDevice,
+    performanceCounters: Qwen35DriverFactoryContext["performanceCounters"],
+  ) => {
     const key = device as object;
     let current = clearers.get(key);
-    if (current === undefined) {
-      current = createQwen35AllocationClearer(device);
+    if (
+      current === undefined ||
+      current.performanceCounters !== performanceCounters
+    ) {
+      current = {
+        performanceCounters,
+        clearer: createQwen35AllocationClearer(device, performanceCounters),
+      };
       clearers.set(key, current);
     }
-    return current;
+    return current.clearer;
   };
   return Object.freeze({
     clearStateAllocation(context: Qwen35StateAllocationClearContext) {
-      return clearer(context.device).clearAllocation(context.allocation);
+      return clearer(context.device, context.performanceCounters)
+        .clearAllocation(context.allocation);
     },
     create(context: Qwen35DriverFactoryContext) {
       return createGpuDriver(context);

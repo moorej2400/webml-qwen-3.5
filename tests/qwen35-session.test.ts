@@ -1018,6 +1018,17 @@ test("metrics contain structured values without prompt or output content", async
         currentBytes: currentGpuBytes,
         peakBytes: peakGpuBytes,
       }),
+      performanceMetrics: () => ({
+        permanentGpuBytes: 10,
+        transientGpuBytes: 20,
+        stateGpuBytes: 30,
+        diskReadBytes: 40,
+        gpuUploadBytes: 50,
+        dispatchCount: 60,
+        queueSubmissionCount: 70,
+        queueRetirementCount: 80,
+        gpuReadbackCount: 90,
+      }),
       async dispose() {
         await resources.dispose();
         currentGpuBytes = 0;
@@ -1036,6 +1047,9 @@ test("metrics contain structured values without prompt or output content", async
   assert.equal(metrics.trackedCpuBytes, 12);
   assert.equal(metrics.trackedGpuBytes, 41);
   assert.equal(metrics.peakTrackedGpuBytes, 55);
+  assert.equal(metrics.performance?.permanentGpuBytes, 10);
+  assert.equal(metrics.performance?.diskReadBytes, 40);
+  assert.equal(metrics.performance?.millisecondsPerGeneratedToken !== undefined, true);
   currentGpuBytes = 43;
   peakGpuBytes = 60;
   assert.equal(session.getMetrics().trackedGpuBytes, 43);

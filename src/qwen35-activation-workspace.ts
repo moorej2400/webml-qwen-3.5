@@ -116,6 +116,7 @@ export interface CreateQwen35ActivationWorkspaceOptions {
     allocation: GpuAllocation,
     resource: Qwen35ActivationResourceView,
   ) => Promise<void>;
+  readonly allocationIdPrefix?: string;
 }
 
 function resource(
@@ -401,7 +402,7 @@ export async function createQwen35ActivationWorkspace(
   try {
     for (const [index, plan] of ACTIVATION_PLAN.resources.entries()) {
       const allocation = await options.arena.allocate({
-        id: `activation-workspace-${index}`,
+        id: `${options.allocationIdPrefix ?? "activation"}-workspace-${index}`,
         category: "activation",
         byteLength: plan.bytes,
         usage: plan.usage,

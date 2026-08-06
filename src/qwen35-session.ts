@@ -13,6 +13,7 @@ import {
 import type { Qwen35Tokenizer } from "./qwen-tokenizer.js";
 import type { Qwen35ForwardBufferSlice } from "./qwen35-forward-dispatch.js";
 import type { Qwen35VisionPatchBatch } from "./qwen35-vision-preprocess.js";
+import type { Qwen35PerformanceSnapshot } from "./qwen35-performance.js";
 import type { Qwen35WebGpuExecutor } from "./qwen35-webgpu-executor.js";
 
 export type Qwen35SessionState =
@@ -100,7 +101,7 @@ export interface Qwen35ExecutionDriver {
   /** Borrowed by the lazy vision runtime; the driver remains its owner. */
   readonly sharedGpuExecutor?: Pick<
     Qwen35WebGpuExecutor,
-    "dispatchBatch" | "submittedWorkDone" | "dispose"
+    "dispatchBatch" | "submittedWorkDone" | "releaseBindGroups" | "dispose"
   >;
   /** A rejected or cancelled prefill may be partial; reset must clear it fully. */
   prefill(input: Qwen35DriverPrefillInput): Promise<void>;
@@ -121,6 +122,7 @@ export interface Qwen35LoadedResources {
     readonly currentBytes: number;
     readonly peakBytes: number;
   };
+  readonly performanceMetrics?: () => Qwen35PerformanceSnapshot;
   readonly deviceLost?: Promise<unknown>;
   readonly vision?: {
     encode(input: {
@@ -172,8 +174,16 @@ export interface RuntimeMetrics {
   readonly prefillTokensPerSecond: number | null;
   readonly generatedTokens: number;
   readonly generatedTokensPerSecond: number | null;
+  readonly performance?: RuntimePerformanceMetrics;
   readonly cancellationCount: number;
   readonly deviceLostCount: number;
+}
+
+export interface RuntimePerformanceMetrics extends Qwen35PerformanceSnapshot {
+  readonly warmTimeToFirstTokenMilliseconds: number | null;
+  readonly prefillTokensPerSecond: number | null;
+  readonly generatedTokensPerSecond: number | null;
+  readonly millisecondsPerGeneratedToken: number | null;
 }
 
 interface MutablePhaseMetrics {
@@ -757,6 +767,25 @@ export class Qwen35Session {
 
   getMetrics(): RuntimeMetrics {
     const gpuMetrics = this.#resources?.gpuByteMetrics?.();
+    const prefillTokensPerSecond = this.#prefillMilliseconds > 0
+      ? (this.#prefillTokens * 1_000) / this.#prefillMilliseconds
+      : null;
+    const generatedTokensPerSecond = this.#generationMilliseconds > 0
+      ? (this.#generatedTokens * 1_000) / this.#generationMilliseconds
+      : null;
+    const performanceSnapshot = this.#resources?.performanceMetrics?.();
+    const performance = performanceSnapshot === undefined
+      ? undefined
+      : Object.freeze({
+          ...performanceSnapshot,
+          warmTimeToFirstTokenMilliseconds: this.#ttft,
+          prefillTokensPerSecond,
+          generatedTokensPerSecond,
+          millisecondsPerGeneratedToken:
+            this.#generatedTokens > 0 && this.#generationMilliseconds > 0
+              ? this.#generationMilliseconds / this.#generatedTokens
+              : null,
+        });
     const phases = Object.fromEntries(
       [...this.#phases]
         .sort(([left], [right]) => left.localeCompare(right))
@@ -773,15 +802,10 @@ export class Qwen35Session {
       contextTokens: this.#contextTokens,
       timeToFirstTokenMilliseconds: this.#ttft,
       prefillTokens: this.#prefillTokens,
-      prefillTokensPerSecond:
-        this.#prefillMilliseconds > 0
-          ? (this.#prefillTokens * 1_000) / this.#prefillMilliseconds
-          : null,
+      prefillTokensPerSecond,
       generatedTokens: this.#generatedTokens,
-      generatedTokensPerSecond:
-        this.#generationMilliseconds > 0
-          ? (this.#generatedTokens * 1_000) / this.#generationMilliseconds
-          : null,
+      generatedTokensPerSecond,
+      ...(performance === undefined ? {} : { performance }),
       cancellationCount: this.#cancellationCount,
       deviceLostCount: this.#deviceLostCount,
     });

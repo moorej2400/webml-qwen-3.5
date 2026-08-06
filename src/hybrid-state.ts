@@ -242,6 +242,14 @@ export class Qwen35HybridState {
     return this.#byteLength;
   }
 
+  /** Physical bytes currently owned by the state, including shard padding. */
+  get allocatedBytes(): bigint {
+    return this.#allocationOrder.reduce(
+      (total, allocation) => total + allocation.allocatedBytes,
+      0n,
+    );
+  }
+
   get resourceCount(): number {
     return this.#resources.size;
   }

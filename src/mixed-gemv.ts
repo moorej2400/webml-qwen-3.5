@@ -44,7 +44,7 @@ export interface GemvKernelAbi {
   readonly wordsPerBlock: number;
   readonly bytesPerBlock: number;
   readonly valuesPerBlock: number;
-  readonly workgroupSize: 1;
+  readonly workgroupSize: 64;
   readonly uniformWords: 5;
   readonly bindings: {
     readonly packedWeights: 0;
@@ -267,29 +267,41 @@ fn packed_byte(block_word: u32, byte_offset: u32) -> u32 {
 
 ${shape.weightValue}
 
-@compute @workgroup_size(1)
+var<workgroup> partials: array<f32, 64>;
+
+@compute @workgroup_size(64)
 fn packed_gemv(
-  @builtin(global_invocation_id) invocation: vec3<u32>,
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
   @builtin(num_workgroups) grid: vec3<u32>,
 ) {
   // Reject surplus 2D invocations before flattening can wrap u32.
-  if (invocation.y > (0xffffffffu - invocation.x) / grid.x) {
+  if (group.y > (0xffffffffu - group.x) / grid.x) {
     return;
   }
-  let row = invocation.y * grid.x + invocation.x;
+  let row = group.y * grid.x + group.x;
   if (row >= params.local_rows) {
     return;
   }
   var sum = 0.0f;
-  for (var block = 0u; block < params.blocks_per_row; block += 1u) {
+  for (var column = local.x; column < params.columns; column += 64u) {
+    let block = column / VALUES_PER_BLOCK;
+    let element = column % VALUES_PER_BLOCK;
     let block_word = params.weight_word_offset +
       (row * params.blocks_per_row + block) * WORDS_PER_BLOCK;
-    for (var element = 0u; element < VALUES_PER_BLOCK; element += 1u) {
-      sum += weight_value(block_word, element) *
-        activation[block * VALUES_PER_BLOCK + element];
-    }
+    sum += weight_value(block_word, element) * activation[column];
   }
-  output[params.output_row_offset + row] = sum;
+  partials[local.x] = sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) {
+      partials[local.x] += partials[local.x + stride];
+    }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) {
+    output[params.output_row_offset + row] = partials[0];
+  }
 }
 `;
 }
@@ -302,7 +314,7 @@ function abi(shape: KernelShape): GemvKernelAbi {
     wordsPerBlock: shape.bytesPerBlock / 4,
     bytesPerBlock: shape.bytesPerBlock,
     valuesPerBlock: shape.valuesPerBlock,
-    workgroupSize: 1,
+    workgroupSize: 64,
     uniformWords: 5,
     bindings: Object.freeze({
       packedWeights: 0,

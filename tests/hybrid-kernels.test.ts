@@ -39,6 +39,35 @@ test("defines only the six model-specific hybrid decode kernels", async () => {
   assert.equal(new Set(kernels.map(({ id }) => id)).size, kernels.length);
 });
 
+test("uses cooperative workgroups for attention and recurrent reductions", async () => {
+  const module = await loadKernelModule();
+  const kernels = module.QWEN35_HYBRID_KERNELS as readonly {
+    readonly key: { readonly operation: string };
+    readonly source: string;
+  }[];
+  const sourceFor = (operation: string): string =>
+    kernels.find(({ key }) => key.operation === operation)!.source;
+
+  for (const operation of ["full-attention-prepare", "deltanet-gated-norm"]) {
+    const source = sourceFor(operation);
+    assert.match(source, /@compute @workgroup_size\(64|128\)/);
+    assert.match(source, /var<workgroup>/);
+    assert.match(source, /workgroupBarrier\(\)/);
+  }
+  const online = sourceFor("full-attention-online");
+  assert.match(online, /@compute @workgroup_size\(256\)/);
+  assert.match(online, /dot_partials/);
+  assert.match(online, /workgroupBarrier\(\)/);
+  const recurrent = sourceFor("deltanet-recurrent");
+  assert.match(recurrent, /@compute @workgroup_size\(128, 2, 1\)/);
+  assert.match(recurrent, /query_partials/);
+  assert.match(recurrent, /key_partials/);
+  assert.match(recurrent, /delta_values/);
+  assert.match(recurrent, /key_group \* 64u/);
+  assert.match(recurrent, /local\.y/);
+  assert.match(recurrent, /workgroupBarrier\(\)/);
+});
+
 test("prepares interleaved Q/gate and writes the current packed K/V row", async () => {
   const module = await loadKernelModule();
   const kernels = module.QWEN35_HYBRID_KERNELS as readonly {
@@ -83,9 +112,9 @@ test("streams packed FP16 K/V without a full attention score matrix", async () =
   assert.match(source, /var<storage, read_write> online_state/);
   assert.match(source, /params\.page_index\s*==\s*0u/);
   assert.match(source, /params\.page_index\s*\+\s*1u\s*==\s*params\.page_count/);
-  assert.match(source, /online_state\[state_base\]\s*=\s*running_maximum/);
-  assert.match(source, /online_state\[state_base \+ 1u\]\s*=\s*running_denominator/);
-  assert.match(source, /select\(\s*accumulator\[lane\],[\s\S]*final_page/);
+  assert.match(source, /online_state\[state_base\]\s*=\s*shared_running_maximum/);
+  assert.match(source, /online_state\[state_base \+ 1u\]\s*=\s*shared_running_denominator/);
+  assert.match(source, /select\(\s*accumulator,[\s\S]*final_page/);
   assert.match(source, /for\s*\(var token/);
   assert.doesNotMatch(source, /array\s*<\s*f32\s*,\s*16384/);
   assert.doesNotMatch(source, /\bscores?\b/i);
@@ -116,10 +145,10 @@ test("encodes exact DeltaNet state order and head mapping in WGSL", async () => 
   assert.match(recurrent, /state_values\[state_index\]\s*=\s*decayed/);
   assert.match(
     recurrent,
-    /beta_values\[value_head\]\s*\*\s*\(target_value - memory\)/,
+    /beta_values\[value_head\]\s*\*\s*\n\s*\(convolved_qkv\[4096u \+ value_head \* 128u \+ value_lane\] - memory\)/,
   );
   assert.match(recurrent, /state_values\[state_index\]\s*=\s*updated/);
-  assert.match(recurrent, /query_value\s*\*\s*updated/);
+  assert.match(recurrent, /query_value\s*\*\s*state_values\[state_index\]/);
   assert.match(recurrent, /0\.000001f/);
   assert.match(recurrent, /inverseSqrt\(128\.0f\)/);
   assert.doesNotMatch(recurrent, /\blet\s+target\b/);

@@ -104,6 +104,8 @@ test("public build contains no local control agent or private connection materia
     "qwen35-logits-reduction.js",
     "qwen35-model-loader.d.ts",
     "qwen35-model-loader.js",
+    "qwen35-performance.d.ts",
+    "qwen35-performance.js",
     "qwen35-program.d.ts",
     "qwen35-program.js",
     "qwen35-rolling-layer-weights.d.ts",

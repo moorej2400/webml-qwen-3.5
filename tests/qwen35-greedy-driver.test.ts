@@ -102,6 +102,23 @@ class FakeTokenEngine implements Qwen35GreedyTokenEngine {
   }
 }
 
+class ChunkingTokenEngine extends FakeTokenEngine {
+  readonly chunks: number[] = [];
+
+  async prefillChunk(input: {
+    readonly steps: readonly Qwen35GreedyTokenStep[];
+    readonly signal: AbortSignal;
+  }): Promise<number | null> {
+    input.signal.throwIfAborted();
+    this.chunks.push(input.steps.length);
+    for (const step of input.steps) {
+      this.steps.push(step);
+      this.position += 1;
+    }
+    return input.steps.at(-1)?.predict === true ? 41 : null;
+  }
+}
+
 test("makes the next token state resident before execution can continue", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -200,6 +217,21 @@ test("serial prefill predicts only on the last token and generation reuses it", 
   ]);
   await driver.dispose();
   assert.equal(engine.disposed, true);
+});
+
+test("uses bounded prefill chunks when the engine provides a layer-major path", async () => {
+  const engine = new ChunkingTokenEngine([]);
+  const driver = createQwen35GreedyTextDriver(engine);
+
+  await driver.prefill({
+    tokenIds: Array.from({ length: 10 }, (_, index) => index + 1),
+    signal: new AbortController().signal,
+  });
+
+  assert.deepEqual(engine.chunks, [4, 4, 2]);
+  assert.equal(engine.position, 10);
+  assert.equal(engine.steps.at(-1)?.predict, true);
+  await driver.dispose();
 });
 
 test("expands one image marker into projected visual rows during prefill", async () => {
@@ -702,6 +734,25 @@ test("rolling layer dispatch marks persistent mutation before submission and ret
     signal: new AbortController().signal,
   });
   assert.deepEqual(events, ["mutation", "dispatch", "retire"]);
+
+  const singleFenceEvents: string[] = [];
+  await executeQwen35GreedyRollingLayerDispatch({
+    commands: Object.freeze([]),
+    executor: {
+      async dispatchBatch() { singleFenceEvents.push("dispatch"); },
+      async submittedWorkDone() { singleFenceEvents.push("retire"); },
+    },
+    mutation: {
+      markStateMutation() { singleFenceEvents.push("mutation"); },
+    },
+    signal: new AbortController().signal,
+    waitForRetirement: false,
+  });
+  assert.deepEqual(
+    singleFenceEvents,
+    ["mutation", "dispatch"],
+    "the rolling owner supplies the single destruction fence",
+  );
 
   const cancelled = new AbortController();
   cancelled.abort();

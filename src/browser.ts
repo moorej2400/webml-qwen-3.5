@@ -15,6 +15,7 @@ export * from "./qwen35-final-dispatch.js";
 export * from "./qwen35-full-attention-dispatch.js";
 export * from "./qwen35-logits-dispatch.js";
 export * from "./qwen35-logits-reduction.js";
+export * from "./qwen35-performance.js";
 export * from "./qwen35-session.js";
 export * from "./qwen35-uniform-arena.js";
 export {
@@ -54,6 +55,9 @@ export * from "./qwen35-vision-merger-kernels.js";
 export * from "./qwen35-vision-encoder.js";
 export * from "./qwen35-vision-streaming-executor.js";
 export * from "./qwen35-webgpu-executor.js";
+export type {
+  Qwen35WeightResidencyPolicy,
+} from "./qwen35-weight-upload.js";
 export type {
   Qwen35BrowserLoadOptions,
   Qwen35BorrowedModelDevice,

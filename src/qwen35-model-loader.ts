@@ -68,8 +68,15 @@ import {
 import {
   initializeQwen35WeightExecution,
   type Qwen35UploadRetirementPolicy,
+  type Qwen35WeightResidencyPolicy,
   type Qwen35WeightWriteQueue,
 } from "./qwen35-weight-upload.js";
+import {
+  createQwen35PerformanceCounters,
+  createQwen35PerformanceWriteQueue,
+  type Qwen35PerformanceCounters,
+  type Qwen35PerformanceWriteQueue,
+} from "./qwen35-performance.js";
 import type { Qwen35WebGpuDevice } from "./qwen35-webgpu-executor.js";
 import { createQwen35LazyVisionRuntime } from "./qwen35-vision-runtime.js";
 import type { Qwen35VisionPackagePins } from "./qwen35-vision-package-loader.js";
@@ -147,6 +154,8 @@ export interface Qwen35DriverFactoryContext {
   readonly rollingLayers?: Qwen35RollingLayerStore;
   /** Exact immutable mapping from logical tensors to uploaded shard ranges. */
   readonly packageDirectory: Qwen35PackageDirectory;
+  /** Optional counters shared by production upload and execution paths. */
+  readonly performanceCounters?: Qwen35PerformanceCounters;
 }
 
 export interface Qwen35StateAllocationClearContext {
@@ -154,6 +163,8 @@ export interface Qwen35StateAllocationClearContext {
   readonly device: Qwen35BorrowedModelDevice;
   readonly allocation: GpuAllocation;
   readonly resource: Qwen35HybridStateResource;
+  /** Optional load-scoped counters for queue work performed by state clearing. */
+  readonly performanceCounters?: Qwen35PerformanceCounters;
 }
 
 /** Installation point for the next model-scheduler milestone. */
@@ -186,6 +197,7 @@ export interface Qwen35DriverFactoryBoundary {
 export function createQwen35DriverFactoryBoundary(
   device: Qwen35ModelDevice,
   factory: Qwen35ExecutionDriverFactory,
+  performanceCounters?: Qwen35PerformanceCounters,
 ): Qwen35DriverFactoryBoundary {
   return Object.freeze({
     clearStateAllocation(
@@ -196,6 +208,7 @@ export function createQwen35DriverFactoryBoundary(
         device,
         allocation,
         resource,
+        ...(performanceCounters === undefined ? {} : { performanceCounters }),
       }));
     },
     create(context: Qwen35DriverFactoryBoundaryContext) {
@@ -229,6 +242,8 @@ export interface Qwen35BrowserLoadOptions extends LoadOptions {
   /** Local evidence run override; omitted builds keep the measured device default. */
   readonly uploadLaneBytes?: number;
   readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
+  /** Resident weights are preferred on desktop; rolling remains the mobile fallback. */
+  readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
   readonly gpuLedgerLimitBytes?: bigint;
   /** Explicit local Chrome smoke-test opt-in; public deployments keep HTTPS pins. */
   readonly allowInsecureLocalhost?: boolean;
@@ -634,10 +649,40 @@ export async function cleanupQwen35GpuResources(input: {
 
 export function qwen35AllocatedWeightBytes(
   packageDirectory: Qwen35PackageDirectory,
+  residencyPolicy: "rolling" | "resident" = "rolling",
 ): bigint {
   return qwen35TensorWeightBytes(
-    qwen35PermanentWeightPackage(packageDirectory),
+    residencyPolicy === "resident"
+      ? packageDirectory
+      : qwen35PermanentWeightPackage(packageDirectory),
   );
+}
+
+export function isQwen35AppleMobileBrowser(
+  userAgent = globalThis.navigator?.userAgent ?? "",
+  maxTouchPoints = globalThis.navigator?.maxTouchPoints ?? 0,
+): boolean {
+  return /\b(?:iPhone|iPad|iPod)\b/i.test(userAgent) ||
+    (/\bMacintosh\b/i.test(userAgent) &&
+      (/\bMobile\b/i.test(userAgent) || maxTouchPoints > 1));
+}
+
+function resolveQwen35ResidencyPolicy(
+  options: Qwen35BrowserLoadOptions,
+  packageDirectory: Qwen35PackageDirectory,
+  stateBytes: bigint,
+): Qwen35WeightResidencyPolicy {
+  const requested = options.residencyPolicy ?? "auto";
+  if (requested !== "auto") return requested;
+  if (isQwen35AppleMobileBrowser()) return "rolling";
+  const residentBytes = stateBytes + qwen35TensorWeightBytes(packageDirectory);
+  if (
+    options.gpuLedgerLimitBytes !== undefined &&
+    options.gpuLedgerLimitBytes < residentBytes
+  ) {
+    return "rolling";
+  }
+  return "auto";
 }
 
 const GPU_LEDGER_REPRESENTATION_GUARD = BigInt(Number.MAX_SAFE_INTEGER);
@@ -908,16 +953,31 @@ export async function loadQwen35BrowserResources(
     profileOptions,
   );
   const device = profile.device as unknown;
+  const stateBytesBigInt = planQwen35HybridState(
+    QWEN35_4B_CONFIG.productContextLength,
+  ).totalBytes;
+  const residencyPolicy = resolveQwen35ResidencyPolicy(
+    options,
+    packageDirectory,
+    stateBytesBigInt,
+  );
+  const weightBytesBigInt = qwen35AllocatedWeightBytes(
+    packageDirectory,
+    residencyPolicy === "rolling" ? "rolling" : "resident",
+  );
+  const stateBytes = Number(stateBytesBigInt);
+  const weightBytes = Number(weightBytesBigInt);
   assertQwen35AcquiredModelDevice(device);
   let ledger: AllocationLedger;
   let arena: GpuArena;
   let driverBoundary: Qwen35DriverFactoryBoundary;
+  const performanceCounters = createQwen35PerformanceCounters();
+  const performanceQueue = createQwen35PerformanceWriteQueue({
+    queue: device.queue as Qwen35PerformanceWriteQueue,
+    counters: performanceCounters,
+  });
   try {
-    const stateBytes = planQwen35HybridState(
-      QWEN35_4B_CONFIG.productContextLength,
-    ).totalBytes;
-    const weightBytes = qwen35AllocatedWeightBytes(packageDirectory);
-    const minimumLedgerBytes = stateBytes + weightBytes;
+    const minimumLedgerBytes = stateBytesBigInt + weightBytesBigInt;
     ledger = createQwen35GpuLedger(
       minimumLedgerBytes,
       options.gpuLedgerLimitBytes,
@@ -925,7 +985,11 @@ export async function loadQwen35BrowserResources(
     arena = new GpuArena(device, ledger, {
       bufferShardCapBytes: BigInt(profile.bufferShardCapBytes),
     });
-    driverBoundary = createQwen35DriverFactoryBoundary(device, factory);
+    driverBoundary = createQwen35DriverFactoryBoundary(
+      device,
+      factory,
+      performanceCounters,
+    );
   } catch (error) {
     destroyQwen35DeviceOrThrow(
       device,
@@ -940,9 +1004,6 @@ export async function loadQwen35BrowserResources(
   let tiedEmbedding: Qwen35DiskBackedTiedEmbeddingStore | null = null;
   let rollingLayers: Qwen35RollingLayerStore | null = null;
   try {
-    const stateBytes = Number(planQwen35HybridState(
-      QWEN35_4B_CONFIG.productContextLength,
-    ).totalBytes);
     reportLoadEvent({
       phase: "state_allocate",
       completedBytes: 0,
@@ -967,7 +1028,6 @@ export async function loadQwen35BrowserResources(
     // creation. Prewarming one 256-token page keeps the 16K remainder lazy and
     // establishes persistent state before any driver-private GPU resources.
     await hybridState.ensureCapacity(1, signal);
-    const weightBytes = Number(qwen35AllocatedWeightBytes(packageDirectory));
     reportLoadEvent({
       phase: "weights_allocate",
       completedBytes: 0,
@@ -980,9 +1040,10 @@ export async function loadQwen35BrowserResources(
       packageDirectory,
       storage,
       cached,
-      queue: device.queue,
+      queue: performanceQueue,
       uploadLaneBytes: options.uploadLaneBytes ?? profile.uploadLaneBytes,
       uploadRetirementPolicy: options.uploadRetirementPolicy ?? "window",
+      residencyPolicy,
       signal,
       onWeightsAllocated: (completedBytes) => reportLoadEvent({
         phase: "weights_allocate",
@@ -1009,11 +1070,12 @@ export async function loadQwen35BrowserResources(
         rollingLayers = stagedRollingLayers ?? null;
         if (
           tiedEmbedding === null &&
+          stagedRollingLayers !== undefined &&
           hasQwen35DiskBackedTiedEmbedding(packageDirectory)
         ) {
           tiedEmbedding = await createQwen35DiskBackedTiedEmbeddingStore({
             arena,
-            queue: device.queue,
+            queue: performanceQueue,
             packageDirectory,
             cached,
             rangeReader: createQwen35ModelCacheRangeReader(storage),
@@ -1029,6 +1091,7 @@ export async function loadQwen35BrowserResources(
           hybridState: hybridState!,
           weightDirectory: uploadedWeights,
           packageDirectory,
+          performanceCounters,
           ...(tiedEmbedding === null ? {} : { tiedEmbedding }),
           ...(rollingLayers === null ? {} : { rollingLayers }),
         });
@@ -1060,8 +1123,10 @@ export async function loadQwen35BrowserResources(
   const ownedDriver = driver!;
   const ownedState = hybridState!;
   const ownedWeightDirectory = weightDirectory!;
-  const ownedTiedEmbedding = tiedEmbedding;
-  const ownedRollingLayers = rollingLayers;
+  const ownedTiedEmbedding = ((): Qwen35DiskBackedTiedEmbeddingStore | null =>
+    tiedEmbedding)();
+  const ownedRollingLayers = ((): Qwen35RollingLayerStore | null =>
+    rollingLayers)();
   const sharedGpuExecutor = ownedDriver.sharedGpuExecutor;
   const vision = sharedGpuExecutor === undefined
     ? undefined
@@ -1071,6 +1136,7 @@ export async function loadQwen35BrowserResources(
         arena,
         ledger,
         executor: sharedGpuExecutor,
+        performanceQueue,
         ...(options.fetchImplementation === undefined
           ? {}
           : { fetchImplementation: options.fetchImplementation }),
@@ -1079,6 +1145,38 @@ export async function loadQwen35BrowserResources(
           : { visionPackagePins: options.visionPackagePins }),
       });
   let disposed = false;
+  const performanceMetrics = () => {
+    if (disposed) {
+      performanceCounters.setGpuBreakdown({
+        permanentGpuBytes: 0,
+        transientGpuBytes: 0,
+        stateGpuBytes: 0,
+      });
+      return performanceCounters.snapshot();
+    }
+    const tiedMetrics = ownedTiedEmbedding?.getMetrics();
+    const rollingMetrics = ownedRollingLayers?.getMetrics();
+    const permanentGpuBytes = Number(ownedWeightDirectory.allocatedBytes);
+    const stateGpuBytes = Number(ownedState.allocatedBytes);
+    const currentGpuBytes = Number(ledger.snapshot().currentBytes);
+    performanceCounters.setGpuBreakdown({
+      permanentGpuBytes,
+      // The ledger includes activation, uniform, cache, and vision resources;
+      // subtracting the two owned persistent categories reports all remaining
+      // driver resources as transient without hiding scratch allocations.
+      transientGpuBytes: Math.max(
+        0,
+        currentGpuBytes - permanentGpuBytes - stateGpuBytes,
+      ),
+      stateGpuBytes,
+    });
+    return Object.freeze({
+      ...performanceCounters.snapshot(),
+      diskReadBytes:
+        (tiedMetrics?.diskReadBytes ?? 0) +
+        (rollingMetrics?.diskReadBytes ?? 0),
+    });
+  };
   return {
     tokenizer,
     driver: ownedDriver,
@@ -1092,6 +1190,7 @@ export async function loadQwen35BrowserResources(
         peakBytes: Number(snapshot.peakBytes),
       });
     },
+    performanceMetrics,
     deviceLost: device.lost,
     ...(vision === undefined ? {} : { vision }),
     async dispose() {

@@ -78,6 +78,11 @@ export interface Qwen35StagedLogitsTileCommands {
   };
 }
 
+export interface Qwen35StagedLogitsGpuTileCommands {
+  readonly commands: readonly Qwen35LogitsDispatchCommand[];
+  readonly uniformCount: 2;
+}
+
 const STAGED_TILE_TOP_1_KERNEL: Qwen35KernelSource = Object.freeze({
   id: "staged-logits-tile-top-1-decode-portable-f32",
   entryPoint: "main",
@@ -91,13 +96,16 @@ struct Params {
 @group(0) @binding(0) var<storage, read> logits_tile: array<f32>;
 @group(0) @binding(1) var<storage, read_write> candidate: array<u32>;
 @group(0) @binding(2) var<uniform> params: Params;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  if (invocation.x != 0u) { return; }
+var<workgroup> best_scores: array<f32, 64>;
+var<workgroup> best_tokens: array<u32, 64>;
+var<workgroup> best_found: array<u32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
   var found = false;
   var best_score = 0.0f;
   var best_token = 0xffffffffu;
-  for (var row = 0u; row < params.vocabulary_rows; row += 1u) {
+  for (var row = lane; row < params.vocabulary_rows; row += 64u) {
     let score = logits_tile[row];
     let exponent = bitcast<u32>(score) & 0x7f800000u;
     if (exponent == 0x7f800000u) { continue; }
@@ -110,8 +118,141 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
       best_token = token;
     }
   }
-  candidate[0] = bitcast<u32>(best_score);
-  candidate[1] = best_token;
+  best_scores[lane] = best_score;
+  best_tokens[lane] = best_token;
+  best_found[lane] = select(0u, 1u, found);
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (lane < stride && best_found[lane + stride] != 0u) {
+      let other_score = best_scores[lane + stride];
+      let other_token = best_tokens[lane + stride];
+      if (best_found[lane] == 0u || other_score > best_scores[lane] ||
+          (other_score == best_scores[lane] && other_token < best_tokens[lane])) {
+        best_scores[lane] = other_score;
+        best_tokens[lane] = other_token;
+        best_found[lane] = 1u;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    candidate[0] = bitcast<u32>(best_scores[0]);
+    candidate[1] = best_tokens[0];
+  }
+}`,
+});
+
+const STAGED_TILE_GPU_CANDIDATE_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "staged-logits-tile-gpu-candidate-decode-portable-f32",
+  entryPoint: "main",
+  source: /* wgsl */ `
+struct Params {
+  vocabulary_rows: u32,
+  vocabulary_start: u32,
+  candidate_slot: u32,
+  pad: u32,
+}
+@group(0) @binding(0) var<storage, read> logits_tile: array<f32>;
+@group(0) @binding(1) var<storage, read_write> candidate: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+var<workgroup> best_scores: array<f32, 64>;
+var<workgroup> best_tokens: array<u32, 64>;
+var<workgroup> best_found: array<u32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
+  var found = false;
+  var best_score = 0.0f;
+  var best_token = 0xffffffffu;
+  for (var row = lane; row < params.vocabulary_rows; row += 64u) {
+    let score = logits_tile[row];
+    let exponent = bitcast<u32>(score) & 0x7f800000u;
+    if (exponent == 0x7f800000u) { continue; }
+    let token = params.vocabulary_start + row;
+    if (token >= 248070u) { continue; }
+    if (!found || score > best_score ||
+        (score == best_score && token < best_token)) {
+      found = true;
+      best_score = score;
+      best_token = token;
+    }
+  }
+  best_scores[lane] = best_score;
+  best_tokens[lane] = best_token;
+  best_found[lane] = select(0u, 1u, found);
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (lane < stride && best_found[lane + stride] != 0u) {
+      let other_score = best_scores[lane + stride];
+      let other_token = best_tokens[lane + stride];
+      if (best_found[lane] == 0u || other_score > best_scores[lane] ||
+          (other_score == best_scores[lane] && other_token < best_tokens[lane])) {
+        best_scores[lane] = other_score;
+        best_tokens[lane] = other_token;
+        best_found[lane] = 1u;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    let slot = params.candidate_slot * 2u;
+    candidate[slot] = bitcast<u32>(best_scores[0]);
+    candidate[slot + 1u] = best_tokens[0];
+  }
+}`,
+});
+
+const STAGED_FINAL_TOKEN_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "staged-logits-final-token-decode-portable-f32",
+  entryPoint: "main",
+  source: /* wgsl */ `
+struct Params { candidate_count: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<storage, read> candidate: array<u32>;
+@group(0) @binding(1) var<storage, read_write> selected_token: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+var<workgroup> best_scores: array<f32, 64>;
+var<workgroup> best_tokens: array<u32, 64>;
+var<workgroup> best_found: array<u32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
+  var found = false;
+  var best_score = 0.0f;
+  var best_token = 0xffffffffu;
+  for (var slot = lane; slot < params.candidate_count; slot += 64u) {
+    let base = slot * 2u;
+    let score = bitcast<f32>(candidate[base]);
+    let token = candidate[base + 1u];
+    let exponent = bitcast<u32>(score) & 0x7f800000u;
+    if (token == 0xffffffffu || token >= 248070u ||
+        exponent == 0x7f800000u) { continue; }
+    if (!found || score > best_score ||
+        (score == best_score && token < best_token)) {
+      found = true;
+      best_score = score;
+      best_token = token;
+    }
+  }
+  best_scores[lane] = best_score;
+  best_tokens[lane] = best_token;
+  best_found[lane] = select(0u, 1u, found);
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (lane < stride && best_found[lane + stride] != 0u) {
+      let other_score = best_scores[lane + stride];
+      let other_token = best_tokens[lane + stride];
+      if (best_found[lane] == 0u || other_score > best_scores[lane] ||
+          (other_score == best_scores[lane] && other_token < best_tokens[lane])) {
+        best_scores[lane] = other_score;
+        best_tokens[lane] = other_token;
+        best_found[lane] = 1u;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    selected_token[0] = best_tokens[0];
+  }
 }`,
 });
 
@@ -646,5 +787,158 @@ export function assembleQwen35StagedLogitsTileCommands(input: {
       byteLength: 4 as const,
       scalarType: "u32" as const,
     }),
+  });
+}
+
+/** Assembles a streamed tile that writes its winner into a persistent GPU slot. */
+export function assembleQwen35StagedLogitsTileGpuCommands(input: {
+  readonly tile: Qwen35StagedPackedRows;
+  readonly normalizedHidden: Qwen35ForwardBufferSlice;
+  readonly workspace: Qwen35LogitsWorkspaceViews;
+  readonly candidateOutput: Qwen35ForwardBufferSlice;
+  readonly candidateSlot: number;
+  readonly limits: Qwen35ForwardDeviceLimits;
+  readonly uniforms: readonly Qwen35ForwardBufferSlice[];
+}): Qwen35StagedLogitsGpuTileCommands {
+  if (input.uniforms.length !== 2) {
+    throw diagnosticError(
+      "logits-staged-uniform-count-invalid",
+      "Qwen3.5 staged logits require two uniform slots",
+    );
+  }
+  if (
+    !Number.isSafeInteger(input.candidateSlot) ||
+    input.candidateSlot < 0 ||
+    input.candidateSlot >= QWEN35_MATHEMATICAL_TILE_COUNT
+  ) {
+    throw diagnosticError(
+      "logits-staged-candidate-invalid",
+      "Qwen3.5 staged logits candidate slot is invalid",
+    );
+  }
+  const logitsTile = requireWorkspaceResource(
+    input.workspace,
+    "logits-tile",
+    "f32",
+    QWEN35_LOGITS_TILE_ROWS,
+    GPU_BUFFER_USAGE_STORAGE,
+    input.limits,
+  );
+  const candidateBinding = bindSlice(
+    1,
+    "storage",
+    input.candidateOutput,
+    QWEN35_CANDIDATE_CAPACITY * 8,
+    input.limits,
+    "logits-staged-candidate-invalid",
+  );
+  const reductionUniform = bindSlice(
+    2,
+    "uniform",
+    input.uniforms[1]!,
+    16,
+    input.limits,
+    "logits-staged-uniform-invalid",
+  );
+  const gemv = planQwen35StagedTiedLogitsDispatch({
+    tile: input.tile,
+    activation: input.normalizedHidden,
+    output: {
+      buffer: logitsTile.binding.buffer,
+      offset: logitsTile.binding.offset,
+      byteLength: logitsTile.binding.size,
+    },
+    uniform: input.uniforms[0]!,
+    limits: input.limits,
+  });
+  const gemvUniform = gemv.bindings.find(({ kind }) => kind === "uniform");
+  if (gemvUniform === undefined) {
+    throw diagnosticError(
+      "logits-staged-uniform-invalid",
+      "Qwen3.5 staged logits uniform binding is unavailable",
+    );
+  }
+  requireDistinctUniforms([gemvUniform, reductionUniform]);
+  requireNoOverlap([logitsTile.binding, candidateBinding], [
+    gemv.bindings[0]!,
+    gemv.bindings[1]!,
+    gemvUniform,
+    reductionUniform,
+  ]);
+  const plan = planQwen35LogitsTileWinner({
+    vocabularyStart: input.tile.firstRow,
+    vocabularyRows: input.tile.rowCount,
+    candidateSlot: input.candidateSlot,
+  });
+  const tileIndex = input.candidateSlot;
+  return Object.freeze({
+    commands: Object.freeze([
+      Object.freeze({
+        ...gemv,
+        kind: "logits-gemv-piece" as const,
+        tileIndex,
+      }),
+      command({
+        kind: "logits-tile-top-1",
+        tileIndex,
+        kernel: STAGED_TILE_GPU_CANDIDATE_KERNEL,
+        bindings: [
+          Object.freeze({ ...logitsTile.binding, binding: 0 }),
+          Object.freeze({ ...candidateBinding, binding: 1 }),
+          reductionUniform,
+        ],
+        uniformWords: plan.uniformWords,
+        workgroups: plan.workgroups,
+      }),
+    ]),
+    uniformCount: 2 as const,
+  });
+}
+
+/** Assembles the single GPU reduction that follows all streamed tile writes. */
+export function assembleQwen35StagedFinalTokenCommand(input: {
+  readonly candidateOutput: Qwen35ForwardBufferSlice;
+  readonly selectedToken: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+  readonly uniform: Qwen35ForwardBufferSlice;
+}): Qwen35LogitsDispatchCommand {
+  const candidateBinding = bindSlice(
+    0,
+    "storage",
+    input.candidateOutput,
+    QWEN35_CANDIDATE_CAPACITY * 8,
+    input.limits,
+    "logits-staged-candidate-invalid",
+  );
+  const selectedBinding = bindSlice(
+    1,
+    "storage",
+    input.selectedToken,
+    4,
+    input.limits,
+    "logits-staged-selected-token-invalid",
+  );
+  const uniformBinding = bindSlice(
+    2,
+    "uniform",
+    input.uniform,
+    16,
+    input.limits,
+    "logits-staged-uniform-invalid",
+  );
+  requireNoOverlap(
+    [candidateBinding, selectedBinding],
+    [uniformBinding],
+  );
+  const plan = planQwen35FinalTokenSelection({
+    candidateCount: QWEN35_MATHEMATICAL_TILE_COUNT,
+  });
+  return command({
+    kind: "indexed-top-1",
+    tileIndex: null,
+    kernel: STAGED_FINAL_TOKEN_KERNEL,
+    bindings: [candidateBinding, selectedBinding, uniformBinding],
+    uniformWords: plan.uniformWords,
+    workgroups: plan.workgroups,
   });
 }

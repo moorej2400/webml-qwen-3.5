@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import * as runtime from "../src/index.js";
+import type { Qwen35WeightResidencyPolicy } from "../src/index.js";
+
+const publicResidencyPolicy: Qwen35WeightResidencyPolicy = "auto";
+void publicResidencyPolicy;
 
 test("exports mixed tensor conversion and GEMV APIs from the package entrypoint", () => {
   assert.equal(typeof runtime.planConversion, "function");

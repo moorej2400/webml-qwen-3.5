@@ -5,6 +5,7 @@ import type { GpuAllocation, GpuBufferLike } from "../src/gpu-arena.js";
 import {
   createQwen35AllocationClearer,
 } from "../src/qwen35-allocation-clear.js";
+import { createQwen35PerformanceCounters } from "../src/qwen35-performance.js";
 import type {
   Qwen35WebGpuBuffer,
   Qwen35WebGpuDevice,
@@ -142,6 +143,23 @@ test("clears every allocation shard in one submission and waits for retirement",
     "pop",
     "retired",
   ]);
+});
+
+test("accounts allocation clear submissions and retirements", async () => {
+  const { device } = fakeDevice();
+  const counters = createQwen35PerformanceCounters();
+  const buffer: FakeBuffer = { id: "buffer", destroy() {} };
+  const clearer = createQwen35AllocationClearer(device, counters);
+
+  await clearer.clearAllocation(allocation([{
+    buffer,
+    logicalByteOffset: 0n,
+    logicalByteLength: 16n,
+    allocatedByteLength: 16n,
+  }], 16n, 16n));
+
+  assert.equal(counters.snapshot().queueSubmissionCount, 1);
+  assert.equal(counters.snapshot().queueRetirementCount, 1);
 });
 
 test("rejects malformed logical coverage and clear alignment before submission", async () => {

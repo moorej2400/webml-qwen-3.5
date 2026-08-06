@@ -539,3 +539,41 @@ test("creates the execution driver only after every weight upload completes", as
   assert.equal(events.at(-2), "upload-complete");
   assert.equal(events.at(-1), "create:24");
 });
+
+test("resident policy uploads the complete package and skips rolling ownership", async () => {
+  const events: string[] = [];
+  const fixture = arenaWithSplits([[8, 8], [8]]);
+  const initialized = await initializeQwen35WeightExecution({
+    arena: fixture.arena,
+    packageDirectory: packageDirectory(),
+    storage: chunkedStorage(
+      { "shard-0": new Uint8Array(32), "shard-1": new Uint8Array(32) },
+      [32],
+    ),
+    cached: cachedPackage(),
+    queue: memoryQueue(events),
+    uploadLaneBytes: 8,
+    residencyPolicy: "resident",
+    signal: new AbortController().signal,
+    async createDriver(directory, rollingStore) {
+      assert.equal(directory.size, 2);
+      assert.equal(directory.logicalBytes, 24n);
+      assert.equal(rollingStore, undefined);
+      return { marker: "resident-driver" };
+    },
+  });
+
+  assert.equal(initialized.driver.marker, "resident-driver");
+  assert.equal(initialized.rollingStore, undefined);
+  assert.equal(
+    events.filter((event) => event.startsWith("write:")).reduce(
+      (sum, event) => sum + Number(event.split(":").at(-1)),
+      0,
+    ),
+    24,
+  );
+  initialized.directory.destroy();
+  assert.equal(fixture.allocations.every((item) =>
+    item.shards.every((shard) => (shard.buffer as MemoryBuffer).destroyed),
+  ), true);
+});

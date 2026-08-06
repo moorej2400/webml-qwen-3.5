@@ -1,4 +1,8 @@
-import { diagnosticError } from "./diagnostics.js";
+import {
+  ALLOCATION_DIAGNOSTIC_CODES,
+  RuntimeDiagnosticError,
+  diagnosticError,
+} from "./diagnostics.js";
 import type {
   CachedModelPackage,
   ModelCacheStorage,
@@ -33,6 +37,18 @@ export interface Qwen35WeightWriteQueue {
 }
 
 export type Qwen35UploadRetirementPolicy = "window" | "per-write";
+export type Qwen35WeightResidencyPolicy = "rolling" | "resident" | "auto";
+
+const RETRYABLE_RESIDENT_FAILURES = new Set<string>(
+  ALLOCATION_DIAGNOSTIC_CODES,
+);
+
+function isRetryableResidentFailure(error: unknown): boolean {
+  return (
+    error instanceof RuntimeDiagnosticError &&
+    RETRYABLE_RESIDENT_FAILURES.has(error.code)
+  );
+}
 
 interface UploadSegment {
   readonly tensor: Qwen35TensorWeight;
@@ -436,8 +452,7 @@ export async function uploadQwen35CachedWeights(input: {
   input.signal.throwIfAborted();
 }
 
-/** Transfers weight ownership to a driver only after all queued writes settle. */
-export async function initializeQwen35WeightExecution<T>(input: {
+async function initializeQwen35WeightExecutionAttempt<T>(input: {
   readonly arena: Qwen35WeightArena;
   readonly packageDirectory: Qwen35PackageDirectory;
   readonly storage: ModelCacheStorage;
@@ -445,6 +460,7 @@ export async function initializeQwen35WeightExecution<T>(input: {
   readonly queue: Qwen35WeightWriteQueue;
   readonly uploadLaneBytes: number;
   readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
+  readonly residencyPolicy: "rolling" | "resident";
   readonly signal: AbortSignal;
   readonly onWeightsAllocated?: (completedBytes: number) => void;
   readonly onWeightsUploaded?: (completedBytes: number) => void;
@@ -458,8 +474,12 @@ export async function initializeQwen35WeightExecution<T>(input: {
   readonly rollingStore?: Qwen35RollingLayerStore;
   readonly driver: T;
 }> {
-  const residentPackage = qwen35PermanentWeightPackage(input.packageDirectory);
-  const usesRollingLayers = hasQwen35RollingLayerSet(input.packageDirectory);
+  const residentPackage = input.residencyPolicy === "resident"
+    ? input.packageDirectory
+    : qwen35PermanentWeightPackage(input.packageDirectory);
+  const usesRollingLayers =
+    input.residencyPolicy === "rolling" &&
+    hasQwen35RollingLayerSet(input.packageDirectory);
   const directory = await allocateQwen35WeightDirectory(
     input.arena,
     residentPackage,
@@ -535,5 +555,58 @@ export async function initializeQwen35WeightExecution<T>(input: {
       );
     }
     throw error;
+  }
+}
+
+/** Transfers weight ownership to a driver only after all queued writes settle. */
+export async function initializeQwen35WeightExecution<T>(input: {
+  readonly arena: Qwen35WeightArena;
+  readonly packageDirectory: Qwen35PackageDirectory;
+  readonly storage: ModelCacheStorage;
+  readonly cached: CachedModelPackage;
+  readonly queue: Qwen35WeightWriteQueue;
+  readonly uploadLaneBytes: number;
+  readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
+  readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
+  readonly signal: AbortSignal;
+  readonly onWeightsAllocated?: (completedBytes: number) => void;
+  readonly onWeightsUploaded?: (completedBytes: number) => void;
+  readonly onDriverInitialize?: () => void;
+  readonly createDriver: (
+    directory: Qwen35WeightDirectoryView,
+    rollingStore?: Qwen35RollingLayerStore,
+  ) => Promise<T>;
+}): Promise<{
+  readonly directory: Qwen35WeightDirectory;
+  readonly rollingStore?: Qwen35RollingLayerStore;
+  readonly driver: T;
+}> {
+  const policy = input.residencyPolicy ?? "rolling";
+  if (policy !== "rolling" && policy !== "resident" && policy !== "auto") {
+    throw diagnosticError(
+      "model-residency-policy-invalid",
+      "The Qwen3.5 weight residency policy is invalid",
+    );
+  }
+  if (policy !== "auto") {
+    return initializeQwen35WeightExecutionAttempt({
+      ...input,
+      residencyPolicy: policy,
+    });
+  }
+  try {
+    return await initializeQwen35WeightExecutionAttempt({
+      ...input,
+      residencyPolicy: "resident",
+    });
+  } catch (error) {
+    if (!isRetryableResidentFailure(error)) throw error;
+    // A failed resident allocation can be retried only after the attempt has
+    // completed its transactional rollback. The rolling path preserves the
+    // proven iPhone fallback without exposing a half-owned GPU directory.
+    return initializeQwen35WeightExecutionAttempt({
+      ...input,
+      residencyPolicy: "rolling",
+    });
   }
 }

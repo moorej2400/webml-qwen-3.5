@@ -60,6 +60,7 @@ test("defines only fixed Qwen vision layer kernels", () => {
   assert.match(attention.source, /var<workgroup> has_key: u32/u);
   assert.match(attention.source, /workgroupBarrier\(\)/u);
   assert.match(attention.source, /for \(var key_token = 0u; key_token < 256u/u);
+  assert.match(attention.source, /current = select\(0\.0f, exp\(score - next_maximum\), enabled\)/u);
   assert.match(linear.source, /packed_weight\[\(row_base \+ column\) \/ 2u\]/u);
   assert.match(gelu.source, /clamp\([^;]+, -10\.0f, 10\.0f\)/u);
 });

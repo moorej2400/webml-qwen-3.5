@@ -4,6 +4,7 @@ import type {
   Qwen35WebGpuBuffer,
   Qwen35WebGpuDevice,
 } from "./qwen35-webgpu-executor.js";
+import type { Qwen35PerformanceCounters } from "./qwen35-performance.js";
 
 interface ClearRange {
   readonly buffer: Qwen35WebGpuBuffer;
@@ -74,10 +75,15 @@ function planClearRanges(allocation: GpuAllocation): readonly ClearRange[] {
 
 class BoundQwen35AllocationClearer implements Qwen35AllocationClearer {
   readonly #device: Qwen35WebGpuDevice;
+  readonly #performanceCounters: Qwen35PerformanceCounters | undefined;
   #poisoned = false;
 
-  constructor(device: Qwen35WebGpuDevice) {
+  constructor(
+    device: Qwen35WebGpuDevice,
+    performanceCounters?: Qwen35PerformanceCounters,
+  ) {
     this.#device = device;
+    this.#performanceCounters = performanceCounters;
   }
 
   async clearAllocation(allocation: GpuAllocation): Promise<void> {
@@ -107,6 +113,7 @@ class BoundQwen35AllocationClearer implements Qwen35AllocationClearer {
         encoder.clearBuffer(range.buffer, 0, range.size);
       }
       this.#device.queue.submit([encoder.finish()]);
+      this.#performanceCounters?.recordQueueSubmission();
     } catch {
       this.#poisoned = true;
       try {
@@ -130,6 +137,7 @@ class BoundQwen35AllocationClearer implements Qwen35AllocationClearer {
     let retirementFailed = false;
     try {
       await this.#device.queue.onSubmittedWorkDone();
+      this.#performanceCounters?.recordQueueRetirement();
     } catch {
       retirementFailed = true;
     }
@@ -158,6 +166,7 @@ class BoundQwen35AllocationClearer implements Qwen35AllocationClearer {
  */
 export function createQwen35AllocationClearer(
   device: Qwen35WebGpuDevice,
+  performanceCounters?: Qwen35PerformanceCounters,
 ): Qwen35AllocationClearer {
-  return new BoundQwen35AllocationClearer(device);
+  return new BoundQwen35AllocationClearer(device, performanceCounters);
 }

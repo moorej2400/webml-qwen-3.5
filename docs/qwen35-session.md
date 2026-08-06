@@ -43,14 +43,18 @@ and peak owned bytes, including driver scratch allocations.
 Production loading installs the model-specific greedy text driver by default.
 Tests may still inject a `Qwen35ExecutionDriverFactory`. The production driver
 executes packed embedding, all 32 language layers, final normalization, tiled
-tied logits, and GPU top-1 reduction. It submits one model batch per processed
-token, retires the queue before advancing HybridState, and reads back only the
-selected u32 token.
+tied logits, and GPU top-1 reduction. Decode submits one model batch per
+processed token, retires the queue before advancing HybridState, and reads back
+only the selected u32 token. Prefill uses the bounded layer-major schedule
+described below.
 
-Prefill is serial and computes logits only for the final prompt token. A
-predicted token is cached until it is emitted. An emitted token remains pending
-until the next decode step ingests it, so generation can continue across a
-natural token limit or cancellation at a yield without repetition. If
+Prefill uses bounded four-token chunks when the GPU driver can allocate the
+optional transient pool. It runs layer-major and computes logits only for the
+final prompt token. Devices that cannot allocate that pool keep the serial
+transactional fallback. A predicted token is cached until it is emitted. An
+emitted token remains pending until the next decode step ingests it, so
+generation can continue across a natural token limit or cancellation at a
+yield without repetition. If
 cancellation crosses submitted generation work, the driver fails closed and
 requires disposal instead of publishing reusable state.
 

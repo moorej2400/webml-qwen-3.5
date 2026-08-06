@@ -326,7 +326,7 @@ var<workgroup> partial: array<f32, 64>; var<workgroup> maximum: f32; var<workgro
       partial[0] = partial[0] + partial[1];
       let score = select(-3.402823466e+38f, partial[0] * 0.125f, enabled); let next_maximum = max(maximum, score);
       prior = select(exp(maximum - next_maximum), 0.0f, has_key == 0u);
-      current = select(exp(score - next_maximum), 0.0f, enabled);
+      current = select(0.0f, exp(score - next_maximum), enabled);
       denominator = denominator * prior + current; maximum = next_maximum;
       has_key = select(has_key, 1u, enabled);
     }

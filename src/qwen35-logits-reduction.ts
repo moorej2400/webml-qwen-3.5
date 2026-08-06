@@ -25,7 +25,7 @@ export interface Qwen35LogitsReductionKernel {
   readonly abi: Readonly<{
     readonly bindings: Readonly<Record<string, number>>;
     readonly uniformWords: 4;
-    readonly workgroupSize: 1;
+    readonly workgroupSize: 64;
   }>;
 }
 
@@ -118,13 +118,16 @@ struct Params {
 @group(0) @binding(1) var<storage, read_write> candidate_scores: array<f32>;
 @group(0) @binding(2) var<storage, read_write> candidate_token_ids: array<u32>;
 @group(0) @binding(3) var<uniform> params: Params;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  if (invocation.x != 0u) { return; }
+var<workgroup> best_scores: array<f32, 64>;
+var<workgroup> best_tokens: array<u32, 64>;
+var<workgroup> best_found: array<u32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
   var found = false;
   var best_score = 0.0f;
   var best_token = 0xffffffffu;
-  for (var row = 0u; row < params.vocabulary_rows; row += 1u) {
+  for (var row = lane; row < params.vocabulary_rows; row += 64u) {
     let score = logits_tile[row];
     let exponent = bitcast<u32>(score) & 0x7f800000u;
     if (exponent == 0x7f800000u) { continue; }
@@ -137,8 +140,27 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
       best_token = token;
     }
   }
-  candidate_scores[params.candidate_slot] = best_score;
-  candidate_token_ids[params.candidate_slot] = best_token;
+  best_scores[lane] = best_score;
+  best_tokens[lane] = best_token;
+  best_found[lane] = select(0u, 1u, found);
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (lane < stride && best_found[lane + stride] != 0u) {
+      let other_score = best_scores[lane + stride];
+      let other_token = best_tokens[lane + stride];
+      if (best_found[lane] == 0u || other_score > best_scores[lane] ||
+          (other_score == best_scores[lane] && other_token < best_tokens[lane])) {
+        best_scores[lane] = other_score;
+        best_tokens[lane] = other_token;
+        best_found[lane] = 1u;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) {
+    candidate_scores[params.candidate_slot] = best_scores[0];
+    candidate_token_ids[params.candidate_slot] = best_tokens[0];
+  }
 }`;
 
 const INDEXED_TOP_1_WGSL = /* wgsl */ `
@@ -147,14 +169,17 @@ struct Params { candidate_count: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(1) var<storage, read> candidate_token_ids: array<u32>;
 @group(0) @binding(2) var<storage, read_write> selected_token: array<u32>;
 @group(0) @binding(3) var<uniform> params: Params;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  if (invocation.x != 0u) { return; }
-  selected_token[0] = 0xffffffffu;
+var<workgroup> best_scores: array<f32, 64>;
+var<workgroup> best_tokens: array<u32, 64>;
+var<workgroup> best_found: array<u32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) local: vec3<u32>) {
+  let lane = local.x;
+  if (lane == 0u) selected_token[0] = 0xffffffffu;
   var found = false;
   var best_score = 0.0f;
   var best_token = 0xffffffffu;
-  for (var slot = 0u; slot < params.candidate_count; slot += 1u) {
+  for (var slot = lane; slot < params.candidate_count; slot += 64u) {
     let token = candidate_token_ids[slot];
     let score = candidate_scores[slot];
     let exponent = bitcast<u32>(score) & 0x7f800000u;
@@ -167,7 +192,24 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
       best_token = token;
     }
   }
-  selected_token[0] = best_token;
+  best_scores[lane] = best_score;
+  best_tokens[lane] = best_token;
+  best_found[lane] = select(0u, 1u, found);
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (lane < stride && best_found[lane + stride] != 0u) {
+      let other_score = best_scores[lane + stride];
+      let other_token = best_tokens[lane + stride];
+      if (best_found[lane] == 0u || other_score > best_scores[lane] ||
+          (other_score == best_scores[lane] && other_token < best_tokens[lane])) {
+        best_scores[lane] = other_score;
+        best_tokens[lane] = other_token;
+        best_found[lane] = 1u;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lane == 0u) selected_token[0] = best_tokens[0];
 }`;
 
 function kernel(
@@ -183,7 +225,7 @@ function kernel(
     abi: Object.freeze({
       bindings: Object.freeze({ ...bindings }),
       uniformWords: 4,
-      workgroupSize: 1,
+      workgroupSize: 64,
     }),
   });
 }

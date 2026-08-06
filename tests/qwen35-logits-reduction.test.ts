@@ -115,10 +115,16 @@ test("defines separate tile and indexed reduction kernels with actual token ids"
   const final = QWEN35_LOGITS_REDUCTION_KERNELS[1]!;
   assert.equal(tile.abi.bindings.logitsTile, 0);
   assert.equal(tile.abi.bindings.candidateTokenIds, 2);
+  assert.equal(tile.abi.workgroupSize, 64);
+  assert.match(tile.source, /@workgroup_size\(64\)/);
+  assert.match(tile.source, /workgroupBarrier\(\)/);
   assert.match(tile.source, /params\.vocabulary_start \+ row/);
   assert.match(tile.source, /token >= 248070u/);
   assert.match(tile.source, /candidate_token_ids\[params\.candidate_slot\]/);
   assert.equal(final.abi.bindings.selectedToken, 2);
+  assert.equal(final.abi.workgroupSize, 64);
+  assert.match(final.source, /@workgroup_size\(64\)/);
+  assert.match(final.source, /workgroupBarrier\(\)/);
   assert.match(final.source, /candidate_token_ids\[slot\]/);
   assert.match(final.source, /token >= 248070u/);
   assert.match(final.source, /selected_token\[0\] = 0xffffffffu/);

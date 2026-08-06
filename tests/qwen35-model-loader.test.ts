@@ -16,6 +16,7 @@ import {
   createQwen35DriverFactoryBoundary,
   createQwen35GpuLedger,
   loadQwen35BrowserResources,
+  isQwen35AppleMobileBrowser,
   qwen35AllocatedWeightBytes,
   snapshotQwen35Manifest,
   type Qwen35DriverFactoryContext,
@@ -37,6 +38,14 @@ const driver: Qwen35ExecutionDriver = {
   async reset() {},
   async dispose() {},
 };
+
+test("detects iPad desktop-mode Safari from touch capability", () => {
+  const desktopModeIpad =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15";
+  assert.equal(isQwen35AppleMobileBrowser(desktopModeIpad, 5), true);
+  assert.equal(isQwen35AppleMobileBrowser(desktopModeIpad, 1), false);
+});
 
 function borrowedDeviceDoesNotExposeOwnership(
   context: Qwen35DriverFactoryContext,

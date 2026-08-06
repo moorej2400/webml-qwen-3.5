@@ -1,4 +1,5 @@
 import { diagnosticError, isSafeDiagnosticCode } from "./diagnostics.js";
+import type { Qwen35PerformanceCounters } from "./qwen35-performance.js";
 
 const GPU_BUFFER_USAGE_COPY_DST = 0x0008;
 const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
@@ -202,6 +203,7 @@ function validateDispatch(
 /** Executes only the fixed Qwen3.5 command plans assembled by the model driver. */
 export class Qwen35WebGpuExecutor {
   readonly #device: Qwen35WebGpuDevice;
+  readonly #performanceCounters: Qwen35PerformanceCounters | undefined;
   readonly #pipelines = new Map<number, Promise<Qwen35ComputePipeline>>();
   readonly #bindGroups = new Map<string, unknown>();
   readonly #bufferIds = new WeakMap<object, number>();
@@ -216,8 +218,12 @@ export class Qwen35WebGpuExecutor {
   #poisoned = false;
   #disposePromise: Promise<void> | null = null;
 
-  constructor(device: Qwen35WebGpuDevice) {
+  constructor(
+    device: Qwen35WebGpuDevice,
+    performanceCounters?: Qwen35PerformanceCounters,
+  ) {
     this.#device = device;
+    this.#performanceCounters = performanceCounters;
   }
 
   createUniform(label: string, values: ArrayBufferView<ArrayBuffer>): Qwen35OwnedUniform {
@@ -283,6 +289,7 @@ export class Qwen35WebGpuExecutor {
         values.byteOffset,
         values.byteLength,
       );
+      this.#performanceCounters?.recordGpuUpload(values.byteLength);
     } catch {
       this.#poisoned = true;
       throw diagnosticError(
@@ -347,6 +354,8 @@ export class Qwen35WebGpuExecutor {
       });
       pass.end();
       this.#device.queue.submit([encoder.finish()]);
+      this.#performanceCounters?.recordDispatch(requests.length);
+      this.#performanceCounters?.recordQueueSubmission();
     } catch {
       await this.#retireFailedScope();
       throw diagnosticError(
@@ -375,6 +384,7 @@ export class Qwen35WebGpuExecutor {
 
   async submittedWorkDone(): Promise<void> {
     await this.#device.queue.onSubmittedWorkDone();
+    this.#performanceCounters?.recordQueueRetirement();
   }
 
   /** Drops bindings that may retain caller-owned rolling GPU buffers. */
@@ -577,6 +587,8 @@ export class Qwen35WebGpuExecutor {
       });
       encoder.copyBufferToBuffer(source, byteOffset, readback, 0, 4);
       this.#device.queue.submit([encoder.finish()]);
+      this.#performanceCounters?.recordGpuReadback();
+      this.#performanceCounters?.recordQueueSubmission();
     } catch {
       await this.#retireFailedScope();
       this.#releaseOwnedBuffer(readback);

@@ -39,6 +39,7 @@ import {
   type Qwen35VisionProjectedTokens,
 } from "./qwen35-vision-encoder.js";
 import type { Qwen35WebGpuDevice, Qwen35WebGpuExecutor } from "./qwen35-webgpu-executor.js";
+import type { Qwen35PerformanceWriteQueue } from "./qwen35-performance.js";
 import { createQwen35UniformArena, type Qwen35UniformArena } from "./qwen35-uniform-arena.js";
 
 const GPU_BUFFER_USAGE_COPY_DST = 0x0008;
@@ -50,7 +51,7 @@ const VISION_LAYER_UNIFORM_OFFSET = 3;
 
 type SharedGpuExecutor = Pick<
   Qwen35WebGpuExecutor,
-  "dispatchBatch" | "submittedWorkDone" | "dispose"
+  "dispatchBatch" | "submittedWorkDone" | "releaseBindGroups" | "dispose"
 >;
 
 export interface Qwen35VisionRuntimeInput {
@@ -59,6 +60,7 @@ export interface Qwen35VisionRuntimeInput {
   readonly arena: GpuArena;
   readonly ledger: AllocationLedger;
   readonly executor: SharedGpuExecutor;
+  readonly performanceQueue?: Qwen35PerformanceWriteQueue;
   readonly fetchImplementation?: typeof fetch;
   readonly visionPackagePins?: Qwen35VisionPackagePins;
 }
@@ -104,21 +106,29 @@ function limits(device: Qwen35WebGpuDevice): Qwen35ForwardDeviceLimits {
   });
 }
 
-function queueForVision(device: Qwen35WebGpuDevice): Qwen35VisionGpuQueue {
+function queueForVision(
+  device: Qwen35WebGpuDevice,
+  performanceQueue?: Qwen35PerformanceWriteQueue,
+): Qwen35VisionGpuQueue {
+  const queue = performanceQueue ?? device.queue;
   return {
     writeBuffer(buffer, bufferOffset, data, dataOffset = 0, size = data.byteLength - dataOffset) {
-      device.queue.writeBuffer(buffer, bufferOffset, data.buffer as ArrayBuffer, data.byteOffset + dataOffset, size);
+      queue.writeBuffer(buffer, bufferOffset, data.buffer as ArrayBuffer, data.byteOffset + dataOffset, size);
     },
-    onSubmittedWorkDone: () => device.queue.onSubmittedWorkDone(),
+    onSubmittedWorkDone: () => queue.onSubmittedWorkDone(),
   };
 }
 
-function activationQueueForVision(device: Qwen35WebGpuDevice): Qwen35VisionActivationQueue {
+function activationQueueForVision(
+  device: Qwen35WebGpuDevice,
+  performanceQueue?: Qwen35PerformanceWriteQueue,
+): Qwen35VisionActivationQueue {
+  const queue = performanceQueue ?? device.queue;
   return {
     writeBuffer(buffer, bufferOffset, data, dataOffset, size) {
-      device.queue.writeBuffer(buffer, bufferOffset, data, dataOffset, size);
+      queue.writeBuffer(buffer, bufferOffset, data, dataOffset, size);
     },
-    onSubmittedWorkDone: () => device.queue.onSubmittedWorkDone(),
+    onSubmittedWorkDone: () => queue.onSubmittedWorkDone(),
   };
 }
 
@@ -300,8 +310,8 @@ export async function createQwen35VisionOperation(input: {
   if (!Number.isSafeInteger(patchCount) || patchCount < 4 || patchCount > 16_384 || patchCount % 4 !== 0 || input.patches.length !== patchCount * VISION_PATCH_SCALARS) {
     fail("vision-runtime-input-invalid", "Vision runtime input is invalid");
   }
-  const queue = queueForVision(runtime.device);
-  const activationQueue = activationQueueForVision(runtime.device);
+  const queue = queueForVision(runtime.device, runtime.performanceQueue);
+  const activationQueue = activationQueueForVision(runtime.device, runtime.performanceQueue);
   const workspace = await createWorkspace({
     arena: runtime.arena,
     queue: activationQueue,
@@ -339,8 +349,9 @@ export async function createQwen35VisionOperation(input: {
   const uploadPatches = async (patches: Float32Array, signal: AbortSignal): Promise<void> => {
     signal.throwIfAborted();
     if (patches.byteLength !== input.patches.byteLength) fail("vision-patches-input-invalid", "Vision patch byte length changed");
-    runtime.device.queue.writeBuffer(patchStorage.buffer, 0, patches.buffer as ArrayBuffer, patches.byteOffset, patches.byteLength);
-    await runtime.device.queue.onSubmittedWorkDone();
+    const patchQueue = runtime.performanceQueue ?? runtime.device.queue;
+    patchQueue.writeBuffer(patchStorage.buffer, 0, patches.buffer as ArrayBuffer, patches.byteOffset, patches.byteLength);
+    await patchQueue.onSubmittedWorkDone();
   };
   const foundation = (staged: Qwen35VisionGpuStagedGroup): readonly Qwen35VisionFoundationDispatchPlan[] => planQwen35VisionBootstrapFoundationDispatches({ bootstrap: staged, workspace: foundationWorkspace(workspace), gridHeight: input.gridHeight, gridWidth: input.gridWidth, limits: limitsView });
   const runFoundation = async (plans: readonly Qwen35VisionFoundationDispatchPlan[], signal: AbortSignal): Promise<void> => {
@@ -405,6 +416,7 @@ export async function createQwen35VisionOperation(input: {
       let first: unknown;
       try { await streaming?.dispose(); } catch (error) { first ??= error; }
       try { await queue.onSubmittedWorkDone(); } catch (error) { first ??= error; }
+      try { runtime.executor.releaseBindGroups(); } catch (error) { first ??= error; }
       if (!patchReleased) {
         try {
           workspace.patchAllocation.destroy();

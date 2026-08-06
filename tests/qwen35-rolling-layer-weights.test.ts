@@ -468,6 +468,10 @@ test("plans every transformer layer for streaming with only the output norm perm
   );
   assert.deepEqual(source.tensors.map((tensor) => tensor.name), originalNames);
   assert.equal(qwen35AllocatedWeightBytes(source), EXACT_PERMANENT_BYTES);
+  assert.equal(
+    qwen35AllocatedWeightBytes(source, "resident"),
+    EXACT_LANGUAGE_BYTES,
+  );
 });
 
 test("composes all-layer streaming after the tied Q6_K table and preserves 16K vision contracts", async () => {
@@ -508,6 +512,10 @@ test("composes all-layer streaming after the tied Q6_K table and preserves 16K v
   assert.equal(rollingPlan.streamedBytes, EXACT_STREAMED_BYTES);
   assert.equal(rollingPlan.permanentBytes, EXACT_PERMANENT_BYTES);
   assert.equal(qwen35AllocatedWeightBytes(packageDirectory), EXACT_PERMANENT_BYTES);
+  assert.equal(
+    qwen35AllocatedWeightBytes(packageDirectory, "resident"),
+    EXACT_LANGUAGE_BYTES + BigInt(tiedBytes),
+  );
   assert.deepEqual(
     rollingPlan.permanentDirectory.tensors.map(({ name }) => name),
     ["output_norm.weight"],
@@ -580,6 +588,39 @@ test("initial allocation and upload exclude every blk.0 through blk.31 tensor", 
   );
   assert.equal(gpu.ledger.snapshot().currentBytes, 4n);
   await initialized.rollingStore.dispose();
+  initialized.directory.destroy();
+  assert.equal(gpu.ledger.snapshot().currentBytes, 0n);
+});
+
+test("resident policy keeps transformer layers in the uploaded directory", async () => {
+  const fixture = smallDirectory();
+  const gpu = gpuFixture();
+  let callbackDirectory: Qwen35WeightDirectoryView | undefined;
+  let callbackStore: RollingLayerStore | undefined;
+  const initialized = await initializeQwen35WeightExecution({
+    arena: gpu.arena,
+    packageDirectory: fixture.packageDirectory,
+    storage: storage(fixture),
+    cached: fixture.cached,
+    queue: gpu.queue,
+    uploadLaneBytes: 8,
+    residencyPolicy: "resident",
+    signal: new AbortController().signal,
+    async createDriver(directory, rollingStore) {
+      callbackDirectory = directory;
+      callbackStore = rollingStore;
+      return Object.freeze({ ready: true });
+    },
+  });
+
+  assert.equal(callbackDirectory, initialized.directory.view);
+  assert.equal(callbackStore, undefined);
+  assert.equal(initialized.rollingStore, undefined);
+  assert.equal(initialized.directory.size, 33);
+  assert.equal(
+    initialized.directory.tensors.some((tensor) => tensor.name.startsWith("blk.")),
+    true,
+  );
   initialized.directory.destroy();
   assert.equal(gpu.ledger.snapshot().currentBytes, 0n);
 });

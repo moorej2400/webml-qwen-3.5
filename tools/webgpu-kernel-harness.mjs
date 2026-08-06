@@ -28,6 +28,10 @@ import {
 } from "../dist/src/qwen-embedding.js";
 import { QWEN35_HYBRID_KERNELS } from "../dist/src/hybrid-kernels.js";
 import {
+  assembleQwen35StagedFinalTokenCommand,
+  assembleQwen35StagedLogitsTileGpuCommands,
+} from "../dist/src/qwen35-logits-dispatch.js";
+import {
   QWEN35_VISION_FOUNDATION_KERNELS,
   visionAddLearnedPositionCpu,
   visionApply2dRopeCpu,
@@ -272,7 +276,7 @@ async function createPipeline(device, kernel) {
   }
   return device.createComputePipelineAsync({
     layout: "auto",
-    compute: { module, entryPoint: "main" },
+    compute: { module, entryPoint: kernel.entryPoint },
   });
 }
 
@@ -441,7 +445,7 @@ async function runVectorPrimitive(device, kernel) {
     resource: {
       buffer: outputBuffer,
       offset: output.outputRowOffset * 4,
-      size: (fixture.expected.length + 1) * 4,
+      size: output.expected.byteLength - output.outputRowOffset * 4,
     },
   });
   entries.push({
@@ -520,7 +524,7 @@ async function runMropePrimitive(device, kernel) {
         resource: {
           buffer: outputBuffer,
           offset: output.outputRowOffset * 4,
-          size: (expectedValues.length + 1) * 4,
+          size: output.expected.byteLength - output.outputRowOffset * 4,
         },
       },
       { binding: 2, resource: { buffer: sectionsBuffer } },
@@ -707,7 +711,7 @@ async function runEmbedding(device, kernel) {
         resource: {
           buffer: outputBuffer,
           offset: output.outputRowOffset * 4,
-          size: (expectedValues.length + 1) * 4,
+          size: output.expected.byteLength - output.outputRowOffset * 4,
         },
       },
       { binding: 2, resource: { buffer: uniforms } },
@@ -1052,9 +1056,14 @@ async function runFullAttentionOnline(device, kernel) {
     floatBytes(output.initial),
     GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   );
+  const onlineStateBuffer = storageBuffer(
+    device,
+    floatBytes(new Float32Array(16 * 2)),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
   const uniforms = storageBuffer(
     device,
-    uintBytes(Uint32Array.of(tokenCount, 1, 2, 0)),
+    uintBytes(Uint32Array.of(tokenCount, 0, 1, 0)),
     GPUBufferUsage.UNIFORM,
   );
   const [actualBytes] = await dispatchAndRead(
@@ -1069,10 +1078,11 @@ async function runFullAttentionOnline(device, kernel) {
         resource: {
           buffer: outputBuffer,
           offset: output.outputRowOffset * 4,
-          size: (expectedValues.length + 1) * 4,
+          size: output.expected.byteLength - output.outputRowOffset * 4,
         },
       },
-      { binding: 4, resource: { buffer: uniforms } },
+      { binding: 4, resource: { buffer: onlineStateBuffer } },
+      { binding: 5, resource: { buffer: uniforms } },
     ],
     [{ buffer: outputBuffer, byteLength: output.expected.byteLength }],
     { x: 16, y: 1, z: 1 },
@@ -1139,7 +1149,7 @@ async function runDeltaNetConv(device, kernel) {
         resource: {
           buffer: outputBuffer,
           offset: output.outputRowOffset * 4,
-          size: (expectedValues.length + 1) * 4,
+          size: output.expected.byteLength - output.outputRowOffset * 4,
         },
       },
     ],
@@ -1214,7 +1224,7 @@ async function runDeltaNetParameters(device, kernel) {
         resource: {
           buffer: betaBuffer,
           offset: betaOutput.outputRowOffset * 4,
-          size: (expectedBeta.length + 1) * 4,
+          size: betaOutput.expected.byteLength - betaOutput.outputRowOffset * 4,
         },
       },
       {
@@ -1222,7 +1232,7 @@ async function runDeltaNetParameters(device, kernel) {
         resource: {
           buffer: decayBuffer,
           offset: decayOutput.outputRowOffset * 4,
-          size: (expectedDecay.length + 1) * 4,
+          size: decayOutput.expected.byteLength - decayOutput.outputRowOffset * 4,
         },
       },
     ],
@@ -1358,7 +1368,7 @@ async function runDeltaNetRecurrent(device, kernel) {
         resource: {
           buffer: outputBuffer,
           offset: output.outputRowOffset * 4,
-          size: (expectedValues.length + 1) * 4,
+          size: output.expected.byteLength - output.outputRowOffset * 4,
         },
       },
     ],
@@ -1448,7 +1458,7 @@ async function runDeltaNetGatedNorm(device, kernel) {
         resource: {
           buffer: outputBuffer,
           offset: output.outputRowOffset * 4,
-          size: (expectedValues.length + 1) * 4,
+          size: output.expected.byteLength - output.outputRowOffset * 4,
         },
       },
     ],
@@ -1563,7 +1573,8 @@ async function runVisionLayerKernel(device, kernel) {
   } else if (kernel.key.operation === "vision-online-attention") {
     const query = Float32Array.from({ length: 2 * 1024 }, (_, i) => Math.fround(((i % 29) - 14) / 29)); const key = Float32Array.from({ length: query.length }, (_, i) => Math.fround(((i % 23) - 11) / 23)); const value = Float32Array.from({ length: query.length }, (_, i) => Math.fround(((i % 19) - 9) / 19)); const offsets = Uint32Array.of(0, 2);
     const expected = visionOnlineAttentionCpu({ query, key, value, tokenCount: 2, headCount: 16, headDimension: 64, segmentOffsets: offsets }); const output = storageBuffer(device, floatBytes(new Float32Array(expected.length)), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
-    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: storageBuffer(device, floatBytes(query), GPUBufferUsage.STORAGE) } }, { binding: 1, resource: { buffer: storageBuffer(device, floatBytes(key), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(value), GPUBufferUsage.STORAGE) } }, { binding: 3, resource: { buffer: storageBuffer(device, uintBytes(offsets), GPUBufferUsage.STORAGE) } }, { binding: 4, resource: { buffer: output } }, { binding: 5, resource: { buffer: uniform([2, 1, 0, 0]) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 1, y: 2, z: 16 }); validateParity(kernel.id, expected, new Float32Array(actual), 1e-4);
+    const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: storageBuffer(device, floatBytes(query), GPUBufferUsage.STORAGE) } }, { binding: 1, resource: { buffer: storageBuffer(device, floatBytes(key), GPUBufferUsage.STORAGE) } }, { binding: 2, resource: { buffer: storageBuffer(device, floatBytes(value), GPUBufferUsage.STORAGE) } }, { binding: 3, resource: { buffer: storageBuffer(device, uintBytes(offsets), GPUBufferUsage.STORAGE) } }, { binding: 4, resource: { buffer: output } }, { binding: 5, resource: { buffer: uniform([2, 1, 0, 0]) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 1, y: 2, z: 16 });
+    validateParity(kernel.id, expected, new Float32Array(actual), 1e-4);
   } else if (kernel.key.operation === "vision-tanh-gelu") {
     const values = Float32Array.from({ length: 4096 }, (_, i) => Math.fround(((i % 31) - 15) / 5)); const expected = visionTanhGeluCpu(values); const output = storageBuffer(device, floatBytes(values), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: uniform([4096, 0, 0, 0]) } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 64, y: 1, z: 1 }); validateParity(kernel.id, expected, new Float32Array(actual), 1e-5);
@@ -1582,6 +1593,256 @@ async function runVisionMergerKernel(device, kernel) {
   const [actual] = await dispatchAndRead(device, kernel, [{ binding: 0, resource: { buffer: output } }, { binding: 1, resource: { buffer: uniforms } }], [{ buffer: output, byteLength: expected.byteLength }], { x: 64, y: 1, z: 1 });
   validateParity(kernel.id, expected, new Float32Array(actual), 2e-6);
   return { id: kernel.id, status: "executed" };
+}
+
+function stagedWorkspace(logitsBuffer) {
+  const byteLength = 1_024 * 4;
+  const resource = Object.freeze({
+    kind: "logits-tile",
+    scalarType: "f32",
+    elementCount: 1_024,
+    bytes: BigInt(byteLength),
+    usage: GPUBufferUsage.STORAGE,
+    byteLength,
+    binding: Object.freeze({ buffer: logitsBuffer, offset: 0, size: byteLength }),
+  });
+  return Object.freeze({
+    get(kind) {
+      if (kind !== "logits-tile") throw new Error(`Unexpected staged resource: ${kind}`);
+      return resource;
+    },
+  });
+}
+
+function stagedBindingEntries(command) {
+  return command.bindings.map(({ binding, buffer, offset, size }) => ({
+    binding,
+    resource: { buffer, offset, size },
+  }));
+}
+
+async function runStagedLogitsGpuSelection(device) {
+  const limits = {
+    minStorageBufferOffsetAlignment: 256,
+    minUniformBufferOffsetAlignment: 256,
+    maxStorageBufferBindingSize: 1 << 30,
+    maxUniformBufferBindingSize: 65_536,
+    maxComputeWorkgroupsPerDimension: 65_535,
+  };
+  const tileCount = 243;
+  const tileRows = 1_024;
+  const rowBytes = 2_120;
+  const blocksPerRow = 10;
+  const packed = new Uint8Array(rowBytes * tileRows);
+  for (let rowIndex = 0; rowIndex < tileRows; rowIndex += 1) {
+    for (let blockIndex = 0; blockIndex < blocksPerRow; blockIndex += 1) {
+      packed.set(
+        packedFixture("q6-k-212", rowIndex, blockIndex),
+        rowIndex * rowBytes + blockIndex * 212,
+      );
+    }
+  }
+  const normalizedHidden = Float32Array.from(
+    { length: 2_560 },
+    (_, index) => Math.fround(((index * 17 + 3) % 29 - 14) / 16),
+  );
+  const expectedScores = gemvCpu("q6-k-212", packed, normalizedHidden, {
+    rows: tileRows,
+    columns: 2_560,
+    packedByteOffset: 0,
+  });
+  let expectedWinnerRow = 0;
+  for (let row = 1; row < expectedScores.length; row += 1) {
+    if (
+      expectedScores[row] > expectedScores[expectedWinnerRow] ||
+      (expectedScores[row] === expectedScores[expectedWinnerRow] && row < expectedWinnerRow)
+    ) {
+      expectedWinnerRow = row;
+    }
+  }
+  const logitsBuffer = storageBuffer(
+    device,
+    new Uint8Array(tileRows * 4),
+    GPUBufferUsage.STORAGE,
+  );
+  const normalizedHiddenBuffer = storageBuffer(
+    device,
+    floatBytes(normalizedHidden),
+    GPUBufferUsage.STORAGE,
+  );
+  const packedTileBuffer = storageBuffer(
+    device,
+    packed,
+    GPUBufferUsage.STORAGE,
+  );
+  const candidateWords = new Uint32Array(256 * 2).fill(0xffff_ffff);
+  const candidateBuffer = storageBuffer(
+    device,
+    uintBytes(candidateWords),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const finalUniformOffset = tileCount * 2 * 256;
+  const uniformBuffer = storageBuffer(
+    device,
+    new Uint8Array(finalUniformOffset + 256),
+    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  );
+  const selectedTokenBuffer = storageBuffer(
+    device,
+    uintBytes(Uint32Array.of(0xffff_ffff)),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const tileCommands = [];
+  for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
+    const firstRow = tileIndex * tileRows;
+    const rowCount = Math.min(tileRows, 248_070 - firstRow);
+    const tile = {
+      tensorName: "token_embd.weight",
+      storageType: "q6-k-212",
+      firstRow,
+      rowCount,
+      rowBytes,
+      buffer: packedTileBuffer,
+      bufferOffset: 0,
+      byteLength: rowBytes * rowCount,
+    };
+    const assembled = assembleQwen35StagedLogitsTileGpuCommands({
+      tile,
+      normalizedHidden: {
+        buffer: normalizedHiddenBuffer,
+        offset: 0,
+        byteLength: 10_240,
+      },
+      workspace: stagedWorkspace(logitsBuffer),
+      candidateOutput: {
+        buffer: candidateBuffer,
+        offset: 0,
+        byteLength: 256 * 8,
+      },
+      candidateSlot: tileIndex,
+      limits,
+      uniforms: [
+        { buffer: uniformBuffer, offset: tileIndex * 512, byteLength: 20 },
+        { buffer: uniformBuffer, offset: tileIndex * 512 + 256, byteLength: 20 },
+      ],
+    });
+    const gemvCommand = assembled.commands[0];
+    const candidateCommand = assembled.commands[1];
+    if (gemvCommand === undefined || candidateCommand === undefined) {
+      throw new Error("Staged logits commands are incomplete");
+    }
+    device.queue.writeBuffer(
+      uniformBuffer,
+      tileIndex * 512,
+      uintBytes(Uint32Array.from(gemvCommand.uniformWords)),
+    );
+    device.queue.writeBuffer(
+      uniformBuffer,
+      tileIndex * 512 + 256,
+      uintBytes(Uint32Array.from(candidateCommand.uniformWords)),
+    );
+    tileCommands.push({ gemvCommand, candidateCommand });
+  }
+  const finalCommand = assembleQwen35StagedFinalTokenCommand({
+    candidateOutput: {
+      buffer: candidateBuffer,
+      offset: 0,
+      byteLength: 256 * 8,
+    },
+    selectedToken: {
+      buffer: selectedTokenBuffer,
+      offset: 0,
+      byteLength: 4,
+    },
+    limits,
+    uniform: { buffer: uniformBuffer, offset: finalUniformOffset, byteLength: 20 },
+  });
+  device.queue.writeBuffer(
+    uniformBuffer,
+    finalUniformOffset,
+    uintBytes(Uint32Array.from(finalCommand.uniformWords)),
+  );
+  const gemvPipeline = await createPipeline(device, tileCommands[0].gemvCommand.kernel);
+  const candidatePipeline = await createPipeline(device, tileCommands[0].candidateCommand.kernel);
+  const finalPipeline = await createPipeline(device, finalCommand.kernel);
+  const finalBindGroup = device.createBindGroup({
+    layout: finalPipeline.getBindGroupLayout(0),
+    entries: stagedBindingEntries(finalCommand),
+  });
+  const candidateReadback = device.createBuffer({
+    size: candidateWords.byteLength,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const selectedReadback = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  for (const { gemvCommand, candidateCommand } of tileCommands) {
+    pass.setPipeline(gemvPipeline);
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: gemvPipeline.getBindGroupLayout(0),
+      entries: stagedBindingEntries(gemvCommand),
+    }));
+    pass.dispatchWorkgroups(
+      gemvCommand.workgroups.x,
+      gemvCommand.workgroups.y,
+      gemvCommand.workgroups.z,
+    );
+    pass.setPipeline(candidatePipeline);
+    pass.setBindGroup(0, device.createBindGroup({
+      layout: candidatePipeline.getBindGroupLayout(0),
+      entries: stagedBindingEntries(candidateCommand),
+    }));
+    pass.dispatchWorkgroups(
+      candidateCommand.workgroups.x,
+      candidateCommand.workgroups.y,
+      candidateCommand.workgroups.z,
+    );
+  }
+  pass.setPipeline(finalPipeline);
+  pass.setBindGroup(0, finalBindGroup);
+  pass.dispatchWorkgroups(1, 1, 1);
+  pass.end();
+  encoder.copyBufferToBuffer(candidateBuffer, 0, candidateReadback, 0, candidateWords.byteLength);
+  encoder.copyBufferToBuffer(selectedTokenBuffer, 0, selectedReadback, 0, 4);
+  device.queue.submit([encoder.finish()]);
+  await candidateReadback.mapAsync(GPUMapMode.READ);
+  const actualCandidates = new Uint32Array(candidateReadback.getMappedRange().slice(0));
+  candidateReadback.unmap();
+  await selectedReadback.mapAsync(GPUMapMode.READ);
+  const selectedToken = new Uint32Array(selectedReadback.getMappedRange().slice(0))[0];
+  selectedReadback.unmap();
+  const actualScore = new Float32Array(actualCandidates.buffer)[0];
+  if (
+    !Number.isFinite(actualScore) ||
+    Math.abs(actualScore - expectedScores[expectedWinnerRow]) > 1e-3 ||
+    actualCandidates[1] !== expectedWinnerRow
+  ) {
+    throw new Error(
+      `staged candidate mismatch: ${actualScore}, ${actualCandidates[1]}, expected ${expectedScores[expectedWinnerRow]}, ${expectedWinnerRow}`,
+    );
+  }
+  if (selectedToken !== expectedWinnerRow) {
+    throw new Error(`staged final token mismatch: ${selectedToken}`);
+  }
+  for (const buffer of [
+    logitsBuffer,
+    normalizedHiddenBuffer,
+    packedTileBuffer,
+    candidateBuffer,
+    uniformBuffer,
+    selectedTokenBuffer,
+    candidateReadback,
+    selectedReadback,
+  ]) buffer.destroy();
+  return {
+    id: "qwen35-staged-logits-gpu-selection",
+    status: "executed",
+    candidateToken: actualCandidates[1],
+    selectedToken,
+  };
 }
 
 export async function runWebGpuKernelHarness() {
@@ -1613,6 +1874,7 @@ export async function runWebGpuKernelHarness() {
   for (const kernel of QWEN35_VISION_MERGER_KERNELS) {
     results.push(await runVisionMergerKernel(device, kernel));
   }
+  results.push(await runStagedLogitsGpuSelection(device));
   device.destroy();
   return results;
 }

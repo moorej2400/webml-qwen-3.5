@@ -19,6 +19,7 @@ const Q6_K_STORAGE_TYPE = "q6-k-212";
 const Q6_K_BLOCK_ELEMENTS = 256;
 const Q6_K_BLOCK_BYTES = 212;
 const GPU_STORAGE_AND_COPY_DST = 0x0080 | 0x0008;
+const OUTPUT_TILE_BUFFER_COUNT = 2;
 
 /** Distinguishes the exact Q6_K product tensor from small generic test fixtures. */
 export function hasQwen35DiskBackedTiedEmbedding(
@@ -142,6 +143,18 @@ export interface Qwen35DiskBackedTiedEmbeddingStore {
       tile: Qwen35StagedPackedRows,
     ) => Promise<readonly Qwen35LogitCandidate[]> | readonly Qwen35LogitCandidate[];
   }): Promise<readonly Qwen35LogitCandidate[]>;
+  /** Streams candidates into caller-owned GPU storage and reads only the final token. */
+  selectTopKGpu?(input: {
+    readonly phase: "prefill" | "decode";
+    readonly signal: AbortSignal;
+    readonly scoreTile: (
+      tile: Qwen35StagedPackedRows,
+      candidateSlot: number,
+    ) => Promise<void> | void;
+    /** Flushes the caller's pending tile commands before a buffer is reused. */
+    readonly flush: () => Promise<void> | void;
+    readonly finalize: () => Promise<number> | number;
+  }): Promise<number>;
   cancel(): Promise<void>;
   dispose(): Promise<void>;
   getMetrics(): Qwen35TiedEmbeddingMetrics;
@@ -339,7 +352,8 @@ const destroyAllocations = (allocations: readonly GpuAllocation[]): boolean => {
 };
 
 /**
- * Creates the two fixed cache buffers used by the model-specific tied path.
+ * Creates fixed cache buffers used by the model-specific tied path. Two output
+ * tiles allow one tile to execute while the next tile uploads.
  * The authenticated OPFS shards remain the only complete tensor owner.
  */
 export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
@@ -420,14 +434,16 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
       alignment: 4,
       requiredShardQuantumBytes: BigInt(geometry.rowBytes),
     }));
-    allocations.push(await input.arena.allocate({
-      id: "tied-embedding-output-tile",
-      category: "scratch",
-      byteLength: BigInt(outputBytes),
-      usage: GPU_STORAGE_AND_COPY_DST,
-      alignment: 4,
-      requiredShardQuantumBytes: BigInt(geometry.rowBytes),
-    }));
+    for (let index = 0; index < OUTPUT_TILE_BUFFER_COUNT; index += 1) {
+      allocations.push(await input.arena.allocate({
+        id: `tied-embedding-output-tile-${index}`,
+        category: "scratch",
+        byteLength: BigInt(outputBytes),
+        usage: GPU_STORAGE_AND_COPY_DST,
+        alignment: 4,
+        requiredShardQuantumBytes: BigInt(geometry.rowBytes),
+      }));
+    }
     if (
       allocations.some((allocation) =>
         allocation.shards.length !== 1 ||
@@ -446,10 +462,15 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
   }
 
   const inputAllocation = allocations[0]!;
-  const outputAllocation = allocations[1]!;
   const inputBuffer = inputAllocation.shards[0]!.buffer as object;
-  const outputBuffer = outputAllocation.shards[0]!.buffer as object;
-  const cacheGpuBytes = inputAllocation.allocatedBytes + outputAllocation.allocatedBytes;
+  const outputAllocations = allocations.slice(1);
+  const outputBuffers = outputAllocations.map((allocation) =>
+    allocation.shards[0]!.buffer as object,
+  );
+  const cacheGpuBytes = allocations.reduce(
+    (total, allocation) => total + allocation.allocatedBytes,
+    0n,
+  );
   const slots = Array.from({ length: inputRowCapacity }, () => ({
     tokenId: null as number | null,
     stamp: 0,
@@ -463,6 +484,7 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
   let decodeRowRequests = 0;
   let outputTileReads = 0;
   let queueDirty = false;
+  const outputBufferBusy = outputBuffers.map(() => false);
   let accepting = true;
   let disposed = false;
   let disposePromise: Promise<void> | null = null;
@@ -474,6 +496,36 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
     if (!queueDirty) return;
     try {
       await input.queue.onSubmittedWorkDone();
+      queueDirty = false;
+    } catch {
+      throw diagnosticError(
+        "tied-embedding-queue-retirement-failed",
+        "Disk-backed tied embedding queue retirement failed",
+      );
+    }
+  };
+
+  const retireOutputBuffer = async (index: number): Promise<void> => {
+    if (!outputBufferBusy[index]) return;
+    try {
+      await input.queue.onSubmittedWorkDone();
+      // WebGPU queue retirement covers every earlier tile, not only the
+      // selected buffer. Clear the whole in-flight set after one fence.
+      outputBufferBusy.fill(false);
+      queueDirty = false;
+    } catch {
+      throw diagnosticError(
+        "tied-embedding-queue-retirement-failed",
+        "Disk-backed tied embedding queue retirement failed",
+      );
+    }
+  };
+
+  const retireOutputBuffers = async (): Promise<void> => {
+    if (!outputBufferBusy.some(Boolean)) return;
+    try {
+      await input.queue.onSubmittedWorkDone();
+      outputBufferBusy.fill(false);
       queueDirty = false;
     } catch {
       throw diagnosticError(
@@ -673,6 +725,15 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
     for (let firstRow = 0; firstRow < decodableRows; firstRow += outputTileRows) {
       signal.throwIfAborted();
       const rowCount = Math.min(outputTileRows, decodableRows - firstRow);
+      const outputBufferIndex = (firstRow / outputTileRows) % OUTPUT_TILE_BUFFER_COUNT;
+      await retireOutputBuffer(outputBufferIndex);
+      const outputBuffer = outputBuffers[outputBufferIndex];
+      if (outputBuffer === undefined) {
+        throw diagnosticError(
+          "tied-embedding-cache-allocation-failed",
+          "Disk-backed tied embedding cache allocation failed",
+        );
+      }
       const bytes = await readTensorRange(
         firstRow * geometry.rowBytes,
         rowCount * geometry.rowBytes,
@@ -681,7 +742,7 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
       outputTileReads += 1;
       try {
         input.queue.writeBuffer(outputBuffer, 0, bytes, 0, bytes.byteLength);
-        queueDirty = true;
+        outputBufferBusy[outputBufferIndex] = true;
       } catch {
         throw diagnosticError(
           "tied-embedding-cache-upload-failed",
@@ -730,12 +791,131 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
         }
       }
       winners = stableTopK([...winners, ...candidates], request.topK);
-      // The tile buffer has one owner. It cannot be overwritten until every
-      // consumer dispatch accepted by scoreTile has retired.
-      await retireQueue();
       signal.throwIfAborted();
     }
     return winners;
+  });
+
+  const selectTopKGpu = (request: {
+    readonly phase: "prefill" | "decode";
+    readonly signal: AbortSignal;
+    readonly scoreTile: (
+      tile: Qwen35StagedPackedRows,
+      candidateSlot: number,
+    ) => Promise<void> | void;
+    readonly flush: () => Promise<void> | void;
+    readonly finalize: () => Promise<number> | number;
+  }): Promise<number> => schedule(request.signal, async (signal) => {
+    if (
+      (request.phase !== "prefill" && request.phase !== "decode") ||
+      typeof request.scoreTile !== "function" ||
+      typeof request.flush !== "function" ||
+      typeof request.finalize !== "function"
+    ) {
+      throw diagnosticError(
+        "tied-embedding-gpu-selection-request-invalid",
+        "Tied embedding GPU selection request is invalid",
+      );
+    }
+    for (let firstRow = 0; firstRow < decodableRows; firstRow += outputTileRows) {
+      signal.throwIfAborted();
+      const rowCount = Math.min(outputTileRows, decodableRows - firstRow);
+      const candidateSlot = firstRow / outputTileRows;
+      if (!Number.isSafeInteger(candidateSlot) || candidateSlot >= 256) {
+        throw diagnosticError(
+          "tied-embedding-gpu-selection-range-invalid",
+          "Tied embedding GPU candidate range is invalid",
+        );
+      }
+      const outputBufferIndex = candidateSlot % OUTPUT_TILE_BUFFER_COUNT;
+      if (candidateSlot > 0 && outputBufferIndex === 0) {
+        try {
+          await request.flush();
+        } catch {
+          if (signal.aborted) throw abortError();
+          throw diagnosticError(
+            "tied-embedding-scoring-failed",
+            "Tied embedding tile batch submission failed",
+          );
+        }
+      }
+      await retireOutputBuffer(outputBufferIndex);
+      const outputBuffer = outputBuffers[outputBufferIndex];
+      if (outputBuffer === undefined) {
+        throw diagnosticError(
+          "tied-embedding-cache-allocation-failed",
+          "Disk-backed tied embedding cache allocation failed",
+        );
+      }
+      const bytes = await readTensorRange(
+        firstRow * geometry.rowBytes,
+        rowCount * geometry.rowBytes,
+        signal,
+      );
+      outputTileReads += 1;
+      try {
+        input.queue.writeBuffer(outputBuffer, 0, bytes, 0, bytes.byteLength);
+        outputBufferBusy[outputBufferIndex] = true;
+      } catch {
+        throw diagnosticError(
+          "tied-embedding-cache-upload-failed",
+          "Disk-backed tied embedding cache upload failed",
+        );
+      }
+      const tile = Object.freeze({
+        tensorName: TIED_TENSOR_NAME,
+        storageType: geometry.tensor.storageType,
+        firstRow,
+        rowCount,
+        rowBytes: geometry.rowBytes,
+        buffer: outputBuffer,
+        bufferOffset: 0,
+        byteLength: bytes.byteLength,
+      });
+      try {
+        await request.scoreTile(tile, candidateSlot);
+      } catch {
+        if (signal.aborted) throw abortError();
+        throw diagnosticError(
+          "tied-embedding-scoring-failed",
+          "Disk-backed tied embedding tile scoring failed",
+        );
+      }
+      // The next tile uses the other output buffer. Reuse fences only when a
+      // buffer comes around again, so the GPU can process two tiles in flight.
+      signal.throwIfAborted();
+    }
+    try {
+      await request.flush();
+    } catch {
+      if (signal.aborted) throw abortError();
+      throw diagnosticError(
+        "tied-embedding-scoring-failed",
+        "Tied embedding tile batch submission failed",
+      );
+    }
+    let tokenId: number;
+    try {
+      tokenId = await request.finalize();
+    } catch {
+      if (signal.aborted) throw abortError();
+      throw diagnosticError(
+        "tied-embedding-gpu-finalization-failed",
+        "Disk-backed tied embedding GPU finalization failed",
+      );
+    }
+    if (
+      !Number.isSafeInteger(tokenId) ||
+      tokenId < 0 ||
+      tokenId >= decodableRows
+    ) {
+      throw diagnosticError(
+        "tied-embedding-gpu-token-invalid",
+        "Disk-backed tied embedding GPU finalization returned an invalid token",
+      );
+    }
+    await retireOutputBuffers();
+    return tokenId;
   });
 
   const getMetrics = (): Qwen35TiedEmbeddingMetrics => Object.freeze({
@@ -788,6 +968,7 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
     cacheGpuBytes,
     stageInputRow,
     selectTopK,
+    selectTopKGpu,
     cancel,
     dispose,
     getMetrics,

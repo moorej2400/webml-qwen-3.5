@@ -31,7 +31,7 @@ const SUBJECT_PATH = "../src/qwen35-disk-backed-tied-embedding.js";
 const ROW_BYTES = 2_120;
 const INPUT_CACHE_ROWS = 2;
 const OUTPUT_TILE_ROWS = 2;
-const CACHE_BYTES = ROW_BYTES * (INPUT_CACHE_ROWS + OUTPUT_TILE_ROWS);
+const CACHE_BYTES = ROW_BYTES * (INPUT_CACHE_ROWS + OUTPUT_TILE_ROWS * 2);
 const EXACT_TIED_BYTES = 526_438_400n;
 
 interface PackedRangeRead {
@@ -92,6 +92,16 @@ interface DiskBackedTiedEmbeddingStore {
       tile: StagedPackedRows,
     ) => Promise<readonly LogitCandidate[]> | readonly LogitCandidate[];
   }): Promise<readonly LogitCandidate[]>;
+  selectTopKGpu(input: {
+    readonly phase: "prefill" | "decode";
+    readonly signal: AbortSignal;
+    readonly scoreTile: (
+      tile: StagedPackedRows,
+      candidateSlot: number,
+    ) => Promise<void> | void;
+    readonly flush: () => Promise<void> | void;
+    readonly finalize: () => Promise<number> | number;
+  }): Promise<number>;
   cancel(): Promise<void>;
   dispose(): Promise<void>;
   getMetrics(): TiedEmbeddingMetrics;
@@ -655,6 +665,31 @@ test("matches full-resident stable greedy and top-k while reading bounded output
   await store.dispose();
 });
 
+test("keeps streamed tile winners on GPU until one final selection", async () => {
+  const { store, gpu } = await createStore();
+  const slots: number[] = [];
+  const flushes: number[] = [];
+  const selected = await store.selectTopKGpu({
+    phase: "decode",
+    signal: new AbortController().signal,
+    scoreTile(_tile, candidateSlot) {
+      slots.push(candidateSlot);
+    },
+    flush() {
+      flushes.push(slots.length);
+    },
+    finalize() {
+      return 4;
+    },
+  });
+
+  assert.equal(selected, 4);
+  assert.deepEqual(slots, [0, 1, 2]);
+  assert.deepEqual(flushes, [2, 3]);
+  assert.equal(gpu.events.filter((event) => event === "retire").length, 2);
+  await store.dispose();
+});
+
 test("uses one immutable tied source for input rows and output tiles", async () => {
   const { store, fixture } = await createStore();
   const signal = new AbortController().signal;
@@ -743,7 +778,10 @@ test("dispose retires queue work, releases ledger ownership, and is idempotent",
 
   assert.equal(gpu.ledger.snapshot().currentBytes, 0n);
   assert.equal(gpu.ledger.snapshot().peakBytes, BigInt(CACHE_BYTES));
-  assert.equal(gpu.events.filter((event) => event === "destroy").length, 2);
+  assert.equal(
+    gpu.events.filter((event) => event === "destroy").length,
+    1 + 2,
+  );
   assert.notEqual(gpu.events.lastIndexOf("retire"), -1);
   assert.ok(gpu.events.lastIndexOf("retire") < gpu.events.indexOf("destroy"));
   assert.equal(store.getMetrics().currentCacheGpuBytes, 0);

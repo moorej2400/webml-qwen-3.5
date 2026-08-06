@@ -20,6 +20,32 @@ import type { Qwen35DispatchRequest } from "../src/qwen35-webgpu-executor.js";
 import type { Qwen35StagedPackedRows } from "../src/qwen35-disk-backed-tied-embedding.js";
 
 interface StagedLogitsSubject {
+  assembleQwen35StagedLogitsTileGpuCommands(input: {
+    readonly tile: Qwen35StagedPackedRows;
+    readonly normalizedHidden: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly workspace: ReturnType<typeof workspace>;
+    readonly candidateOutput: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly candidateSlot: number;
+    readonly limits: typeof limits;
+    readonly uniforms: readonly { readonly buffer: object; readonly offset: number; readonly byteLength: number }[];
+  }): {
+    readonly commands: readonly ({
+      readonly kind: "logits-gemv-piece" | "logits-tile-top-1";
+      readonly tileIndex: number;
+      readonly uniformWords: readonly number[];
+    } & Qwen35DispatchRequest)[];
+    readonly uniformCount: 2;
+  };
+  assembleQwen35StagedFinalTokenCommand(input: {
+    readonly candidateOutput: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly selectedToken: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly limits: typeof limits;
+    readonly uniform: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+  }): {
+    readonly kind: "indexed-top-1";
+    readonly tileIndex: null;
+    readonly uniformWords: readonly number[];
+  } & Qwen35DispatchRequest;
   assembleQwen35StagedLogitsTileCommands(input: {
     readonly tile: Qwen35StagedPackedRows;
     readonly normalizedHidden: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
@@ -292,6 +318,58 @@ test("assembles one staged Q6_K logits tile with score and token readback", asyn
     byteLength: 4,
     scalarType: "u32",
   });
+});
+
+test("assembles staged logits into GPU candidate slots without per-tile readbacks", async () => {
+  const subject = await stagedLogitsSubject();
+  const packedTile = {};
+  const candidateOutput = {};
+  const result = subject.assembleQwen35StagedLogitsTileGpuCommands({
+    tile: {
+      tensorName: "token_embd.weight",
+      storageType: "q6-k-212",
+      firstRow: 247_808,
+      rowCount: 262,
+      rowBytes: 2_120,
+      buffer: packedTile,
+      bufferOffset: 0,
+      byteLength: 2_120 * 262,
+    },
+    normalizedHidden: { buffer: {}, offset: 0, byteLength: 10_240 },
+    workspace: workspace(),
+    candidateOutput: { buffer: candidateOutput, offset: 0, byteLength: 256 * 8 },
+    candidateSlot: 242,
+    limits,
+    uniforms: uniformSlices(2),
+  });
+
+  assert.equal(result.uniformCount, 2);
+  const reduction = result.commands.at(-1)!;
+  assert.equal(reduction.kind, "logits-tile-top-1");
+  assert.equal(reduction.tileIndex, 242);
+  assert.deepEqual(reduction.uniformWords, [262, 247_808, 242, 0]);
+  assert.match(reduction.kernel.source, /@workgroup_size\(64\)/);
+  assert.match(reduction.kernel.source, /workgroupBarrier\(\)/);
+  assert.equal("candidateScoreReadback" in result, false);
+  assert.equal("candidateTokenReadback" in result, false);
+});
+
+test("assembles one final staged token reduction command", async () => {
+  const subject = await stagedLogitsSubject();
+  const candidateOutput = {};
+  const selectedToken = {};
+  const command = subject.assembleQwen35StagedFinalTokenCommand({
+    candidateOutput: { buffer: candidateOutput, offset: 0, byteLength: 256 * 8 },
+    selectedToken: { buffer: selectedToken, offset: 0, byteLength: 4 },
+    limits,
+    uniform: uniformSlices(1)[0]!,
+  });
+
+  assert.equal(command.kind, "indexed-top-1");
+  assert.equal(command.tileIndex, null);
+  assert.deepEqual(command.uniformWords, [243, 0, 0, 0]);
+  assert.match(command.kernel.source, /@workgroup_size\(64\)/);
+  assert.match(command.kernel.source, /workgroupBarrier\(\)/);
 });
 
 test("rejects missing, extra, and aliased uniform slots", () => {

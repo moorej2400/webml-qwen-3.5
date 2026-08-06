@@ -128,6 +128,10 @@ test("defines one explicit direct-read kernel ABI for every language layout", ()
     assert.equal(definition.abi.layout, definition.layout);
     assert.equal(definition.abi.phase, definition.phase);
     assert.equal(definition.abi.profile, definition.profile);
+    assert.equal(definition.abi.workgroupSize, 64);
+    assert.match(definition.source, /@compute @workgroup_size\(64\)/);
+    assert.match(definition.source, /var<workgroup> partials/);
+    assert.match(definition.source, /workgroupBarrier\(\)/);
     assert.match(definition.source, /array<u32>/);
     assert.match(definition.source, /local_rows\s*:\s*u32/);
     assert.match(definition.source, /output_row_offset\s*:\s*u32/);
@@ -205,10 +209,10 @@ test("guards two-dimensional row flattening before u32 arithmetic can wrap", () 
 
   for (const kernel of LANGUAGE_GEMV_KERNELS) {
     const guard = kernel.source.indexOf(
-      "if (invocation.y > (0xffffffffu - invocation.x) / grid.x)",
+      "if (group.y > (0xffffffffu - group.x) / grid.x)",
     );
     const flatten = kernel.source.indexOf(
-      "let row = invocation.y * grid.x + invocation.x",
+      "let row = group.y * grid.x + group.x",
     );
     assert.ok(guard >= 0, `${kernel.layout} is missing the overflow guard`);
     assert.ok(

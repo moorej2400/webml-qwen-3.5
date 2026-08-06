@@ -21,7 +21,10 @@ import type {
   WebGpuProbeSurface,
 } from "./device-profile.js";
 import type { Qwen35VisionPackagePins } from "./qwen35-vision-package-loader.js";
-import type { Qwen35UploadRetirementPolicy } from "./qwen35-weight-upload.js";
+import type {
+  Qwen35UploadRetirementPolicy,
+  Qwen35WeightResidencyPolicy,
+} from "./qwen35-weight-upload.js";
 import {
   ChatOperationGate,
   emptyChatContextCopy,
@@ -54,6 +57,7 @@ interface RuntimeConfig {
   readonly expectedManifestSha256: string;
   readonly compiledTokenizerUrl: string;
   readonly bufferShardPolicy?: BufferShardPolicy;
+  readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
 }
 
 interface RuntimeConfigWindow extends Window {
@@ -82,6 +86,7 @@ export interface Qwen35ChatAppOptions {
   readonly webGpuSurface?: WebGpuProbeSurface;
   readonly uploadLaneBytes?: number;
   readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
+  readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
 }
 
 interface PendingImage {
@@ -197,6 +202,11 @@ function readRuntimeConfig(): RuntimeConfig | null {
     bufferShardPolicy === "default" ||
     bufferShardPolicy === "evidence-128" ||
     bufferShardPolicy === "evidence-64";
+  const residencyPolicy = injected.residencyPolicy;
+  const hasResidencyPolicy =
+    residencyPolicy === "auto" ||
+    residencyPolicy === "resident" ||
+    residencyPolicy === "rolling";
   const hasManifest = typeof injected.manifest === "object" && injected.manifest !== null;
   const hasManifestUrl = typeof injected.manifestUrl === "string" && injected.manifestUrl.length > 0;
   if (
@@ -206,6 +216,7 @@ function readRuntimeConfig(): RuntimeConfig | null {
     typeof expectedManifestSha256 !== "string" || expectedManifestSha256.length === 0 ||
     typeof compiledTokenizerUrl !== "string" || compiledTokenizerUrl.length === 0
     || (bufferShardPolicy !== undefined && !hasBufferShardPolicy)
+    || (residencyPolicy !== undefined && !hasResidencyPolicy)
   ) {
     return null;
   }
@@ -227,6 +238,7 @@ function readRuntimeConfig(): RuntimeConfig | null {
     expectedManifestSha256,
     compiledTokenizerUrl,
     ...(hasBufferShardPolicy ? { bufferShardPolicy } : {}),
+    ...(hasResidencyPolicy ? { residencyPolicy } : {}),
   });
 }
 
@@ -492,6 +504,12 @@ export function startQwen35ChatApp(
       ...(options.uploadRetirementPolicy === undefined
         ? {}
         : { uploadRetirementPolicy: options.uploadRetirementPolicy }),
+      ...((options.residencyPolicy ?? runtimeConfig.residencyPolicy) === undefined
+        ? {}
+        : {
+            residencyPolicy: options.residencyPolicy ??
+              runtimeConfig.residencyPolicy,
+          }),
       ...(runtimeConfig.allowInsecureLocalhost === true
         ? { allowInsecureLocalhost: true }
         : {}),
