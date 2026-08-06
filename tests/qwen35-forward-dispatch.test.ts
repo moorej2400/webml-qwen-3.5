@@ -15,6 +15,20 @@ import type {
   Qwen35WeightDirectoryView,
 } from "../src/qwen35-weight-directory.js";
 import type { Qwen35DispatchRequest } from "../src/qwen35-webgpu-executor.js";
+import type { Qwen35StagedPackedRows } from "../src/qwen35-disk-backed-tied-embedding.js";
+
+interface StagedForwardSubject {
+  planQwen35StagedPackedEmbeddingDispatch(input: {
+    readonly rows: Qwen35StagedPackedRows;
+    readonly output: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly uniform: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly limits: Qwen35ForwardDeviceLimits;
+  }): ReturnType<typeof planQwen35PackedEmbeddingDispatch>;
+}
+
+async function stagedForwardSubject(): Promise<StagedForwardSubject> {
+  return await import("../src/qwen35-forward-dispatch.js") as unknown as StagedForwardSubject;
+}
 
 const limits: Qwen35ForwardDeviceLimits = {
   minStorageBufferOffsetAlignment: 256,
@@ -159,6 +173,42 @@ test("binds only an aligned embedding-row window inside a large arena", () => {
     size: 2_192,
   });
   assert.deepEqual(plan.uniformWords, [18, 2_560, 10, 0]);
+});
+
+test("aligns a staged Q6_K cache row before binding its packed prefix", async () => {
+  const subject = await stagedForwardSubject();
+  assert.equal(
+    typeof subject.planQwen35StagedPackedEmbeddingDispatch,
+    "function",
+    "the staged packed-row planner is required by the disk-backed cache",
+  );
+  const packedCache = {};
+  const output = {};
+  const uniform = {};
+  const plan = subject.planQwen35StagedPackedEmbeddingDispatch({
+    rows: {
+      tensorName: "token_embd.weight",
+      storageType: "q6-k-212",
+      firstRow: 17,
+      rowCount: 1,
+      rowBytes: 2_120,
+      buffer: packedCache,
+      bufferOffset: 2_120,
+      byteLength: 2_120,
+    },
+    output: slice(output, 10_240),
+    uniform: slice(uniform, 16),
+    limits,
+  });
+
+  assert.equal(plan.kernel.id, "q6-k-212-embedding-row-shared-portable-f32");
+  assert.deepEqual(plan.bindings, [
+    { binding: 0, kind: "storage", buffer: packedCache, offset: 2_048, size: 2_192 },
+    { binding: 1, kind: "storage", buffer: output, offset: 0, size: 10_240 },
+    { binding: 2, kind: "uniform", buffer: uniform, offset: 0, size: 16 },
+  ]);
+  assert.deepEqual(plan.uniformWords, [18, 2_560, 10, 0]);
+  assert.deepEqual(plan.workgroups, { x: 10, y: 1, z: 1 });
 });
 
 test("plans every physical matrix row range for all six packed layouts", () => {

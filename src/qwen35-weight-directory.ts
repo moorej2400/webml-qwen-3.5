@@ -257,10 +257,14 @@ function destroyReverse(allocations: readonly GpuAllocation[]): unknown {
 export async function allocateQwen35WeightDirectory(
   arena: Qwen35WeightArena,
   packageDirectory: Qwen35PackageDirectory,
+  options: {
+    readonly onProgress?: (completedBytes: number) => void;
+  } = {},
 ): Promise<Qwen35WeightDirectory> {
   const allocations: GpuAllocation[] = [];
   const tensors: Qwen35TensorWeight[] = [];
   const byName = new Map<string, Qwen35TensorWeight>();
+  let completedBytes = 0;
   try {
     for (const [index, tensor] of packageDirectory.tensors.entries()) {
       if (byName.has(tensor.name)) {
@@ -285,6 +289,8 @@ export async function allocateQwen35WeightDirectory(
         requiredShardQuantumBytes: BigInt(shape.rowBytes),
       });
       allocations.push(allocation);
+      completedBytes += safeByteNumber(shape.logicalBytes, "Allocated weight bytes");
+      options.onProgress?.(completedBytes);
       const physicalRows = physicalRowViews(
         allocation,
         shape.rowBytes,

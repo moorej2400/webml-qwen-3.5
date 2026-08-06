@@ -80,6 +80,12 @@ test("streams packed FP16 K/V without a full attention score matrix", async () =
   assert.match(source, /0\.0625f/);
   assert.match(source, /running_maximum/);
   assert.match(source, /running_denominator/);
+  assert.match(source, /var<storage, read_write> online_state/);
+  assert.match(source, /params\.page_index\s*==\s*0u/);
+  assert.match(source, /params\.page_index\s*\+\s*1u\s*==\s*params\.page_count/);
+  assert.match(source, /online_state\[state_base\]\s*=\s*running_maximum/);
+  assert.match(source, /online_state\[state_base \+ 1u\]\s*=\s*running_denominator/);
+  assert.match(source, /select\(\s*accumulator\[lane\],[\s\S]*final_page/);
   assert.match(source, /for\s*\(var token/);
   assert.doesNotMatch(source, /array\s*<\s*f32\s*,\s*16384/);
   assert.doesNotMatch(source, /\bscores?\b/i);

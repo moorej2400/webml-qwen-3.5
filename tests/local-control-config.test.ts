@@ -158,6 +158,115 @@ test("browser runtime configuration carries the selected allocation-shaping expe
   assert.equal(config.bufferShardPolicy, "evidence-64");
 });
 
+test("upload probe trials change exactly one memory variable from the 128 MiB baseline", () => {
+  const revision = "c".repeat(40);
+  const base = {
+    QWEN_RUNTIME_MANIFEST: ".local/model/manifest.json",
+    QWEN_RUNTIME_PACKAGE_BASE_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/`,
+    QWEN_RUNTIME_MANIFEST_SHA256: "a".repeat(64),
+    QWEN_RUNTIME_TOKENIZER_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/tokenizer.bin`,
+  };
+  const expected = {
+    "baseline-128": {
+      bufferShardPolicy: "evidence-128",
+      uploadLaneBytes: 32 * 1024 * 1024,
+      retireUploadAfterEachWrite: false,
+    },
+    "buffer-64": {
+      bufferShardPolicy: "evidence-64",
+      uploadLaneBytes: 32 * 1024 * 1024,
+      retireUploadAfterEachWrite: false,
+    },
+    "lane-16": {
+      bufferShardPolicy: "evidence-128",
+      uploadLaneBytes: 16 * 1024 * 1024,
+      retireUploadAfterEachWrite: false,
+    },
+    "lane-8": {
+      bufferShardPolicy: "evidence-128",
+      uploadLaneBytes: 8 * 1024 * 1024,
+      retireUploadAfterEachWrite: false,
+    },
+    "paced-retirement": {
+      bufferShardPolicy: "evidence-128",
+      uploadLaneBytes: 32 * 1024 * 1024,
+      retireUploadAfterEachWrite: true,
+    },
+  } as const;
+  const actual = Object.fromEntries(
+    Object.keys(expected).map((trial) => {
+      const environment = loadBrowserRuntimeEnvironment({
+        ...base,
+        QWEN_RUNTIME_UPLOAD_PROBE_TRIAL: trial,
+      }) as unknown as Record<string, unknown>;
+      assert.equal(environment.uploadDiagnostics, true);
+      return [trial, {
+        bufferShardPolicy: environment.bufferShardPolicy,
+        uploadLaneBytes: environment.uploadLaneBytes,
+        retireUploadAfterEachWrite: environment.retireUploadAfterEachWrite,
+      }];
+    }),
+  );
+
+  assert.deepEqual(actual, expected);
+  const baseline = expected["baseline-128"];
+  for (const [trial, candidate] of Object.entries(expected)) {
+    if (trial === "baseline-128") continue;
+    const differences = Object.keys(baseline).filter(
+      (key) => candidate[key as keyof typeof candidate] !== baseline[key as keyof typeof baseline],
+    );
+    assert.equal(differences.length, 1, `${trial} must isolate one variable`);
+  }
+  assert.throws(
+    () => loadBrowserRuntimeEnvironment({
+      ...base,
+      QWEN_RUNTIME_UPLOAD_PROBE_TRIAL: "combined-guess",
+    }),
+    /upload probe trial/i,
+  );
+  assert.throws(
+    () => loadBrowserRuntimeEnvironment({
+      ...base,
+      QWEN_RUNTIME_UPLOAD_PROBE_TRIAL: "lane-8",
+      QWEN_RUNTIME_BUFFER_SHARD_POLICY: "evidence-64",
+    }),
+    /upload probe trial|independent|combine/i,
+  );
+});
+
+test("browser runtime configuration carries the selected upload probe without local identities", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "qwen-runtime-upload-probe-"));
+  await mkdir(path.join(root, ".local", "model"), { recursive: true });
+  const manifest = runtimeManifest();
+  await writeFile(
+    path.join(root, ".local", "model", "manifest.json"),
+    JSON.stringify(manifest),
+  );
+  const revision = "c".repeat(40);
+  const environment = loadBrowserRuntimeEnvironment({
+    QWEN_RUNTIME_MANIFEST: ".local/model/manifest.json",
+    QWEN_RUNTIME_PACKAGE_BASE_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/`,
+    QWEN_RUNTIME_MANIFEST_SHA256: modelCacheKey(manifest),
+    QWEN_RUNTIME_TOKENIZER_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/tokenizer.bin`,
+    QWEN_RUNTIME_UPLOAD_PROBE_TRIAL: "lane-8",
+  });
+
+  const config = await loadBrowserRuntimeConfiguration({ projectRoot: root, environment });
+  const diagnostic = config as unknown as Record<string, unknown>;
+  assert.equal(diagnostic.uploadDiagnostics, true);
+  assert.equal(diagnostic.bufferShardPolicy, "evidence-128");
+  assert.equal(diagnostic.uploadLaneBytes, 8 * 1024 * 1024);
+  assert.equal(diagnostic.retireUploadAfterEachWrite, false);
+  assert.doesNotMatch(
+    JSON.stringify(config),
+    /manifestPath|local path|operator|credential|secret|prompt|response|stack/i,
+  );
+});
+
 test("browser runtime configuration rejects mutable, credentialed, or mismatched inputs", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "qwen-runtime-config-reject-"));
   await mkdir(path.join(root, ".local"), { recursive: true });

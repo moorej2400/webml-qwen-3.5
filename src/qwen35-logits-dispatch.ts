@@ -4,12 +4,14 @@ import type {
   Qwen35ActivationResourceView,
 } from "./qwen35-activation-workspace.js";
 import {
+  planQwen35StagedTiedLogitsDispatch,
   planQwen35TiedLogitsGeometry,
   planQwen35TiedLogitsDispatches,
   type Qwen35ForwardBufferSlice,
   type Qwen35ForwardDeviceLimits,
   type Qwen35TiedLogitsDispatchPlan,
 } from "./qwen35-forward-dispatch.js";
+import type { Qwen35StagedPackedRows } from "./qwen35-disk-backed-tied-embedding.js";
 import {
   QWEN35_LOGITS_REDUCTION_KERNELS,
   planQwen35FinalTokenSelection,
@@ -58,6 +60,60 @@ export interface Qwen35TiledLogitsCommands {
   readonly uniformCount: number;
   readonly selectedTokenReadback: Qwen35SelectedTokenReadback;
 }
+
+export interface Qwen35StagedLogitsTileCommands {
+  readonly commands: readonly Qwen35LogitsDispatchCommand[];
+  readonly uniformCount: 2;
+  readonly candidateScoreReadback: {
+    readonly buffer: object;
+    readonly offset: number;
+    readonly byteLength: 4;
+    readonly scalarType: "f32";
+  };
+  readonly candidateTokenReadback: {
+    readonly buffer: object;
+    readonly offset: number;
+    readonly byteLength: 4;
+    readonly scalarType: "u32";
+  };
+}
+
+const STAGED_TILE_TOP_1_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "staged-logits-tile-top-1-decode-portable-f32",
+  entryPoint: "main",
+  source: /* wgsl */ `
+struct Params {
+  vocabulary_rows: u32,
+  vocabulary_start: u32,
+  pad0: u32,
+  pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> logits_tile: array<f32>;
+@group(0) @binding(1) var<storage, read_write> candidate: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
+  if (invocation.x != 0u) { return; }
+  var found = false;
+  var best_score = 0.0f;
+  var best_token = 0xffffffffu;
+  for (var row = 0u; row < params.vocabulary_rows; row += 1u) {
+    let score = logits_tile[row];
+    let exponent = bitcast<u32>(score) & 0x7f800000u;
+    if (exponent == 0x7f800000u) { continue; }
+    let token = params.vocabulary_start + row;
+    if (token >= 248070u) { continue; }
+    if (!found || score > best_score ||
+        (score == best_score && token < best_token)) {
+      found = true;
+      best_score = score;
+      best_token = token;
+    }
+  }
+  candidate[0] = bitcast<u32>(best_score);
+  candidate[1] = best_token;
+}`,
+});
 
 const REDUCTION_KERNEL_SOURCES = new Map<
   Qwen35LogitsReductionOperation,
@@ -489,6 +545,106 @@ export function assembleQwen35TiledLogitsCommands(input: {
       offset: selectedToken.binding.offset,
       byteLength: 4,
       scalarType: "u32",
+    }),
+  });
+}
+
+/** Assembles one bounded disk-backed tile and its exact finite-score winner. */
+export function assembleQwen35StagedLogitsTileCommands(input: {
+  readonly tile: Qwen35StagedPackedRows;
+  readonly normalizedHidden: Qwen35ForwardBufferSlice;
+  readonly workspace: Qwen35LogitsWorkspaceViews;
+  readonly candidateOutput: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+  readonly uniforms: readonly Qwen35ForwardBufferSlice[];
+}): Qwen35StagedLogitsTileCommands {
+  if (input.uniforms.length !== 2) {
+    throw diagnosticError(
+      "logits-staged-uniform-count-invalid",
+      "Qwen3.5 staged logits require two uniform slots",
+    );
+  }
+  const logitsTile = requireWorkspaceResource(
+    input.workspace,
+    "logits-tile",
+    "f32",
+    QWEN35_LOGITS_TILE_ROWS,
+    GPU_BUFFER_USAGE_STORAGE,
+    input.limits,
+  );
+  const candidateBinding = bindSlice(
+    1,
+    "storage",
+    input.candidateOutput,
+    8,
+    input.limits,
+    "logits-staged-candidate-invalid",
+  );
+  const reductionUniform = bindSlice(
+    2,
+    "uniform",
+    input.uniforms[1]!,
+    16,
+    input.limits,
+    "logits-staged-uniform-invalid",
+  );
+  const gemv = planQwen35StagedTiedLogitsDispatch({
+    tile: input.tile,
+    activation: input.normalizedHidden,
+    output: {
+      buffer: logitsTile.binding.buffer,
+      offset: logitsTile.binding.offset,
+      byteLength: logitsTile.binding.size,
+    },
+    uniform: input.uniforms[0]!,
+    limits: input.limits,
+  });
+  const gemvUniform = gemv.bindings.find(({ kind }) => kind === "uniform");
+  if (gemvUniform === undefined) {
+    throw diagnosticError(
+      "logits-staged-uniform-invalid",
+      "Qwen3.5 staged logits uniform binding is unavailable",
+    );
+  }
+  requireDistinctUniforms([gemvUniform, reductionUniform]);
+  requireNoOverlap([logitsTile.binding, candidateBinding], [
+    gemv.bindings[0]!,
+    gemv.bindings[1]!,
+    gemvUniform,
+    reductionUniform,
+  ]);
+  const tileIndex = input.tile.firstRow / QWEN35_LOGITS_TILE_ROWS;
+  const gemvCommand = Object.freeze({
+    ...gemv,
+    kind: "logits-gemv-piece" as const,
+    tileIndex,
+  });
+  const reduction = command({
+    kind: "logits-tile-top-1",
+    tileIndex,
+    kernel: STAGED_TILE_TOP_1_KERNEL,
+    bindings: [
+      Object.freeze({ ...logitsTile.binding, binding: 0 }),
+      candidateBinding,
+      reductionUniform,
+    ],
+    uniformWords: [input.tile.rowCount, input.tile.firstRow, 0, 0],
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+  return Object.freeze({
+    commands: Object.freeze([gemvCommand, reduction]),
+    uniformCount: 2 as const,
+    candidateScoreReadback: Object.freeze({
+      buffer: candidateBinding.buffer,
+      offset: candidateBinding.offset,
+      byteLength: 4 as const,
+      scalarType: "f32" as const,
+    }),
+    candidateTokenReadback: Object.freeze({
+      buffer: candidateBinding.buffer,
+      offset: candidateBinding.offset + 4,
+      byteLength: 4 as const,
+      scalarType: "u32" as const,
     }),
   });
 }

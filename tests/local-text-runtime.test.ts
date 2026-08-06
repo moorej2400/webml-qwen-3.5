@@ -5,6 +5,7 @@ import {
   createTextRuntimeController,
   type TextRuntimeSession,
 } from "../dev/browser/text-runtime.js";
+import type { Qwen35RuntimeCoordinator } from "../src/chat-app.js";
 import type { Qwen35BrowserLoadOptions } from "../src/qwen35-model-loader.js";
 import type { RuntimeMetrics } from "../src/qwen35-session.js";
 
@@ -115,4 +116,26 @@ test("text runtime accepts only a bounded prompt payload and reports structured 
     gpuBytes: 200,
   });
   assert.doesNotMatch(JSON.stringify(state), /secret|prompt|output/i);
+});
+
+test("shared coordinator load is idempotent while an existing runtime is busy", async () => {
+  let loadCalls = 0;
+  const coordinator: Qwen35RuntimeCoordinator = {
+    state: "generating",
+    async load() { loadCalls += 1; },
+    async replaceConversation() {
+      return { rendered: "", contextTokens: 0, remainingContextTokens: 16_384 };
+    },
+    async *generate() {},
+    async cancel() {},
+    async reset() {},
+    async dispose() {},
+    getMetrics() { return metrics("generating"); },
+    subscribeLoadEvents() { return () => undefined; },
+  };
+  const controller = createTextRuntimeController({ coordinator });
+
+  await controller.load();
+
+  assert.equal(loadCalls, 0, "load must not replace a shared runtime during generation");
 });

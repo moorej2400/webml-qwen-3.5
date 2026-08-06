@@ -2,7 +2,10 @@ import {
   AllocationLedger,
   type AllocationHandle,
 } from "./allocation-ledger.js";
-import { diagnosticError } from "./diagnostics.js";
+import {
+  allocationDiagnosticError,
+  diagnosticError,
+} from "./diagnostics.js";
 
 export type GpuAllocationCategory =
   | "model"
@@ -74,6 +77,17 @@ function destroyEveryBuffer(buffers: readonly GpuBufferLike[]): unknown {
     }
   }
   return firstError;
+}
+
+function readErrorCode(error: unknown): unknown {
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") {
+    return undefined;
+  }
+  try {
+    return (error as { readonly code?: unknown }).code;
+  } catch {
+    return undefined;
+  }
 }
 
 const GPU_BUFFER_USAGE_ALL = 0x03ff;
@@ -177,11 +191,29 @@ export class GpuArena {
       );
     }
 
-    const ledgerHandle: AllocationHandle = this.#ledger.reserve({
-      id: request.id,
-      category: request.category,
-      bytes: allocatedBytes,
-    });
+    let ledgerHandle: AllocationHandle;
+    try {
+      ledgerHandle = this.#ledger.reserve({
+        id: request.id,
+        category: request.category,
+        bytes: allocatedBytes,
+      });
+    } catch (error) {
+      const code = readErrorCode(error);
+      if (code === "ALLOCATION_LIMIT_EXCEEDED") {
+        throw diagnosticError(
+          "allocation_conflict",
+          "GPU allocation exceeds ledger limit",
+        );
+      }
+      if (code === "ALLOCATION_DUPLICATE") {
+        throw diagnosticError(
+          "allocation_conflict",
+          "GPU allocation ownership conflict",
+        );
+      }
+      throw allocationDiagnosticError("unknown");
+    }
     const shards: Array<{
       buffer: GpuBufferLike;
       logicalByteOffset: bigint;
@@ -202,40 +234,52 @@ export class GpuArena {
     try {
       this.#device.pushErrorScope("validation");
       scopesPushed = 1;
-      this.#device.pushErrorScope("out-of-memory");
-      scopesPushed = 2;
-
-      let remainingAllocated = allocatedBytes;
-      let remainingLogical = request.byteLength;
-      let logicalByteOffset = 0n;
-      while (remainingAllocated > 0n) {
-        const allocatedByteLength =
-          remainingAllocated < alignedChunkLimit
-            ? remainingAllocated
-            : alignedChunkLimit;
-        const logicalByteLength =
-          remainingLogical < allocatedByteLength
-            ? remainingLogical
-            : allocatedByteLength;
-        const buffer = this.#device.createBuffer({
-          size: Number(allocatedByteLength),
-          usage: request.usage,
-          // Tensor identifiers may contain model or user data; labels expose
-          // only the public category and an allocation-local ordinal.
-          label: `qwen-runtime:${request.category}:${shards.length}`,
-        });
-        shards.push({
-          buffer,
-          logicalByteOffset,
-          logicalByteLength,
-          allocatedByteLength,
-        });
-        logicalByteOffset += logicalByteLength;
-        remainingLogical -= logicalByteLength;
-        remainingAllocated -= allocatedByteLength;
-      }
     } catch {
-      creationFailed = true;
+      scopeFailed = true;
+    }
+    if (!scopeFailed) {
+      try {
+        this.#device.pushErrorScope("out-of-memory");
+        scopesPushed = 2;
+      } catch {
+        scopeFailed = true;
+      }
+    }
+
+    if (!scopeFailed) {
+      try {
+        let remainingAllocated = allocatedBytes;
+        let remainingLogical = request.byteLength;
+        let logicalByteOffset = 0n;
+        while (remainingAllocated > 0n) {
+          const allocatedByteLength =
+            remainingAllocated < alignedChunkLimit
+              ? remainingAllocated
+              : alignedChunkLimit;
+          const logicalByteLength =
+            remainingLogical < allocatedByteLength
+              ? remainingLogical
+              : allocatedByteLength;
+          const buffer = this.#device.createBuffer({
+            size: Number(allocatedByteLength),
+            usage: request.usage,
+            // Tensor identifiers may contain model or user data; labels expose
+            // only the public category and an allocation-local ordinal.
+            label: `qwen-runtime:${request.category}:${shards.length}`,
+          });
+          shards.push({
+            buffer,
+            logicalByteOffset,
+            logicalByteLength,
+            allocatedByteLength,
+          });
+          logicalByteOffset += logicalByteLength;
+          remainingLogical -= logicalByteLength;
+          remainingAllocated -= allocatedByteLength;
+        }
+      } catch {
+        creationFailed = true;
+      }
     }
 
     // Error scopes share one device-wide stack. Capture both pops synchronously;
@@ -269,20 +313,23 @@ export class GpuArena {
       }
     }
 
-    if (
-      creationFailed ||
-      scopeFailed ||
-      outOfMemoryError !== null ||
-      validationError !== null
-    ) {
+    const failureCode = scopeFailed
+      ? "error_scope"
+      : outOfMemoryError !== null && validationError !== null
+        ? "gpu_ambiguous_scopes"
+        : outOfMemoryError !== null
+          ? "gpu_out_of_memory"
+          : validationError !== null
+            ? "gpu_validation"
+            : creationFailed
+              ? "buffer_creation"
+              : undefined;
+    if (failureCode !== undefined) {
       // The arena owns every returned prefix buffer until both async scopes
       // succeed. Any failure destroys the prefix and releases ledger ownership.
       destroyEveryBuffer(shards.map(({ buffer }) => buffer));
       this.#ledger.release(ledgerHandle);
-      throw diagnosticError(
-        "GPU_BUFFER_ALLOCATION_FAILED",
-        "GPU buffer allocation failed",
-      );
+      throw allocationDiagnosticError(failureCode);
     }
 
     const ownedLedgerHandle = ledgerHandle;

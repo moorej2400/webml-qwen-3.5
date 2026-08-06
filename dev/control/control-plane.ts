@@ -65,6 +65,8 @@ interface StoredCommand {
   dispatched: boolean;
   phoneReceived: boolean;
   payloadFingerprint: string;
+  originDocumentId?: string;
+  loadDocumentId?: string;
   reloadProof?: {
     connectionId: string;
     documentId: string;
@@ -73,6 +75,12 @@ interface StoredCommand {
   };
   timer?: number | NodeJS.Timeout;
   retireAtMs?: number;
+}
+
+interface CommandTombstone {
+  target: Pick<PhoneIdentity, "deviceId" | "tabId">;
+  documentId: string;
+  expiresAtMs: number;
 }
 
 interface DisconnectRecord {
@@ -97,6 +105,7 @@ export interface IssueCommandRequest {
 export interface ControlPlaneOptions {
   clock?: Clock;
   commandTimeoutMs?: number;
+  promptTimeoutMs?: number;
   reloadTimeoutMs?: number;
   suspectedCrashTimeoutMs?: number;
   retentionMs?: number;
@@ -112,6 +121,21 @@ const tabKey = (identity: Pick<PhoneIdentity, "deviceId" | "tabId">): string =>
 const isReload = (command: ControlCommand): boolean =>
   command === "warmReload" || command === "coldAppReload";
 
+// Keep this narrow allowlist aligned with the nonterminal phases emitted by
+// the local browser agent. Only this validated shape can extend a load lease.
+const LOAD_PROGRESS_PHASES = new Set([
+  "lock_wait",
+  "cache_scan",
+  "cache_download",
+  "cache_verify",
+  "tokenizer_load",
+  "device_probe",
+  "state_allocate",
+  "weights_allocate",
+  "weights_upload",
+  "driver_initialize",
+]);
+
 const isTerminal = (state: CommandSnapshot["state"]): state is TerminalCommandState =>
   state === "completed" ||
   state === "failed" ||
@@ -125,6 +149,7 @@ const payloadFingerprint = (payload: Record<string, unknown> | undefined): strin
 export class ControlPlane {
   readonly #clock: Clock;
   readonly #commandTimeoutMs: number;
+  readonly #promptTimeoutMs: number;
   readonly #reloadTimeoutMs: number;
   readonly #suspectedCrashTimeoutMs: number;
   readonly #retentionMs: number;
@@ -134,12 +159,14 @@ export class ControlPlane {
   readonly #connections = new Map<string, Connection>();
   readonly #connectionByTab = new Map<string, string>();
   readonly #commands = new Map<string, StoredCommand>();
+  readonly #commandTombstones = new Map<string, CommandTombstone>();
   readonly #sequences: EventSequenceTracker;
   readonly #disconnects: DisconnectRecord[] = [];
 
   constructor(options: ControlPlaneOptions = {}) {
     this.#clock = options.clock ?? systemClock;
     this.#commandTimeoutMs = options.commandTimeoutMs ?? 120_000;
+    this.#promptTimeoutMs = options.promptTimeoutMs ?? 15 * 60_000;
     this.#reloadTimeoutMs = options.reloadTimeoutMs ?? 30_000;
     this.#suspectedCrashTimeoutMs = options.suspectedCrashTimeoutMs ?? 10_000;
     this.#retentionMs = options.retentionMs ?? 15 * 60_000;
@@ -147,6 +174,7 @@ export class ControlPlane {
     this.#maxDisconnectRecords = options.maxDisconnectRecords ?? 1_024;
     for (const [value, label] of [
       [this.#retentionMs, "retention"],
+      [this.#promptTimeoutMs, "prompt timeout"],
       [this.#maxCommands, "command capacity"],
       [this.#maxDisconnectRecords, "disconnect capacity"],
     ] as const) {
@@ -282,6 +310,9 @@ export class ControlPlane {
       }
       return existing.tracker.snapshot();
     }
+    if (this.#commandTombstones.has(commandId)) {
+      throw new Error("commandId is still retired");
+    }
     if (this.#commands.size >= this.#maxCommands) throw new Error("command capacity reached");
 
     const tracker = new CommandTracker({
@@ -314,20 +345,7 @@ export class ControlPlane {
     // tests and future local transports can synchronously acknowledge a send.
     this.#commands.set(commandId, stored);
 
-    const timeoutMs = isReload(request.command) ? this.#reloadTimeoutMs : this.#commandTimeoutMs;
-    stored.timer = this.#clock.setTimeout(() => {
-      const state = tracker.snapshot().state;
-      if (isTerminal(state)) return;
-      tracker.forceTerminal(
-        isReload(request.command) ? "indeterminate" : "timed_out",
-        this.#clock.now(),
-        isReload(request.command) ? "replacement_document_not_proven" : "command_timeout",
-      );
-      if (!isReload(request.command)) {
-        this.#promoteSuspectedCrash(target, "command_timeout");
-      }
-      this.#retireTerminal(stored);
-    }, timeoutMs);
+    this.#armCommandDeadline(stored);
     this.#attemptDispatch(stored);
     return tracker.snapshot();
   }
@@ -348,7 +366,22 @@ export class ControlPlane {
       return connectionId === undefined ? undefined : this.#connections.get(connectionId);
     })();
     if (selected === undefined || tabKey(selected.identity) !== tabKey(stored.target)) return false;
-    if (!this.#tryQueue(selected, stored.message)) return false;
+    if (
+      stored.originDocumentId !== undefined &&
+      stored.originDocumentId !== selected.identity.documentId
+    ) {
+      // A replacement document has no durable command record and could repeat
+      // work that may already be running in the original document.
+      return false;
+    }
+    const provisionedOrigin = stored.originDocumentId === undefined;
+    stored.originDocumentId ??= selected.identity.documentId;
+    if (!this.#tryQueue(selected, stored.message)) {
+      // Provision before send so synchronous acknowledgements see ownership;
+      // roll it back only when the transport confirms that queueing failed.
+      if (provisionedOrigin && !stored.phoneReceived) delete stored.originDocumentId;
+      return false;
+    }
     stored.dispatched = true;
     return true;
   }
@@ -381,6 +414,7 @@ export class ControlPlane {
     if (message.type === "commandState") this.#applyCommandState(message, connection);
     if (message.type === "ready") this.#completeReplacementReload(message);
     if (message.type === "telemetry") {
+      this.#refreshLoadDeadline(message);
       const evidence = disconnectEvidenceFromTelemetry(message.event);
       if (evidence !== undefined) connection.lastEvidence = evidence;
       if (this.#onTelemetry !== undefined) {
@@ -415,8 +449,34 @@ export class ControlPlane {
     connection: Connection,
   ): void {
     const stored = this.#commands.get(message.commandId);
-    if (stored === undefined) throw new Error("unknown commandId");
+    if (stored === undefined) {
+      const tombstone = this.#commandTombstones.get(message.commandId);
+      if (tombstone !== undefined) {
+        if (tabKey(tombstone.target) !== tabKey(message)) throw new Error("command target mismatch");
+        if (tombstone.documentId !== connection.identity.documentId) {
+          throw new Error("command document mismatch");
+        }
+        // The retained tombstone proves this lifecycle belongs to concluded
+        // work. Drain every late state without recreating the command.
+        return;
+      }
+      // A terminal report cannot start work or rebuild server state. Accepting
+      // it lets a pruned phone outbox converge; unknown nonterminal work still
+      // remains a protocol error.
+      if (isTerminal(message.state)) return;
+      throw new Error("unknown commandId");
+    }
     if (tabKey(stored.target) !== tabKey(message)) throw new Error("command target mismatch");
+    if (stored.originDocumentId !== connection.identity.documentId) {
+      throw new Error("command document mismatch");
+    }
+    if (isTerminal(stored.tracker.snapshot().state)) {
+      // Once the server owns a terminal, every late state from the originating
+      // document is convergence evidence only. Acknowledge it without letting
+      // accepted/started or another terminal regress the snapshot.
+      stored.phoneReceived = true;
+      return;
+    }
     if (
       isReload(stored.message.command) &&
       (message.state === "completed" ||
@@ -428,6 +488,22 @@ export class ControlPlane {
     stored.tracker.transition(message.state, this.#clock.now(), message.reason, message.result);
     stored.phoneReceived = true;
     if (stored.message.command === "runPrompt") delete stored.message.payload;
+    if (
+      stored.message.command === "load" &&
+      message.state === "started" &&
+      stored.loadDocumentId === undefined
+    ) {
+      // A later document cannot inherit the lease for work started elsewhere.
+      stored.loadDocumentId = connection.identity.documentId;
+      // Before start, the deadline bounds command delivery. The first start
+      // begins a separate inactivity lease for the actual model load.
+      this.#armCommandDeadline(stored);
+    }
+    if (stored.message.command === "runPrompt" && message.state === "started") {
+      // Full-model rolling prefill can exceed the delivery timeout even while
+      // the phone is healthy. Start a separate bounded execution lease.
+      this.#armCommandDeadline(stored);
+    }
     if (isReload(stored.message.command) && message.state === "started") {
       stored.reloadProof = {
         connectionId: connection.connectionId,
@@ -518,8 +594,12 @@ export class ControlPlane {
       delete stored.timer;
     }
     if (stored.message.command === "runPrompt") delete stored.message.payload;
+    delete stored.loadDocumentId;
     delete stored.reloadProof;
     stored.retireAtMs = this.#clock.now() + this.#retentionMs;
+    if (stored.originDocumentId !== undefined) {
+      this.#recordCommandTombstone(stored, stored.retireAtMs + this.#retentionMs);
+    }
   }
 
   #prune(): void {
@@ -529,6 +609,9 @@ export class ControlPlane {
         if (stored.timer !== undefined) this.#clock.clearTimeout(stored.timer);
         this.#commands.delete(commandId);
       }
+    }
+    for (const [commandId, tombstone] of this.#commandTombstones) {
+      if (tombstone.expiresAtMs < now) this.#commandTombstones.delete(commandId);
     }
     const cutoff = now - this.#retentionMs;
     for (let index = this.#disconnects.length - 1; index >= 0; index -= 1) {
@@ -557,7 +640,85 @@ export class ControlPlane {
     record.classification = "suspected_crash";
     if (!record.evidence.includes(evidence)) record.evidence.push(evidence);
   }
+
+  #recordCommandTombstone(stored: StoredCommand, expiresAtMs: number): void {
+    if (stored.originDocumentId === undefined) return;
+    while (
+      !this.#commandTombstones.has(stored.message.commandId) &&
+      this.#commandTombstones.size >= this.#maxCommands
+    ) {
+      const oldest = this.#commandTombstones.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#commandTombstones.delete(oldest);
+    }
+    this.#commandTombstones.set(stored.message.commandId, {
+      target: stored.target,
+      documentId: stored.originDocumentId,
+      expiresAtMs,
+    });
+  }
+
+  #armCommandDeadline(stored: StoredCommand): void {
+    if (stored.timer !== undefined) this.#clock.clearTimeout(stored.timer);
+    const reload = isReload(stored.message.command);
+    const delayMs = reload
+      ? this.#reloadTimeoutMs
+      : stored.message.command === "runPrompt" &&
+          stored.tracker.snapshot().state === "started"
+        ? this.#promptTimeoutMs
+        : this.#commandTimeoutMs;
+    const timer = this.#clock.setTimeout(() => {
+      // A cleared host timer can already be queued. Timer ownership prevents a
+      // stale callback from expiring a lease refreshed by newer progress.
+      if (stored.timer !== timer) return;
+      delete stored.timer;
+      const state = stored.tracker.snapshot().state;
+      if (isTerminal(state)) return;
+      stored.tracker.forceTerminal(
+        reload ? "indeterminate" : "timed_out",
+        this.#clock.now(),
+        reload ? "replacement_document_not_proven" : "command_timeout",
+      );
+      if (!reload) this.#promoteSuspectedCrash(stored.target, "command_timeout");
+      this.#retireTerminal(stored);
+    }, delayMs);
+    stored.timer = timer;
+  }
+
+  #refreshLoadDeadline(message: Extract<PhoneToServerMessage, { type: "telemetry" }>): void {
+    if (!isValidatedLoadProgress(message.event)) return;
+    const candidates = [...this.#commands.values()].filter(
+      (stored) =>
+        stored.message.command === "load" &&
+        stored.tracker.snapshot().state === "started" &&
+        tabKey(stored.target) === tabKey(message) &&
+        stored.loadDocumentId === message.documentId,
+    );
+    // Load telemetry has no commandId. Ambiguity must not extend multiple
+    // independent commands, so refresh only when ownership is unique.
+    if (candidates.length === 1) this.#armCommandDeadline(candidates[0]!);
+  }
 }
+
+const isValidatedLoadProgress = (event: Record<string, unknown>): boolean => {
+  if (event.category !== "phase" || event.name !== "load_started") return false;
+  if (!Number.isSafeInteger(event.timestampMs) || (event.timestampMs as number) < 0) return false;
+  if (typeof event.metrics !== "object" || event.metrics === null || Array.isArray(event.metrics)) {
+    return false;
+  }
+  const metrics = event.metrics as Record<string, unknown>;
+  if (typeof metrics.phase !== "string" || !LOAD_PROGRESS_PHASES.has(metrics.phase)) return false;
+  if (
+    !Number.isSafeInteger(metrics.completedBytes) ||
+    (metrics.completedBytes as number) < 0 ||
+    !Number.isSafeInteger(metrics.totalBytes) ||
+    (metrics.totalBytes as number) < 0 ||
+    (metrics.completedBytes as number) > (metrics.totalBytes as number)
+  ) {
+    return false;
+  }
+  return true;
+};
 
 const disconnectEvidenceFromTelemetry = (
   event: Record<string, unknown>,

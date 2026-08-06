@@ -5,8 +5,9 @@ const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
 const GPU_BUFFER_USAGE_MAP_READ = 0x0001;
 const GPU_MAP_MODE_READ = 0x0001;
 
-// The fixed ABI has 32 existing shader identities, six vision-layer identities,
-// and one exact-GELU merger identity. This bounds cache growth only.
+// The fixed ABI bound still covers both mutually exclusive language tails:
+// resident execution uses two reduction kernels, while disk-backed execution
+// replaces them with one staged reduction kernel. Vision adds its fixed set.
 const QWEN35_FIXED_ABI_KERNEL_CAPACITY = 39;
 
 /** Opaque buffer identity accepted for binding without transferring ownership. */
@@ -374,6 +375,12 @@ export class Qwen35WebGpuExecutor {
 
   async submittedWorkDone(): Promise<void> {
     await this.#device.queue.onSubmittedWorkDone();
+  }
+
+  /** Drops bindings that may retain caller-owned rolling GPU buffers. */
+  releaseBindGroups(): void {
+    this.#assertUsable();
+    this.#bindGroups.clear();
   }
 
   /** Reads only the GPU-selected token or count, never a vocabulary score tile. */

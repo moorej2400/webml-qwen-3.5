@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -31,6 +31,31 @@ test("local browser agent connects automatically without a reusable credential o
   assert.doesNotMatch(source, /pairing|one-time-code|sessionCapability|Bearer /i);
   assert.match(source, /credentials: "omit"/);
   assert.doesNotMatch(source, /dialog|input\.type|password/i);
+});
+
+test("development bootstrap uses the polished app without constructing a second session harness", async () => {
+  const source = await readFile("dev/browser/app.ts", "utf8");
+
+  assert.match(source, /from "\.\.\/\.\.\/src\/chat-app\.js"/);
+  assert.doesNotMatch(source, /runtime-status|runtime-output|runtime-prompt|runtime-max-tokens/);
+  assert.doesNotMatch(source, /new Qwen35Session\s*\(/);
+  assert.match(source, /upload-probe\.js/);
+  assert.match(source, /createLocalWeightUploadProbe/);
+  assert.match(source, /"qwen-local-runtime-upload-event"/);
+  const controllerStart = source.indexOf("createTextRuntimeController({");
+  const controllerEnd = source.indexOf("});", controllerStart);
+  assert.ok(controllerStart >= 0 && controllerEnd > controllerStart);
+  assert.match(
+    source.slice(controllerStart, controllerEnd),
+    /\bonText\b/,
+    "operator-generated text must remain visible in the polished phone page",
+  );
+  const controlIndex = source.indexOf("__QWEN_LOCAL_CONTROL__ =");
+  const readyIndex = source.indexOf('"qwen-local-runtime-ready"');
+  assert.ok(
+    controlIndex >= 0 && controlIndex < readyIndex,
+    "the polished development controller must identify before startup can load the model",
+  );
 });
 
 test("injected browser agent retains and replays bounded unacknowledged events", () => {
@@ -255,7 +280,12 @@ test("development page exposes no-store credential-free runtime configuration", 
   const handler = createDevelopmentRequestHandler({
     ticketAuthority: createAuthority(),
     publicOrigin,
-    html: "<main></main>",
+    html: [
+      "<body>",
+      '<main id="qwen-app"></main>',
+      '<script type="module" src="/assets/public/chat-app.js"></script>',
+      "</body>",
+    ].join(""),
     runtimeConfiguration,
   });
   let status = 0;
@@ -284,4 +314,14 @@ test("development page exposes no-store credential-free runtime configuration", 
   );
   assert.match(page, /__QWEN35_RUNTIME_CONFIG__/);
   assert.match(page, /\.local-agent\.js/);
+  assert.match(page, /id="qwen-app"/);
+  assert.doesNotMatch(page, /\/assets\/public\/chat-app\.js/);
+  assert.match(page, /\/assets\/dev\/browser\/app\.js/);
+  const configurationIndex = page.indexOf("__QWEN35_RUNTIME_CONFIG__");
+  const agentIndex = page.indexOf("/.local-agent.js");
+  const applicationIndex = page.indexOf("/assets/dev/browser/app.js");
+  assert.ok(
+    configurationIndex < agentIndex && agentIndex < applicationIndex,
+    "development control must initialize before the polished app can start model work",
+  );
 });

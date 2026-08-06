@@ -1,6 +1,12 @@
 import {
   Qwen35Session,
+  type GenerateOptions,
+  type GeneratedToken,
+  type Qwen35SessionState,
+  type RuntimeLoadEvent,
   type RuntimeMetrics,
+  type SequenceState,
+  type TextOrImageConversation,
 } from "./qwen35-session.js";
 import type { Qwen35ChatContentPart, Qwen35ChatMessage } from "./qwen-chat-template.js";
 import {
@@ -10,7 +16,12 @@ import {
   type Qwen35VisionPatchBatch,
 } from "./qwen35-vision-preprocess.js";
 import type { ModelPackageManifest } from "./manifest.js";
+import type {
+  BufferShardPolicy,
+  WebGpuProbeSurface,
+} from "./device-profile.js";
 import type { Qwen35VisionPackagePins } from "./qwen35-vision-package-loader.js";
+import type { Qwen35UploadRetirementPolicy } from "./qwen35-weight-upload.js";
 import {
   ChatOperationGate,
   emptyChatContextCopy,
@@ -42,21 +53,41 @@ interface RuntimeConfig {
   readonly expectedPackageBaseUrl: string;
   readonly expectedManifestSha256: string;
   readonly compiledTokenizerUrl: string;
+  readonly bufferShardPolicy?: BufferShardPolicy;
 }
 
 interface RuntimeConfigWindow extends Window {
   readonly __QWEN35_RUNTIME_CONFIG__?: Partial<RuntimeConfig>;
 }
 
+export interface Qwen35RuntimeCoordinator {
+  readonly state: Qwen35SessionState;
+  load(): Promise<void>;
+  replaceConversation(input: TextOrImageConversation): Promise<SequenceState>;
+  generate(options: GenerateOptions): AsyncIterable<GeneratedToken>;
+  cancel(): Promise<void>;
+  reset(): Promise<void>;
+  dispose(): Promise<void>;
+  getMetrics(): RuntimeMetrics;
+  subscribeLoadEvents(listener: (event: RuntimeLoadEvent) => void): () => void;
+}
+
+export interface Qwen35ChatAppHandle {
+  readonly coordinator: Qwen35RuntimeCoordinator;
+}
+
+export interface Qwen35ChatAppOptions {
+  /** Development control installs its command surface before requesting load. */
+  readonly autoLoad?: boolean;
+  readonly webGpuSurface?: WebGpuProbeSurface;
+  readonly uploadLaneBytes?: number;
+  readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
+}
+
 interface PendingImage {
   readonly file: File;
   readonly previewUrl: string;
   readonly batch: Qwen35VisionPatchBatch;
-}
-
-const root = document.querySelector<HTMLElement>("#qwen-app");
-if (root !== null) {
-  void startApp(root);
 }
 
 function element<T extends Element>(selector: string): T {
@@ -77,7 +108,7 @@ function setBusy(value: boolean): void {
       control.disabled = value;
     }
   }
-  root?.toggleAttribute("data-busy", value);
+  document.querySelector<HTMLElement>("#qwen-app")?.toggleAttribute("data-busy", value);
 }
 
 function formatNumber(value: number): string {
@@ -99,6 +130,16 @@ function updateMetrics(metrics: RuntimeMetrics): void {
     ? `${(metrics.trackedGpuBytes / (1024 ** 3)).toFixed(2)} GB`
     : "—";
   phase.textContent = metrics.state;
+}
+
+function formatLoadProgress(event: RuntimeLoadEvent): string {
+  const shard = event.shardIndex === undefined || event.shardCount === undefined
+    ? ""
+    : ` · shard ${event.shardIndex + 1}/${event.shardCount}`;
+  const bytes = event.totalBytes === 0
+    ? ""
+    : ` · ${formatNumber(event.completedBytes)}/${formatNumber(event.totalBytes)} bytes`;
+  return `${event.phase}${shard}${bytes}`;
 }
 
 function appendMessage(role: "user" | "assistant", text: string, image?: PendingImage): HTMLElement {
@@ -151,6 +192,11 @@ function readRuntimeConfig(): RuntimeConfig | null {
   const compiledTokenizerUrl = injected.compiledTokenizerUrl;
   const maxVisualTokens = injected.maxVisualTokens;
   const visionShortestEdge = injected.visionShortestEdge;
+  const bufferShardPolicy = injected.bufferShardPolicy;
+  const hasBufferShardPolicy =
+    bufferShardPolicy === "default" ||
+    bufferShardPolicy === "evidence-128" ||
+    bufferShardPolicy === "evidence-64";
   const hasManifest = typeof injected.manifest === "object" && injected.manifest !== null;
   const hasManifestUrl = typeof injected.manifestUrl === "string" && injected.manifestUrl.length > 0;
   if (
@@ -159,6 +205,7 @@ function readRuntimeConfig(): RuntimeConfig | null {
     typeof expectedPackageBaseUrl !== "string" || expectedPackageBaseUrl.length === 0 ||
     typeof expectedManifestSha256 !== "string" || expectedManifestSha256.length === 0 ||
     typeof compiledTokenizerUrl !== "string" || compiledTokenizerUrl.length === 0
+    || (bufferShardPolicy !== undefined && !hasBufferShardPolicy)
   ) {
     return null;
   }
@@ -179,17 +226,180 @@ function readRuntimeConfig(): RuntimeConfig | null {
     expectedPackageBaseUrl,
     expectedManifestSha256,
     compiledTokenizerUrl,
+    ...(hasBufferShardPolicy ? { bufferShardPolicy } : {}),
   });
 }
 
-async function loadManifest(config: RuntimeConfig): Promise<ModelPackageManifest> {
+async function loadManifest(
+  config: RuntimeConfig,
+  signal: AbortSignal,
+): Promise<ModelPackageManifest> {
   if (config.manifest !== undefined) return config.manifest;
   if (config.manifestUrl === undefined) throw new Error("The pinned language manifest is not configured.");
-  const response = await fetch(config.manifestUrl, { cache: "no-store" });
+  const response = await fetch(config.manifestUrl, {
+    cache: "no-store",
+    signal,
+  });
   if (!response.ok) throw new Error("The pinned language manifest could not be loaded.");
   const value: unknown = await response.json();
   if (typeof value !== "object" || value === null) throw new Error("The language manifest is invalid.");
   return value as ModelPackageManifest;
+}
+
+function emptyRuntimeMetrics(state: Qwen35SessionState): RuntimeMetrics {
+  return {
+    state,
+    phases: {},
+    cacheHit: null,
+    trackedCpuBytes: 0,
+    trackedGpuBytes: 0,
+    peakTrackedGpuBytes: 0,
+    contextTokens: 0,
+    timeToFirstTokenMilliseconds: null,
+    prefillTokens: 0,
+    prefillTokensPerSecond: null,
+    generatedTokens: 0,
+    generatedTokensPerSecond: null,
+    cancellationCount: 0,
+    deviceLostCount: 0,
+  };
+}
+
+function createRuntimeCoordinator(
+  resolveLoadOptions: (
+    signal: AbortSignal,
+  ) => Promise<Parameters<Qwen35Session["load"]>[0]>,
+): Qwen35RuntimeCoordinator {
+  const listeners = new Set<(event: RuntimeLoadEvent) => void>();
+  let session: Qwen35Session | null = null;
+  let loadingPromise: Promise<void> | null = null;
+  let loadController: AbortController | null = null;
+  let hasSequence = false;
+  let lastMetrics = emptyRuntimeMetrics("idle");
+
+  const report = (event: RuntimeLoadEvent): void => {
+    for (const listener of listeners) {
+      try {
+        // UI and development telemetry are observers, never load authorities.
+        listener(event);
+      } catch {
+        // One observer cannot hide progress from the remaining observers.
+      }
+    }
+  };
+
+  const requireSession = (): Qwen35Session => {
+    if (session === null) throw new Error("The Qwen3.5 runtime is not loaded.");
+    return session;
+  };
+
+  const coordinator: Qwen35RuntimeCoordinator = {
+    get state() {
+      return session?.state ?? lastMetrics.state;
+    },
+    async load() {
+      if (session?.state === "ready") return;
+      if (loadingPromise !== null) return loadingPromise;
+      if (session !== null) {
+        lastMetrics = session.getMetrics();
+        await session.dispose().catch(() => undefined);
+        session = null;
+      }
+      const created = new Qwen35Session();
+      const controller = new AbortController();
+      session = created;
+      loadController = controller;
+      let failedEventReported = false;
+      const reportAttempt = (event: RuntimeLoadEvent): void => {
+        if (event.phase === "failed") failedEventReported = true;
+        report(event);
+      };
+      const pending = (async () => {
+        try {
+          const loadOptions = await resolveLoadOptions(controller.signal);
+          // The resolver may ignore cancellation. This boundary prevents any
+          // later lock, cache, device, or model work after cancellation.
+          controller.signal.throwIfAborted();
+          await created.load({
+            ...loadOptions,
+            signal: controller.signal,
+            onLoadEvent: reportAttempt,
+          });
+          lastMetrics = created.getMetrics();
+        } catch (error) {
+          const failureMetrics = created.getMetrics();
+          const failedBeforeSessionLoad = failureMetrics.state === "idle";
+          const cancelled = controller.signal.aborted;
+          lastMetrics = cancelled
+            ? emptyRuntimeMetrics("idle")
+            : failedBeforeSessionLoad
+            ? emptyRuntimeMetrics("failed")
+            : failureMetrics;
+          await created.dispose().catch(() => undefined);
+          if (session === created) session = null;
+          if (failedBeforeSessionLoad && !failedEventReported && !cancelled) {
+            // Manifest and runtime-config failures happen before Session.load(),
+            // so the coordinator owns their one safe terminal event.
+            reportAttempt({
+              phase: "failed",
+              completedBytes: 0,
+              totalBytes: 0,
+            });
+          }
+          throw error;
+        }
+      })();
+      loadingPromise = pending;
+      try {
+        await pending;
+      } finally {
+        if (loadingPromise === pending) loadingPromise = null;
+        if (loadController === controller) loadController = null;
+      }
+    },
+    async replaceConversation(input) {
+      const active = requireSession();
+      if (hasSequence) {
+        await active.reset();
+        hasSequence = false;
+      }
+      const sequence = await active.prefill(input);
+      hasSequence = true;
+      return sequence;
+    },
+    generate(options) {
+      return requireSession().generate(options);
+    },
+    async cancel() {
+      loadController?.abort();
+      await session?.cancel();
+    },
+    async reset() {
+      if (session === null) return;
+      await session.reset();
+      hasSequence = false;
+    },
+    async dispose() {
+      const pendingLoad = loadingPromise;
+      loadController?.abort();
+      const active = session;
+      if (active !== null) {
+        await active.dispose();
+        lastMetrics = active.getMetrics();
+        if (session === active) session = null;
+      }
+      await pendingLoad?.catch(() => undefined);
+      hasSequence = false;
+    },
+    getMetrics() {
+      return session?.getMetrics() ?? lastMetrics;
+    },
+    subscribeLoadEvents(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+  return Object.freeze(coordinator);
 }
 
 async function imageToRgb(file: File, signal: AbortSignal): Promise<{ readonly rgb: Uint8Array; readonly width: number; readonly height: number }> {
@@ -247,17 +457,49 @@ function contentForUser(text: string, image: PendingImage | null): readonly Qwen
   return parts;
 }
 
-async function startApp(container: HTMLElement): Promise<void> {
+export function startQwen35ChatApp(
+  container: HTMLElement,
+  options: Qwen35ChatAppOptions = {},
+): Qwen35ChatAppHandle {
   const messages: Qwen35ChatMessage[] = [];
-  let session: Qwen35Session | null = null;
   let runtimeConfig: RuntimeConfig | null = readRuntimeConfig();
   let pendingImage: PendingImage | null = null;
   let preprocessController: AbortController | null = null;
   let sendController: AbortController | null = null;
-  let hasPrefilled = false;
   let generationLimit = 192;
-  let loadingPromise: Promise<Qwen35Session> | null = null;
   const operationGate = new ChatOperationGate();
+  const coordinator = createRuntimeCoordinator(async (signal) => {
+    if (runtimeConfig === null) {
+      throw new Error("Runtime config is not installed. Set the local model package configuration first.");
+    }
+    statusText("Authenticating package");
+    const manifest = await loadManifest(runtimeConfig, signal);
+    return {
+      manifest,
+      packageBaseUrl: runtimeConfig.packageBaseUrl,
+      expectedPackageBaseUrl: runtimeConfig.expectedPackageBaseUrl,
+      expectedManifestSha256: runtimeConfig.expectedManifestSha256,
+      compiledTokenizerUrl: runtimeConfig.compiledTokenizerUrl,
+      ...(runtimeConfig.bufferShardPolicy === undefined
+        ? {}
+        : { bufferShardPolicy: runtimeConfig.bufferShardPolicy }),
+      ...(options.webGpuSurface === undefined
+        ? {}
+        : { webGpuSurface: options.webGpuSurface }),
+      ...(options.uploadLaneBytes === undefined
+        ? {}
+        : { uploadLaneBytes: options.uploadLaneBytes }),
+      ...(options.uploadRetirementPolicy === undefined
+        ? {}
+        : { uploadRetirementPolicy: options.uploadRetirementPolicy }),
+      ...(runtimeConfig.allowInsecureLocalhost === true
+        ? { allowInsecureLocalhost: true }
+        : {}),
+      ...(runtimeConfig.visionPackagePins === undefined
+        ? {}
+        : { visionPackagePins: runtimeConfig.visionPackagePins }),
+    };
+  });
 
   const renderImagePreview = (): void => {
     const slot = element<HTMLElement>("[data-image-preview]");
@@ -284,45 +526,11 @@ async function startApp(container: HTMLElement): Promise<void> {
     slot.append(image, remove);
   };
 
-  const ensureSession = async (): Promise<Qwen35Session> => {
-    if (loadingPromise !== null) return loadingPromise;
-    if (session !== null) return session;
-    if (runtimeConfig === null) {
-      throw new Error("Runtime config is not installed. Set the local model package configuration first.");
-    }
-    const pending = (async () => {
-      statusText("Authenticating package");
-      const manifest = await loadManifest(runtimeConfig!);
-      const created = new Qwen35Session();
-      try {
-        await created.load({
-          manifest,
-          packageBaseUrl: runtimeConfig!.packageBaseUrl,
-          expectedPackageBaseUrl: runtimeConfig!.expectedPackageBaseUrl,
-          expectedManifestSha256: runtimeConfig!.expectedManifestSha256,
-          compiledTokenizerUrl: runtimeConfig!.compiledTokenizerUrl,
-          ...(runtimeConfig!.allowInsecureLocalhost === true
-            ? { allowInsecureLocalhost: true }
-            : {}),
-          ...(runtimeConfig!.visionPackagePins === undefined
-            ? {}
-            : { visionPackagePins: runtimeConfig!.visionPackagePins }),
-        });
-        session = created;
-        statusText("Ready for a prompt");
-        updateMetrics(created.getMetrics());
-        return created;
-      } catch (error) {
-        await created.dispose().catch(() => undefined);
-        throw error;
-      }
-    })();
-    loadingPromise = pending;
-    try {
-      return await pending;
-    } finally {
-      if (loadingPromise === pending) loadingPromise = null;
-    }
+  const ensureSession = async (): Promise<Qwen35RuntimeCoordinator> => {
+    await coordinator.load();
+    statusText("Ready for a prompt");
+    updateMetrics(coordinator.getMetrics());
+    return coordinator;
   };
 
   const sendImplementation = async (): Promise<void> => {
@@ -340,14 +548,12 @@ async function startApp(container: HTMLElement): Promise<void> {
     prompt.value = "";
     pendingImage = null;
     renderImagePreview();
-    let loaded: Qwen35Session | null = null;
+    let loaded: Qwen35RuntimeCoordinator | null = null;
     try {
       loaded = await ensureSession();
-      if (hasPrefilled) await loaded.reset();
       statusText("Prefilling conversation");
-      const state = await loaded.prefill(nextMessages);
+      const state = await loaded.replaceConversation(nextMessages);
       messages.push(userMessage);
-      hasPrefilled = true;
       element<HTMLElement>("[data-context-copy]").textContent = `${formatNumber(state.contextTokens)} context tokens`;
       const assistant = appendMessage("assistant", "");
       const output = assistant.querySelector<HTMLElement>(".message__text")!;
@@ -363,16 +569,14 @@ async function startApp(container: HTMLElement): Promise<void> {
       statusText("Ready for a prompt");
       updateMetrics(loaded.getMetrics());
     } catch (error) {
-      const failedSession = loaded ?? session;
+      const failedSession = loaded ?? coordinator;
       const presentation = presentChatGenerationFailure(error, {
         cancellationRequested: controller.signal.aborted,
         runtimeFailed: failedSession?.state === "failed",
       });
-      if (failedSession?.state === "failed") {
+      if (failedSession.state === "failed") {
         await failedSession.dispose().catch(() => undefined);
         updateMetrics(failedSession.getMetrics());
-        session = null;
-        hasPrefilled = false;
       }
       appendNotice(
         presentation.notice,
@@ -423,9 +627,8 @@ async function startApp(container: HTMLElement): Promise<void> {
     void send();
   });
   element<HTMLButtonElement>("[data-stop]").addEventListener("click", () => {
-    const activeSession = session;
     sendController?.abort();
-    if (activeSession !== null) void activeSession.cancel().catch(() => undefined);
+    void coordinator.cancel().catch(() => undefined);
   });
   element<HTMLButtonElement>("[data-image-button]").addEventListener("click", () => element<HTMLInputElement>("[data-image-input]").click());
   element<HTMLInputElement>("[data-image-input]").addEventListener("change", (event) => {
@@ -450,17 +653,16 @@ async function startApp(container: HTMLElement): Promise<void> {
       setBusy(true);
       statusText("Resetting conversation");
       try {
-        await session?.reset();
+        await coordinator.reset();
         if (pendingImage !== null) URL.revokeObjectURL(pendingImage.previewUrl);
         pendingImage = null;
         renderImagePreview();
         messages.length = 0;
-        hasPrefilled = false;
         element<HTMLElement>("[data-messages]").replaceChildren();
         element<HTMLElement>("[data-context-copy]").textContent = emptyChatContextCopy();
         appendNotice("New conversation ready.");
         setPanel(false);
-        if (session !== null) updateMetrics(session.getMetrics());
+        updateMetrics(coordinator.getMetrics());
         statusText("Ready for a prompt");
       } catch (error) {
         appendNotice(error instanceof Error ? error.message : "The conversation could not be reset.", "error");
@@ -479,25 +681,51 @@ async function startApp(container: HTMLElement): Promise<void> {
 
   // Configuration is deliberately injected at runtime. No local address,
   // operator token, cache path, or private model URL enters the Pages build.
+  coordinator.subscribeLoadEvents((event) => {
+    updateMetrics(coordinator.getMetrics());
+    statusText(formatLoadProgress(event));
+    element<HTMLElement>("[data-metric-phase]").textContent = event.phase;
+    if (event.currentGpuBytes !== undefined) {
+      element<HTMLElement>("[data-metric-memory]").textContent =
+        `${(event.currentGpuBytes / (1024 ** 3)).toFixed(2)} GB`;
+    }
+  });
+
   if (runtimeConfig === null) {
     statusText("Runtime config not installed");
     appendNotice("Add a public model package config to start the Chrome validation loop.");
-  } else {
+  } else if (options.autoLoad !== false) {
     setBusy(true);
     void ensureSession()
       .catch((error) => {
-        session = null;
         statusText("Load failed");
         appendNotice(error instanceof Error ? error.message : "Model load failed.", "error");
       })
       .finally(() => {
         if (!operationGate.busy) setBusy(false);
       });
+  } else {
+    statusText("Waiting for load command");
   }
 
   window.addEventListener("beforeunload", () => {
     preprocessController?.abort();
     sendController?.abort();
-    void session?.dispose();
+    void coordinator.dispose();
   });
+
+  return Object.freeze({ coordinator });
+}
+
+const publicRoot = typeof document === "undefined"
+  ? null
+  : document.querySelector<HTMLElement>("#qwen-app");
+// Development imports this module too, so only the public script tag may
+// trigger automatic startup. The development entry installs control first.
+const hasPublicEntrypoint = typeof document !== "undefined" &&
+  [...document.scripts].some((script) =>
+    script.type === "module" && /(?:^|\/)chat-app\.js$/.test(new URL(script.src, location.href).pathname)
+  );
+if (publicRoot !== null && hasPublicEntrypoint) {
+  startQwen35ChatApp(publicRoot);
 }

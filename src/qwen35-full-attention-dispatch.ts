@@ -5,7 +5,10 @@ import {
   planQwen35HybridDispatch,
   type Qwen35HybridOperation,
 } from "./hybrid-kernels.js";
-import type { Qwen35HybridLayerResources } from "./hybrid-state.js";
+import {
+  QWEN35_HYBRID_STATE_PAGE_TOKENS,
+  type Qwen35HybridLayerResources,
+} from "./hybrid-state.js";
 import {
   QWEN_PRIMITIVE_KERNELS,
   planPrimitiveDispatch,
@@ -39,6 +42,8 @@ const KEY_VALUE = 1_024;
 const ATTENTION_OUTPUT = 4_096;
 const FFN = 9_216;
 const KV_ROW_BYTES = 2_048;
+const MAX_KV_PAGE_COUNT = 16_384 / QWEN35_HYBRID_STATE_PAGE_TOKENS;
+const NON_ONLINE_FIXED_UNIFORM_COUNT = 6;
 
 export type Qwen35FullAttentionLayerStage =
   | "input-rms"
@@ -96,7 +101,8 @@ export interface PlanQwen35FullAttentionLayerGeometryInput {
 
 export interface Qwen35FullAttentionLayerGeometry {
   readonly layer: number;
-  readonly fixedUniformCount: 7;
+  /** Maximum fixed slots; online attention consumes one slot per resident page. */
+  readonly fixedUniformCount: 70;
   readonly physicalGemvPieceCount: number;
   readonly uniformCount: number;
 }
@@ -356,9 +362,11 @@ function fullAttentionGeometryData(
   );
   const geometry = Object.freeze({
     layer: input.invocation.layer,
-    fixedUniformCount: 7 as const,
+    fixedUniformCount: (NON_ONLINE_FIXED_UNIFORM_COUNT + MAX_KV_PAGE_COUNT) as 70,
     physicalGemvPieceCount,
-    uniformCount: physicalGemvPieceCount + 7,
+    uniformCount:
+      physicalGemvPieceCount + NON_ONLINE_FIXED_UNIFORM_COUNT +
+      MAX_KV_PAGE_COUNT,
   });
   return Object.freeze({ sequence, matrixWeights, directWeights, geometry });
 }
@@ -437,34 +445,56 @@ function workspaceSlice(
   return Object.freeze({ buffer: view.binding.buffer, offset: 0, byteLength: view.byteLength });
 }
 
-function stateSlice(
+interface Qwen35AttentionStatePage {
+  readonly tokenStart: number;
+  readonly tokenCapacity: number;
+  readonly slice: Qwen35ForwardBufferSlice;
+}
+
+function statePages(
   resource: Extract<Qwen35HybridLayerResources, { kind: "full-attention" }>["key"],
-  capacity: number,
+  logicalCapacity: number,
   limits: Qwen35ForwardDeviceLimits,
-): Qwen35ForwardBufferSlice {
-  const bytes = capacity * KV_ROW_BYTES;
+): readonly Qwen35AttentionStatePage[] {
   if (
-    !Number.isSafeInteger(capacity) || capacity < 1 || capacity > 16_384 ||
-    resource.bytes !== BigInt(bytes) || resource.byteLength !== BigInt(bytes)
+    !Number.isSafeInteger(logicalCapacity) || logicalCapacity < 1 ||
+    logicalCapacity > 16_384 || resource.bytes !== resource.byteLength ||
+    resource.byteLength <= 0n || resource.byteLength % BigInt(KV_ROW_BYTES) !== 0n
   ) {
     fail("full-attention-state-invalid", "A Qwen3.5 full-attention state view is invalid");
   }
-  if (resource.shards.length !== 1 || bytes > limits.maxStorageBufferBindingSize) {
-    fail(
-      "full-attention-state-pages-unsupported",
-      "The current full-attention kernel ABI cannot address multiple K/V pages; use a page-aware kernel or a larger state shard",
-    );
-  }
-  const shard = resource.shards[0];
+  let expectedOffset = 0n;
+  const pages = resource.shards.map((shard) => {
+    if (
+      shard.logicalByteOffset !== expectedOffset ||
+      shard.logicalByteLength <= 0n ||
+      shard.logicalByteLength % BigInt(KV_ROW_BYTES) !== 0n ||
+      shard.allocatedByteLength < shard.logicalByteLength ||
+      shard.logicalByteLength > BigInt(limits.maxStorageBufferBindingSize) ||
+      shard.logicalByteOffset > BigInt(Number.MAX_SAFE_INTEGER) ||
+      shard.logicalByteLength > BigInt(Number.MAX_SAFE_INTEGER)
+    ) {
+      fail("full-attention-state-invalid", "A Qwen3.5 full-attention state page is invalid");
+    }
+    const tokenStart = Number(shard.logicalByteOffset / BigInt(KV_ROW_BYTES));
+    const tokenCapacity = Number(shard.logicalByteLength / BigInt(KV_ROW_BYTES));
+    const slice = Object.freeze({
+      buffer: shard.buffer,
+      offset: 0,
+      byteLength: Number(shard.logicalByteLength),
+    });
+    makeBinding(0, "storage", slice, slice.byteLength, limits);
+    expectedOffset += shard.logicalByteLength;
+    return Object.freeze({ tokenStart, tokenCapacity, slice });
+  });
   if (
-    shard === undefined || shard.logicalByteOffset !== 0n ||
-    shard.logicalByteLength !== BigInt(bytes) || shard.allocatedByteLength < BigInt(bytes)
+    pages.length < 1 || pages.length > logicalCapacity ||
+    expectedOffset !== resource.byteLength ||
+    Number(expectedOffset / BigInt(KV_ROW_BYTES)) > logicalCapacity
   ) {
-    fail("full-attention-state-invalid", "A Qwen3.5 full-attention state page is invalid");
+    fail("full-attention-state-invalid", "A Qwen3.5 full-attention state page directory is invalid");
   }
-  const slice = Object.freeze({ buffer: shard.buffer, offset: 0, byteLength: bytes });
-  makeBinding(0, "storage", slice, bytes, limits);
-  return slice;
+  return Object.freeze(pages);
 }
 
 function rangeOverlaps(left: BufferRange, right: BufferRange): boolean {
@@ -529,7 +559,7 @@ export function planQwen35FullAttentionLayerDispatch(
 ): Qwen35FullAttentionLayerDispatchPlan {
   const geometryData = fullAttentionGeometryData(input);
   const { sequence, matrixWeights } = geometryData;
-  if (input.uniforms.length !== geometryData.geometry.uniformCount) {
+  if (input.uniforms.length > geometryData.geometry.uniformCount) {
     fail("full-attention-uniform-count-invalid", "Qwen3.5 full-attention uniform count is invalid");
   }
   if (
@@ -541,30 +571,61 @@ export function planQwen35FullAttentionLayerDispatch(
   }
 
   let preparePlan: ReturnType<typeof planQwen35HybridDispatch>;
-  let onlinePlan: ReturnType<typeof planQwen35HybridDispatch>;
   try {
-    preparePlan = planQwen35HybridDispatch({
-      operation: "full-attention-prepare",
-      maxComputeWorkgroupsPerDimension: input.limits.maxComputeWorkgroupsPerDimension,
-      position: input.position,
-      capacity: input.capacity,
-      positions: input.mropePositions,
-    });
-    onlinePlan = planQwen35HybridDispatch({
-      operation: "full-attention-online",
-      maxComputeWorkgroupsPerDimension: input.limits.maxComputeWorkgroupsPerDimension,
-      position: input.position,
-      capacity: input.capacity,
-      tokenCount: input.position + 1,
-    });
+    if (
+      !Number.isSafeInteger(input.position) || input.position < 0 ||
+      !Number.isSafeInteger(input.capacity) || input.capacity < 1 ||
+      input.capacity > 16_384 || input.position >= input.capacity
+    ) {
+      throw new Error("invalid logical context address");
+    }
   } catch {
     fail("full-attention-context-invalid", "The Qwen3.5 full-attention context address is invalid");
   }
 
-  // Validate the current state ABI before model bindings. A reduced binding
-  // limit requires a page-aware attention kernel, not a generic size failure.
-  const keyState = stateSlice(input.state.key, input.capacity, input.limits);
-  const valueState = stateSlice(input.state.value, input.capacity, input.limits);
+  const keyPages = statePages(input.state.key, input.capacity, input.limits);
+  const valuePages = statePages(input.state.value, input.capacity, input.limits);
+  if (
+    keyPages.length !== valuePages.length ||
+    keyPages.some((page, index) => {
+      const value = valuePages[index];
+      return value === undefined || page.tokenStart !== value.tokenStart ||
+        page.tokenCapacity !== value.tokenCapacity;
+    })
+  ) {
+    fail("full-attention-state-invalid", "Qwen3.5 K/V state pages do not match");
+  }
+  const activePages = keyPages.filter(({ tokenStart }) => tokenStart <= input.position);
+  const activeValuePages = valuePages.slice(0, activePages.length);
+  const targetPageIndex = activePages.findIndex(
+    ({ tokenStart, tokenCapacity }) =>
+      input.position >= tokenStart && input.position < tokenStart + tokenCapacity,
+  );
+  if (
+    targetPageIndex < 0 || activePages.length > MAX_KV_PAGE_COUNT ||
+    activePages.length !== targetPageIndex + 1
+  ) {
+    fail("full-attention-state-invalid", "The current token has no resident Qwen3.5 K/V page");
+  }
+  const targetKeyPage = activePages[targetPageIndex]!;
+  const targetValuePage = activeValuePages[targetPageIndex]!;
+  const localPosition = input.position - targetKeyPage.tokenStart;
+  try {
+    preparePlan = planQwen35HybridDispatch({
+      operation: "full-attention-prepare",
+      maxComputeWorkgroupsPerDimension: input.limits.maxComputeWorkgroupsPerDimension,
+      position: localPosition,
+      capacity: targetKeyPage.tokenCapacity,
+      positions: input.mropePositions,
+    });
+  } catch {
+    fail("full-attention-context-invalid", "The Qwen3.5 full-attention page context address is invalid");
+  }
+  const requiredUniformCount = geometryData.geometry.physicalGemvPieceCount +
+    NON_ONLINE_FIXED_UNIFORM_COUNT + activePages.length;
+  if (input.uniforms.length < requiredUniformCount) {
+    fail("full-attention-uniform-count-invalid", "Qwen3.5 full-attention uniforms are incomplete");
+  }
 
   const direct = {
     inputNorm: requireDirectF32Weight(geometryData.directWeights.inputNorm, input.limits),
@@ -589,8 +650,12 @@ export function planQwen35FullAttentionLayerDispatch(
     buffer: slice.buffer, offset: slice.offset, size: slice.byteLength,
   }));
   mutableRanges.push(
-    { buffer: keyState.buffer, offset: 0, size: keyState.byteLength },
-    { buffer: valueState.buffer, offset: 0, size: valueState.byteLength },
+    ...activePages.map(({ slice }) => ({
+      buffer: slice.buffer, offset: slice.offset, size: slice.byteLength,
+    })),
+    ...activeValuePages.map(({ slice }) => ({
+      buffer: slice.buffer, offset: slice.offset, size: slice.byteLength,
+    })),
   );
   requireDisjointRanges(mutableRanges, "full-attention-buffer-alias-invalid");
 
@@ -678,8 +743,8 @@ export function planQwen35FullAttentionLayerDispatch(
     Object.freeze({ ...direct.queryNorm.binding, binding: 3 }),
     Object.freeze({ ...direct.keyNorm.binding, binding: 4 }),
     storage(5, activations.preparedQueryGate, QUERY_GATE * 4),
-    storage(6, keyState, keyState.byteLength),
-    storage(7, valueState, valueState.byteLength),
+    storage(6, targetKeyPage.slice, targetKeyPage.slice.byteLength),
+    storage(7, targetValuePage.slice, targetValuePage.slice.byteLength),
     uniformBinding(8, prepareUniform, 32),
   ];
   requireOutputDisjoint(prepareBindings[5]!, prepareBindings.slice(0, 5));
@@ -688,26 +753,58 @@ export function planQwen35FullAttentionLayerDispatch(
     kernel: hybridKernel("full-attention-prepare"),
     bindings: prepareBindings,
     workgroups: preparePlan.workgroups,
-    uniformWords: [input.position, input.capacity, ...input.mropePositions, 0, 0, 0],
+    uniformWords: [
+      localPosition,
+      targetKeyPage.tokenCapacity,
+      ...input.mropePositions,
+      0,
+      0,
+      0,
+    ],
     mutatesPersistentState: true,
   }));
 
-  const onlineUniform = nextUniform(4, 16);
-  const onlineBindings = [
-    storage(0, activations.preparedQueryGate, QUERY_GATE * 4),
-    storage(1, keyState, keyState.byteLength),
-    storage(2, valueState, valueState.byteLength),
-    storage(3, activations.attention, ATTENTION_OUTPUT * 4),
-    uniformBinding(4, onlineUniform, 16),
-  ];
-  requireOutputDisjoint(onlineBindings[3]!, onlineBindings.slice(0, 3));
-  commands.push(frozenCommand({
-    stage: "full-attention-online",
-    kernel: hybridKernel("full-attention-online"),
-    bindings: onlineBindings,
-    workgroups: onlinePlan.workgroups,
-    uniformWords: [input.position + 1, input.position, input.capacity, 0],
-  }));
+  // Each dispatch binds one stable KV page. The shader carries the online
+  // softmax accumulator through activation storage, so no score matrix or
+  // monolithic 16K K/V binding is required.
+  for (const [pageIndex, keyPage] of activePages.entries()) {
+    const valuePage = activeValuePages[pageIndex]!;
+    const tokenCount = pageIndex === targetPageIndex
+      ? localPosition + 1
+      : keyPage.tokenCapacity;
+    let onlinePlan: ReturnType<typeof planQwen35HybridDispatch>;
+    try {
+      onlinePlan = planQwen35HybridDispatch({
+        operation: "full-attention-online",
+        maxComputeWorkgroupsPerDimension: input.limits.maxComputeWorkgroupsPerDimension,
+        position: tokenCount - 1,
+        capacity: keyPage.tokenCapacity,
+        tokenCount,
+      });
+    } catch {
+      fail("full-attention-context-invalid", "The Qwen3.5 full-attention page range is invalid");
+    }
+    const onlineUniform = nextUniform(5, 16);
+    const onlineBindings = [
+      storage(0, activations.preparedQueryGate, QUERY_GATE * 4),
+      storage(1, keyPage.slice, keyPage.slice.byteLength),
+      storage(2, valuePage.slice, valuePage.slice.byteLength),
+      storage(3, activations.attention, ATTENTION_OUTPUT * 4),
+      storage(4, activations.key, 16 * 2 * 4),
+      uniformBinding(5, onlineUniform, 16),
+    ];
+    requireOutputDisjoint(
+      onlineBindings[3]!,
+      onlineBindings.filter((_, index) => index !== 3),
+    );
+    commands.push(frozenCommand({
+      stage: "full-attention-online",
+      kernel: hybridKernel("full-attention-online"),
+      bindings: onlineBindings,
+      workgroups: onlinePlan.workgroups,
+      uniformWords: [tokenCount, pageIndex, activePages.length, 0],
+    }));
+  }
 
   addGemv("attention-output-projection", matrixWeights.output, activations.attention, activations.normalized);
   addPrimitive("attention-residual", "residual-add", [activations.normalized, activations.hidden, activations.hiddenSecondary], HIDDEN, [HIDDEN, 0, 0, 0]);
@@ -719,7 +816,7 @@ export function planQwen35FullAttentionLayerDispatch(
   addGemv("ffn-down-projection", matrixWeights.ffnDown, activations.ffnProduct, activations.normalized);
   addPrimitive("mlp-residual", "residual-add", [activations.normalized, activations.hiddenSecondary, activations.hidden], HIDDEN, [HIDDEN, 0, 0, 0]);
 
-  if (uniformCursor !== geometryData.geometry.uniformCount) {
+  if (uniformCursor !== requiredUniformCount) {
     fail("full-attention-uniform-count-invalid", "Qwen3.5 full-attention uniform count is invalid");
   }
   requireDisjointRanges(usedUniforms, "full-attention-uniform-alias-invalid");

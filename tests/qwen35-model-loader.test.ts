@@ -428,6 +428,16 @@ test("installs the production Qwen driver before package validation", async () =
   assert.equal(manifestAccessed, true);
 });
 
+test("prewarms one lazy state page before weight and driver initialization", async () => {
+  const source = await import("node:fs/promises").then(({ readFile }) =>
+    readFile(new URL("../src/qwen35-model-loader.ts", import.meta.url), "utf8")
+  );
+  const prewarm = source.indexOf("await hybridState.ensureCapacity(1, signal)");
+  const weights = source.indexOf("initializeQwen35WeightExecution({");
+  assert.ok(prewarm >= 0);
+  assert.ok(weights > prewarm);
+});
+
 test("requires the exact pinned language and tokenizer source identities", () => {
   const identity = {
     packageKind: "language",
@@ -622,6 +632,36 @@ test("GPU cleanup awaits queue completion before destroying owned resources", as
     "driver",
     "queue-start",
     "queue-end",
+    "state",
+    "weight",
+    "device",
+    "ledger",
+  ]);
+});
+
+test("GPU cleanup quiesces borrowed streaming owners before the final queue fence", async () => {
+  const events: string[] = [];
+
+  await cleanupQwen35GpuResources({
+    vision: { async dispose() { events.push("vision"); } },
+    driver: { ...driver, async dispose() { events.push("driver"); } },
+    rollingLayers: { async dispose() { events.push("rolling"); } },
+    tiedEmbedding: { async dispose() { events.push("tied"); } },
+    device: {
+      queue: { async onSubmittedWorkDone() { events.push("queue"); } },
+      destroy() { events.push("device"); },
+    },
+    hybridState: { dispose() { events.push("state"); } },
+    weightAllocations: [{ ...allocation, destroy() { events.push("weight"); } }],
+    ledger: { assertAllReleased() { events.push("ledger"); } },
+  });
+
+  assert.deepEqual(events, [
+    "vision",
+    "driver",
+    "rolling",
+    "tied",
+    "queue",
     "state",
     "weight",
     "device",

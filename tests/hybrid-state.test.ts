@@ -108,9 +108,11 @@ test("allocates, resets, advances, and disposes every logical state exactly once
       ) => Promise<void>;
     }) => Promise<{
       readonly capacity: number;
+      readonly residentCapacity: number;
       readonly position: number;
       readonly byteLength: bigint;
       readonly resourceCount: number;
+      ensureCapacity(requiredEnd: number): Promise<void>;
       advance(tokens: number): { readonly start: number; readonly end: number };
       reset(): Promise<void>;
       dispose(): void;
@@ -124,26 +126,34 @@ test("allocates, resets, advances, and disposes every logical state exactly once
   });
 
   assert.equal(state.capacity, 16_384);
+  assert.equal(state.residentCapacity, 0);
   assert.equal(state.position, 0);
+  assert.equal(state.byteLength, 0n);
+  assert.equal(state.resourceCount, 0);
+  assert.equal(allocated.length, 0);
+
+  await state.ensureCapacity(16_384);
+  assert.equal(state.residentCapacity, 16_384);
   assert.equal(state.byteLength, 590_348_288n);
   assert.equal(state.resourceCount, 64);
-  assert.equal(allocated.length, 64);
+  assert.equal(allocated.length, 1_072);
+  assert.equal(new Set(allocated.map(({ id }) => id)).size, 1_072);
   assert.deepEqual(state.advance(2), { start: 0, end: 2 });
   assert.equal(state.position, 2);
   await state.reset();
   assert.equal(state.position, 0);
-  assert.equal(cleared.length, 64);
+  assert.equal(cleared.length, 1_072);
   assert.throws(() => state.advance(16_385), /capacity/i);
   assert.throws(() => state.advance(0), /positive/i);
 
   state.dispose();
   state.dispose();
-  assert.equal(destroyed.length, 64);
+  assert.equal(destroyed.length, 1_072);
   assert.throws(() => state.advance(1), /disposed/i);
   await assert.rejects(state.reset(), /disposed/i);
 });
 
-test("rolls back all owned allocations when state creation fails", async () => {
+test("rolls back all staged allocations when initial state growth fails", async () => {
   const module = await loadHybridStateModule();
   const destroyed: string[] = [];
   let allocationCount = 0;
@@ -169,23 +179,33 @@ test("rolls back all owned allocations when state creation fails", async () => {
     },
   };
 
-  await assert.rejects(
-    (
-      module.createQwen35HybridState as (options: {
-        readonly arena: typeof arena;
-        readonly capacity: number;
-        readonly clearAllocation: () => Promise<void>;
-      }) => Promise<unknown>
-    )({
-      arena,
-      capacity: 16_384,
-      clearAllocation: async () => {},
-    }),
-    /state allocation failed/i,
-  );
+  const state = await (
+    module.createQwen35HybridState as (options: {
+      readonly arena: typeof arena;
+      readonly capacity: number;
+      readonly clearAllocation: () => Promise<void>;
+    }) => Promise<{
+      readonly residentCapacity: number;
+      readonly byteLength: bigint;
+      ensureCapacity(requiredEnd: number): Promise<void>;
+      dispose(): void;
+    }>
+  )({
+    arena,
+    capacity: 16_384,
+    clearAllocation: async () => {},
+  });
+
+  await assert.rejects(state.ensureCapacity(1), {
+    code: "unknown",
+    message: "Hybrid state allocation failed",
+  });
   assert.equal(allocationCount, 7);
   assert.equal(destroyed.length, 6);
   assert.equal(new Set(destroyed).size, 6);
+  assert.equal(state.residentCapacity, 0);
+  assert.equal(state.byteLength, 0n);
+  state.dispose();
 });
 
 test("poisons partially cleared state so only disposal remains legal", async () => {
@@ -215,6 +235,7 @@ test("poisons partially cleared state so only disposal remains legal", async () 
       readonly capacity: number;
       readonly clearAllocation: () => Promise<void>;
     }) => Promise<{
+      ensureCapacity(requiredEnd: number): Promise<void>;
       advance(tokens: number): unknown;
       reset(): Promise<void>;
       dispose(): void;
@@ -229,6 +250,7 @@ test("poisons partially cleared state so only disposal remains legal", async () 
       }
     },
   });
+  await state.ensureCapacity(1);
   state.advance(1);
 
   await assert.rejects(state.reset(), /reset failed/i);
@@ -265,7 +287,9 @@ interface TestResourceView {
 }
 
 interface TestHybridState {
+  readonly residentCapacity: number;
   readonly byteLength: bigint;
+  ensureCapacity(requiredEnd: number): Promise<void>;
   getResource(
     layer: number,
     kind: TestResourceView["kind"],
@@ -326,6 +350,7 @@ test("exposes immutable resource views for all 32 model layers", async () => {
       readonly clearAllocation: () => Promise<void>;
     }) => Promise<TestHybridState>
   )({ arena, capacity: 16_384, clearAllocation: async () => {} });
+  await state.ensureCapacity(1);
 
   for (let layer = 0; layer < 32; layer += 1) {
     const resources = state.getLayerResources(layer);
@@ -345,7 +370,7 @@ test("exposes immutable resource views for all 32 model layers", async () => {
   }
 
   const key = state.getResource(3, "key");
-  const ownedKey = allocations.get(key.id)!;
+  const ownedKey = allocations.get(`${key.id}-page-0`)!;
   assert.equal(Object.isFrozen(key), true);
   assert.equal(Object.isFrozen(key.shards), true);
   assert.equal(Object.isFrozen(key.shards[0]), true);
@@ -393,7 +418,8 @@ test("keeps K and V as independent row-aligned pages under small buffer caps", a
       readonly byteLength: bigint;
       readonly requiredShardQuantumBytes: bigint;
     }) {
-      const cap = request.id.endsWith("-key") || request.id.endsWith("-value")
+      const cap = request.id.includes("-key-page-") ||
+          request.id.includes("-value-page-")
         ? 4_096n
         : request.byteLength;
       const shards: Array<{
@@ -433,39 +459,41 @@ test("keeps K and V as independent row-aligned pages under small buffer caps", a
       readonly clearAllocation: () => Promise<void>;
     }) => Promise<TestHybridState>
   )({ arena, capacity: 5, clearAllocation: async () => {} });
+  await state.ensureCapacity(5);
 
   const key = state.getResource(3, "key");
   const value = state.getResource(3, "value");
-  assert.equal(key.byteLength, 10_240n);
-  assert.equal(value.byteLength, 10_240n);
+  assert.equal(key.byteLength, 524_288n);
+  assert.equal(value.byteLength, 524_288n);
+  assert.equal(key.shards.length, 128);
+  assert.equal(value.shards.length, 128);
   assert.deepEqual(
-    key.shards.map(({ logicalByteOffset, logicalByteLength }) => [
-      logicalByteOffset,
-      logicalByteLength,
-    ]),
-    [[0n, 4_096n], [4_096n, 4_096n], [8_192n, 2_048n]],
+    [key.shards[0], key.shards[1], key.shards.at(-1)].map(
+      (shard) => [shard?.logicalByteOffset, shard?.logicalByteLength],
+    ),
+    [[0n, 4_096n], [4_096n, 4_096n], [520_192n, 4_096n]],
   );
   assert.deepEqual(
-    value.shards.map(({ logicalByteOffset, logicalByteLength }) => [
-      logicalByteOffset,
-      logicalByteLength,
-    ]),
-    [[0n, 4_096n], [4_096n, 4_096n], [8_192n, 2_048n]],
+    [value.shards[0], value.shards[1], value.shards.at(-1)].map(
+      (shard) => [shard?.logicalByteOffset, shard?.logicalByteLength],
+    ),
+    [[0n, 4_096n], [4_096n, 4_096n], [520_192n, 4_096n]],
   );
   assert.equal(
     key.shards[1]!.buffer,
-    allocations.get(key.id)!.shards[1]!.buffer,
+    allocations.get(`${key.id}-page-0`)!.shards[1]!.buffer,
   );
   assert.equal(
-    value.shards[2]!.buffer,
-    allocations.get(value.id)!.shards[2]!.buffer,
+    value.shards.at(-1)!.buffer,
+    allocations.get(`${value.id}-page-0`)!.shards.at(-1)!.buffer,
   );
-  assert.equal(state.byteLength, 53_641_216n);
+  assert.equal(state.residentCapacity, 5);
+  assert.equal(state.byteLength, 61_865_984n);
 
   state.dispose();
 });
 
-test("destroys a malformed returned allocation once before rollback", async () => {
+test("destroys a malformed returned allocation once before growth rollback", async () => {
   const module = await loadHybridStateModule();
   let destroyCount = 0;
   const arena = {
@@ -486,15 +514,21 @@ test("destroys a malformed returned allocation once before rollback", async () =
     },
   };
 
-  await assert.rejects(
-    (
-      module.createQwen35HybridState as (options: {
-        readonly arena: typeof arena;
-        readonly capacity: number;
-        readonly clearAllocation: () => Promise<void>;
-      }) => Promise<unknown>
-    )({ arena, capacity: 16_384, clearAllocation: async () => {} }),
-    /state allocation failed/i,
-  );
+  const state = await (
+    module.createQwen35HybridState as (options: {
+      readonly arena: typeof arena;
+      readonly capacity: number;
+      readonly clearAllocation: () => Promise<void>;
+    }) => Promise<{
+      ensureCapacity(requiredEnd: number): Promise<void>;
+      dispose(): void;
+    }>
+  )({ arena, capacity: 16_384, clearAllocation: async () => {} });
+
+  await assert.rejects(state.ensureCapacity(1), {
+    code: "state_metadata",
+    message: "GPU buffer allocation failed",
+  });
   assert.equal(destroyCount, 1);
+  state.dispose();
 });

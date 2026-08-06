@@ -147,8 +147,8 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
 const FULL_ATTENTION_ONLINE_WGSL = /* wgsl */ `
 struct Params {
   token_count: u32,
-  position: u32,
-  capacity: u32,
+  page_index: u32,
+  page_count: u32,
   pad0: u32,
 }
 
@@ -156,7 +156,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read> packed_key_values: array<u32>;
 @group(0) @binding(2) var<storage, read> packed_value_values: array<u32>;
 @group(0) @binding(3) var<storage, read_write> output_values: array<f32>;
-@group(0) @binding(4) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> online_state: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
 
 fn sigmoid(value: f32) -> f32 {
   if (value >= 0.0f) {
@@ -172,19 +173,30 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
   if (
     query_head >= 16u ||
     params.token_count == 0u ||
-    params.capacity == 0u ||
-    params.capacity > 16384u ||
-    params.position >= params.capacity ||
-    params.token_count > params.position + 1u
+    params.token_count > 16384u ||
+    params.page_count == 0u ||
+    params.page_index >= params.page_count
   ) { return; }
   let query_base = query_head * 512u;
   let kv_head = query_head / 4u;
   var accumulator: array<f32, 256>;
+  let first_page = params.page_index == 0u;
+  let final_page = params.page_index + 1u == params.page_count;
   for (var lane = 0u; lane < 256u; lane += 1u) {
-    accumulator[lane] = 0.0f;
+    let output_index = query_head * 256u + lane;
+    accumulator[lane] = select(output_values[output_index], 0.0f, first_page);
   }
-  var running_maximum = -3.402823466e+38f;
-  var running_denominator = 0.0f;
+  let state_base = query_head * 2u;
+  var running_maximum = select(
+    online_state[state_base],
+    -3.402823466e+38f,
+    first_page,
+  );
+  var running_denominator = select(
+    online_state[state_base + 1u],
+    0.0f,
+    first_page,
+  );
   for (var token = 0u; token < params.token_count; token += 1u) {
     var dot = 0.0f;
     for (var lane = 0u; lane < 256u; lane += 1u) {
@@ -209,11 +221,16 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     }
     running_maximum = next_maximum;
   }
+  online_state[state_base] = running_maximum;
+  online_state[state_base + 1u] = running_denominator;
   for (var lane = 0u; lane < 256u; lane += 1u) {
     let output_index = query_head * 256u + lane;
-    output_values[output_index] =
+    output_values[output_index] = select(
+      accumulator[lane],
       (accumulator[lane] / running_denominator) *
-      sigmoid(prepared_query_gate[query_base + 256u + lane]);
+        sigmoid(prepared_query_gate[query_base + 256u + lane]),
+      final_page,
+    );
   }
 }`;
 

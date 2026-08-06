@@ -17,6 +17,41 @@ import type {
   Qwen35WeightDirectoryView,
 } from "../src/qwen35-weight-directory.js";
 import type { Qwen35DispatchRequest } from "../src/qwen35-webgpu-executor.js";
+import type { Qwen35StagedPackedRows } from "../src/qwen35-disk-backed-tied-embedding.js";
+
+interface StagedLogitsSubject {
+  assembleQwen35StagedLogitsTileCommands(input: {
+    readonly tile: Qwen35StagedPackedRows;
+    readonly normalizedHidden: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly workspace: ReturnType<typeof workspace>;
+    readonly candidateOutput: { readonly buffer: object; readonly offset: number; readonly byteLength: number };
+    readonly limits: typeof limits;
+    readonly uniforms: readonly { readonly buffer: object; readonly offset: number; readonly byteLength: number }[];
+  }): {
+    readonly commands: readonly ({
+      readonly kind: "logits-gemv-piece" | "logits-tile-top-1";
+      readonly tileIndex: number;
+      readonly uniformWords: readonly number[];
+    } & Qwen35DispatchRequest)[];
+    readonly uniformCount: 2;
+    readonly candidateScoreReadback: {
+      readonly buffer: object;
+      readonly offset: number;
+      readonly byteLength: 4;
+      readonly scalarType: "f32";
+    };
+    readonly candidateTokenReadback: {
+      readonly buffer: object;
+      readonly offset: number;
+      readonly byteLength: 4;
+      readonly scalarType: "u32";
+    };
+  };
+}
+
+async function stagedLogitsSubject(): Promise<StagedLogitsSubject> {
+  return await import("../src/qwen35-logits-dispatch.js") as unknown as StagedLogitsSubject;
+}
 
 const limits = {
   minStorageBufferOffsetAlignment: 256,
@@ -191,6 +226,72 @@ test("exposes the exact uniform count without caller-owned uniform buffers", () 
     weights: directory(tensor({ splits: [248_320] })),
     limits,
   }), 487);
+});
+
+test("assembles one staged Q6_K logits tile with score and token readback", async () => {
+  const subject = await stagedLogitsSubject();
+  assert.equal(
+    typeof subject.assembleQwen35StagedLogitsTileCommands,
+    "function",
+    "the disk-backed output path requires a real staged-tile scorer",
+  );
+  const packedTile = {};
+  const candidateOutput = {};
+  const logitsWorkspace = workspace();
+  const result = subject.assembleQwen35StagedLogitsTileCommands({
+    tile: {
+      tensorName: "token_embd.weight",
+      storageType: "q6-k-212",
+      firstRow: 247_808,
+      rowCount: 262,
+      rowBytes: 2_120,
+      buffer: packedTile,
+      bufferOffset: 0,
+      byteLength: 2_120 * 262,
+    },
+    normalizedHidden: { buffer: {}, offset: 0, byteLength: 10_240 },
+    workspace: logitsWorkspace,
+    candidateOutput: { buffer: candidateOutput, offset: 0, byteLength: 8 },
+    limits,
+    uniforms: uniformSlices(2),
+  });
+
+  assert.equal(result.uniformCount, 2);
+  assert.deepEqual(result.commands.map(({ kind, tileIndex, uniformWords }) => ({
+    kind,
+    tileIndex,
+    uniformWords,
+  })), [
+    {
+      kind: "logits-gemv-piece",
+      tileIndex: 242,
+      uniformWords: [262, 2_560, 10, 0, 0],
+    },
+    {
+      kind: "logits-tile-top-1",
+      tileIndex: 242,
+      uniformWords: [262, 247_808, 0, 0],
+    },
+  ]);
+  assert.deepEqual(result.commands[0]!.bindings[0], {
+    binding: 0,
+    kind: "storage",
+    buffer: packedTile,
+    offset: 0,
+    size: 2_120 * 262,
+  });
+  assert.deepEqual(result.candidateScoreReadback, {
+    buffer: candidateOutput,
+    offset: 0,
+    byteLength: 4,
+    scalarType: "f32",
+  });
+  assert.deepEqual(result.candidateTokenReadback, {
+    buffer: candidateOutput,
+    offset: 4,
+    byteLength: 4,
+    scalarType: "u32",
+  });
 });
 
 test("rejects missing, extra, and aliased uniform slots", () => {

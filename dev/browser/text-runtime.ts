@@ -1,5 +1,6 @@
 import { QWEN35_PRODUCT_CONTEXT_TOKENS } from "../../src/qwen-chat-template.js";
 import type { Qwen35BrowserLoadOptions } from "../../src/qwen35-model-loader.js";
+import type { Qwen35RuntimeCoordinator } from "../../src/chat-app.js";
 import type {
   GenerateOptions,
   GeneratedToken,
@@ -83,17 +84,44 @@ const parsePromptPayload = (
 const isLoadedState = (state: Qwen35SessionState): boolean =>
   state !== "idle" && state !== "loading" && state !== "disposed" && state !== "failed";
 
-export const createTextRuntimeController = (options: {
-  readonly session: TextRuntimeSession;
-  readonly loadOptions: Qwen35BrowserLoadOptions;
+type TextRuntimeControllerOptions = {
+  readonly onPromptStart?: (prompt: string) => void;
   readonly onText?: (text: string) => void;
-}): TextRuntimeController => {
+} & (
+  | {
+      readonly coordinator: Qwen35RuntimeCoordinator;
+    }
+  | {
+      readonly session: TextRuntimeSession;
+      readonly loadOptions: Qwen35BrowserLoadOptions;
+    }
+);
+
+export const createTextRuntimeController = (
+  options: TextRuntimeControllerOptions,
+): TextRuntimeController => {
   let hasSequence = false;
   let activePrompt: Promise<void> | null = null;
 
+  const state = (): Qwen35SessionState =>
+    "coordinator" in options
+      ? options.coordinator.state
+      : options.session.state;
+
+  const metrics = (): RuntimeMetrics =>
+    "coordinator" in options
+      ? options.coordinator.getMetrics()
+      : options.session.getMetrics();
+
   const load = async (payload?: unknown): Promise<void> => {
     requireEmptyPayload(payload);
-    if (options.session.state === "ready") return;
+    // The polished UI and local control share this loaded session. A repeated
+    // load command must not replace it while another owner is using it.
+    if (isLoadedState(state())) return;
+    if ("coordinator" in options) {
+      await options.coordinator.load();
+      return;
+    }
     await options.session.load(options.loadOptions);
   };
 
@@ -101,19 +129,33 @@ export const createTextRuntimeController = (options: {
     const parsed = parsePromptPayload(payload);
     if (activePrompt !== null) throw new Error("A prompt is already running");
     const operation = (async () => {
-      if (hasSequence) {
-        await options.session.reset();
-        hasSequence = false;
+      options.onPromptStart?.(parsed.prompt);
+      if ("coordinator" in options) {
+        await options.coordinator.replaceConversation([
+          Object.freeze({ role: "user", content: parsed.prompt }),
+        ]);
+      } else {
+        if (hasSequence) {
+          await options.session.reset();
+          hasSequence = false;
+        }
+        await options.session.prefill([
+          Object.freeze({ role: "user", content: parsed.prompt }),
+        ]);
+        hasSequence = true;
       }
-      await options.session.prefill([
-        Object.freeze({ role: "user", content: parsed.prompt }),
-      ]);
-      hasSequence = true;
-      for await (const token of options.session.generate({
-        maxNewTokens: parsed.maxNewTokens,
-        temperature: 0,
-        topK: 1,
-      })) {
+      const generated = "coordinator" in options
+        ? options.coordinator.generate({
+            maxNewTokens: parsed.maxNewTokens,
+            temperature: 0,
+            topK: 1,
+          })
+        : options.session.generate({
+            maxNewTokens: parsed.maxNewTokens,
+            temperature: 0,
+            topK: 1,
+          });
+      for await (const token of generated) {
         options.onText?.(token.text);
       }
     })();
@@ -126,28 +168,32 @@ export const createTextRuntimeController = (options: {
   };
 
   const getState = (): TextRuntimeState => {
-    const metrics = options.session.getMetrics();
-    const loaded = isLoadedState(metrics.state);
-    const generating = metrics.state === "generating" || metrics.state === "cancelling";
+    const snapshot = metrics();
+    const loaded = isLoadedState(snapshot.state);
+    const generating = snapshot.state === "generating" || snapshot.state === "cancelling";
     return Object.freeze({
-      modelState: metrics.state,
+      modelState: snapshot.state,
       generationState: generating ? "active" : "idle",
-      cacheState: metrics.cacheHit === null ? "unknown" : metrics.cacheHit ? "hit" : "miss",
-      deviceState: metrics.deviceLostCount > 0 ? "lost" : loaded ? "ready" : "unavailable",
+      cacheState: snapshot.cacheHit === null ? "unknown" : snapshot.cacheHit ? "hit" : "miss",
+      deviceState: snapshot.deviceLostCount > 0 ? "lost" : loaded ? "ready" : "unavailable",
       loaded,
       generating,
-      contextTokens: metrics.contextTokens,
+      contextTokens: snapshot.contextTokens,
       maxContextTokens: QWEN35_PRODUCT_CONTEXT_TOKENS,
-      cpuBytes: metrics.trackedCpuBytes,
-      gpuBytes: metrics.trackedGpuBytes,
+      cpuBytes: snapshot.trackedCpuBytes,
+      gpuBytes: snapshot.trackedGpuBytes,
     });
   };
 
   return Object.freeze({
     load,
     runPrompt,
-    cancelPrompt: () => options.session.cancel(),
-    dispose: () => options.session.dispose(),
+    cancelPrompt: () => "coordinator" in options
+      ? options.coordinator.cancel()
+      : options.session.cancel(),
+    dispose: () => "coordinator" in options
+      ? options.coordinator.dispose()
+      : options.session.dispose(),
     getState,
   });
 };

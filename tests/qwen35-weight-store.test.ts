@@ -342,6 +342,35 @@ test("scatters tensors across package padding, package shards, and physical row 
   assert.equal(writes.every((event) => event === "upload-complete" || Number(event.slice(6)) <= 12), true);
 });
 
+test("per-write retirement settles every accepted queue copy independently", async () => {
+  const fixture = arenaWithSplits([[8, 8], [8]]);
+  const directory = await allocateQwen35WeightDirectory(fixture.arena, packageDirectory());
+  const queueEvents: string[] = [];
+  const options = {
+    storage: chunkedStorage(
+      { "shard-0": new Uint8Array(32), "shard-1": new Uint8Array(32) },
+      [32],
+    ),
+    cached: cachedPackage(),
+    directory,
+    queue: memoryQueue(queueEvents),
+    uploadLaneBytes: 16,
+    uploadRetirementPolicy: "per-write" as const,
+    signal: new AbortController().signal,
+  };
+
+  await assert.doesNotReject(uploadQwen35CachedWeights(options));
+  assert.deepEqual([...tensorBytes(directory, "token_embd.weight")], new Array(16).fill(0));
+  assert.deepEqual(queueEvents, [
+    "write:8",
+    "upload-complete",
+    "write:8",
+    "upload-complete",
+    "write:8",
+    "upload-complete",
+  ]);
+});
+
 test("retires queue-owned upload copies within the configured staging window", async () => {
   const fixture = arenaWithSplits([[8, 8], [8]]);
   const directory = await allocateQwen35WeightDirectory(fixture.arena, packageDirectory());

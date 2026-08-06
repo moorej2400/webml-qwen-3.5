@@ -227,7 +227,7 @@ type AssemblyFixture = ReturnType<typeof fixture> & {
 
 async function geometryPlanner(): Promise<(input: ReturnType<typeof fixture>) => {
   readonly layer: number;
-  readonly fixedUniformCount: 7;
+  readonly fixedUniformCount: 70;
   readonly physicalGemvPieceCount: number;
   readonly uniformCount: number;
 }> {
@@ -270,9 +270,9 @@ test("derives frozen exact full-attention uniform geometry before allocation", a
 
   assert.deepEqual(geometry, {
     layer: 3,
-    fixedUniformCount: 7,
+    fixedUniformCount: 70,
     physicalGemvPieceCount: 7,
-    uniformCount: 14,
+    uniformCount: 77,
   });
   assert.equal(Object.isFrozen(geometry), true);
 });
@@ -305,11 +305,15 @@ test("assembles exact one-token full-attention stages and state bindings", async
   assert.match(prepare.kernel.source, /pack2x16float/);
   assert.match(online.kernel.source, /running_maximum/);
   assert.deepEqual(prepare.uniformWords, [5, 8, 5, 2, 3, 0, 0, 0]);
-  assert.deepEqual(online.uniformWords, [6, 5, 8, 0]);
+  assert.deepEqual(online.uniformWords, [6, 0, 1, 0]);
   assert.equal(prepare.bindings[6]!.buffer,
     input.state.kind === "full-attention" ? input.state.key.shards[0]!.buffer : null);
   assert.equal(online.bindings[2]!.buffer,
     input.state.kind === "full-attention" ? input.state.value.shards[0]!.buffer : null);
+  assert.equal(
+    online.bindings[4]!.buffer,
+    input.workspace.get("full-attention-key").binding.buffer,
+  );
   assert.deepEqual(
     plan.commands.filter(({ mutatesPersistentState }) => mutatesPersistentState).map(({ stage }) => stage),
     ["full-attention-prepare"],
@@ -362,9 +366,9 @@ test("keeps physical GEMV fragments ordered and reports dynamic uniforms", async
   const geometry = (await geometryPlanner())(splitBase);
   assert.deepEqual(geometry, {
     layer: 3,
-    fixedUniformCount: 7,
+    fixedUniformCount: 70,
     physicalGemvPieceCount: 8,
-    uniformCount: 15,
+    uniformCount: 78,
   });
   assert.equal(Object.isFrozen(geometry), true);
   const plan = (await planner())({ ...splitBase, uniforms: uniforms(geometry.uniformCount) });
@@ -374,19 +378,57 @@ test("keeps physical GEMV fragments ordered and reports dynamic uniforms", async
   ]);
 });
 
-test("fails specifically when current kernel ABI cannot address multiple K/V pages", async () => {
-  const valid = await executableFixture();
+test("streams distinct K/V pages through one FP32 online-softmax carry", async () => {
+  const base = fixture();
+  const pagedState = state(8, 2);
+  const valid = await executableFixture({ ...base, state: pagedState });
   const plan = await planner();
-  assert.throws(
-    () => plan({ ...valid, state: state(8, 2) }),
-    /multiple K\/V pages|page-aware kernel|state-pages-unsupported/i,
+  const result = plan(valid);
+  const online = result.commands.filter(
+    ({ stage }) => stage === "full-attention-online",
   );
+
+  assert.equal(result.uniformCount, 15);
+  assert.equal(online.length, 2);
+  assert.deepEqual(result.commands[4]!.uniformWords, [1, 4, 5, 2, 3, 0, 0, 0]);
+  assert.equal(
+    result.commands[4]!.bindings[6]!.buffer,
+    pagedState.kind === "full-attention"
+      ? pagedState.key.shards[1]!.buffer
+      : null,
+  );
+  assert.equal(
+    result.commands[4]!.bindings[7]!.buffer,
+    pagedState.kind === "full-attention"
+      ? pagedState.value.shards[1]!.buffer
+      : null,
+  );
+  assert.deepEqual(online.map(({ uniformWords }) => uniformWords), [
+    [4, 0, 2, 0],
+    [2, 1, 2, 0],
+  ]);
+  assert.deepEqual(
+    online.map(({ bindings }) => bindings[1]!.buffer),
+    pagedState.kind === "full-attention"
+      ? pagedState.key.shards.map(({ buffer }) => buffer)
+      : [],
+  );
+  assert.deepEqual(
+    online.map(({ bindings }) => bindings[2]!.buffer),
+    pagedState.kind === "full-attention"
+      ? pagedState.value.shards.map(({ buffer }) => buffer)
+      : [],
+  );
+  const carry = valid.workspace.get("full-attention-key").binding.buffer;
+  assert.equal(online.every(({ bindings }) => bindings[4]!.buffer === carry), true);
+
   assert.throws(
     () => plan({
       ...valid,
+      state: state(8, 1),
       limits: { ...valid.limits, maxStorageBufferBindingSize: 8_192 },
     }),
-    /page-aware kernel|larger state shard/i,
+    /state|page|binding/i,
   );
 });
 

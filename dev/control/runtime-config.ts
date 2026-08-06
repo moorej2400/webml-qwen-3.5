@@ -18,7 +18,12 @@ export type BrowserRuntimeConfiguration = Readonly<
     | "expectedManifestSha256"
     | "compiledTokenizerUrl"
     | "bufferShardPolicy"
+    | "uploadLaneBytes"
   >
+  & {
+    readonly uploadDiagnostics?: true;
+    readonly retireUploadAfterEachWrite?: boolean;
+  }
 >;
 
 export interface BrowserRuntimeEnvironment {
@@ -27,7 +32,76 @@ export interface BrowserRuntimeEnvironment {
   readonly expectedManifestSha256: string;
   readonly compiledTokenizerUrl: string;
   readonly bufferShardPolicy: BufferShardPolicy;
+  readonly uploadDiagnostics?: true;
+  readonly uploadLaneBytes?: number;
+  readonly retireUploadAfterEachWrite?: boolean;
 }
+
+const MIB = 1024 * 1024;
+// Every candidate changes one baseline variable so a physical-device run can
+// attribute a failure boundary to buffer shaping, lane width, or retirement.
+const UPLOAD_PROBE_TRIALS = Object.freeze({
+  "baseline-128": Object.freeze({
+    bufferShardPolicy: "evidence-128",
+    uploadLaneBytes: 32 * MIB,
+    retireUploadAfterEachWrite: false,
+  }),
+  "buffer-64": Object.freeze({
+    bufferShardPolicy: "evidence-64",
+    uploadLaneBytes: 32 * MIB,
+    retireUploadAfterEachWrite: false,
+  }),
+  "lane-16": Object.freeze({
+    bufferShardPolicy: "evidence-128",
+    uploadLaneBytes: 16 * MIB,
+    retireUploadAfterEachWrite: false,
+  }),
+  "lane-8": Object.freeze({
+    bufferShardPolicy: "evidence-128",
+    uploadLaneBytes: 8 * MIB,
+    retireUploadAfterEachWrite: false,
+  }),
+  "paced-retirement": Object.freeze({
+    bufferShardPolicy: "evidence-128",
+    uploadLaneBytes: 32 * MIB,
+    retireUploadAfterEachWrite: true,
+  }),
+} as const satisfies Readonly<Record<string, {
+  readonly bufferShardPolicy: BufferShardPolicy;
+  readonly uploadLaneBytes: number;
+  readonly retireUploadAfterEachWrite: boolean;
+}>>);
+
+const parseUploadProbeTrial = (
+  environment: NodeJS.ProcessEnv,
+): Readonly<{
+  readonly bufferShardPolicy: BufferShardPolicy;
+  readonly uploadDiagnostics?: true;
+  readonly uploadLaneBytes?: number;
+  readonly retireUploadAfterEachWrite?: boolean;
+}> => {
+  const trial = environment.QWEN_RUNTIME_UPLOAD_PROBE_TRIAL;
+  if (trial === undefined || trial === "") {
+    return Object.freeze({
+      bufferShardPolicy: parseBufferShardPolicy(
+        environment.QWEN_RUNTIME_BUFFER_SHARD_POLICY,
+      ),
+    });
+  }
+  if (
+    environment.QWEN_RUNTIME_BUFFER_SHARD_POLICY !== undefined &&
+    environment.QWEN_RUNTIME_BUFFER_SHARD_POLICY !== ""
+  ) {
+    throw new Error("Upload probe trials cannot combine with a buffer shard policy");
+  }
+  if (!Object.hasOwn(UPLOAD_PROBE_TRIALS, trial)) {
+    throw new Error("Runtime upload probe trial is invalid");
+  }
+  return Object.freeze({
+    ...UPLOAD_PROBE_TRIALS[trial as keyof typeof UPLOAD_PROBE_TRIALS],
+    uploadDiagnostics: true,
+  });
+};
 
 const parseBufferShardPolicy = (value: string | undefined): BufferShardPolicy => {
   if (value === undefined || value === "") return "default";
@@ -96,6 +170,7 @@ export const loadBrowserRuntimeEnvironment = (
   if (!/^[a-f0-9]{64}$/.test(expectedManifestSha256)) {
     throw new Error("Runtime manifest SHA-256 must be an exact lowercase digest");
   }
+  const uploadProbe = parseUploadProbeTrial(environment);
   return Object.freeze({
     manifestPath: validateLocalPath(
       requireValue(environment, "QWEN_RUNTIME_MANIFEST", "Runtime manifest path"),
@@ -119,9 +194,7 @@ export const loadBrowserRuntimeEnvironment = (
       "Compiled tokenizer URL",
       "file",
     ),
-    bufferShardPolicy: parseBufferShardPolicy(
-      environment.QWEN_RUNTIME_BUFFER_SHARD_POLICY,
-    ),
+    ...uploadProbe,
   });
 };
 
@@ -192,5 +265,13 @@ export const loadBrowserRuntimeConfiguration = async (options: {
     ...trust,
     compiledTokenizerUrl: options.environment.compiledTokenizerUrl,
     bufferShardPolicy: options.environment.bufferShardPolicy,
+    ...(options.environment.uploadDiagnostics === true
+      ? {
+          uploadDiagnostics: true as const,
+          uploadLaneBytes: options.environment.uploadLaneBytes!,
+          retireUploadAfterEachWrite:
+            options.environment.retireUploadAfterEachWrite!,
+        }
+      : {}),
   });
 };

@@ -17,6 +17,17 @@ import {
   type CacheEnumerationLimits,
   type ModelCacheStorage,
 } from "../src/opfs-model-cache.js";
+import type { Qwen35PackedRangeReader } from "../src/qwen35-disk-backed-tied-embedding.js";
+
+interface ModelCacheRangeSubject {
+  createQwen35ModelCacheRangeReader(
+    storage: ModelCacheStorage,
+  ): Qwen35PackedRangeReader;
+}
+
+async function modelCacheRangeSubject(): Promise<ModelCacheRangeSubject> {
+  return await import("../src/qwen35-disk-backed-tied-embedding.js") as unknown as ModelCacheRangeSubject;
+}
 
 function hash(bytes: Uint8Array): string {
   return new IncrementalSha256().update(bytes).digestHex();
@@ -501,4 +512,108 @@ test("OPFS enumeration counts the requested prefix against the depth limit", asy
       error.code === "cache-enumeration-depth",
   );
   assert.equal(deepestDirectoryRead, false);
+});
+
+test("OPFS random reads slice only the requested immutable byte range", async () => {
+  const bytes = Uint8Array.from({ length: 32 }, (_, index) => index);
+  const slices: Array<{ readonly start: number; readonly end: number }> = [];
+  const fileHandle = {
+    kind: "file" as const,
+    async getFile() {
+      return {
+        size: bytes.byteLength,
+        slice(start = 0, end = bytes.byteLength) {
+          slices.push({ start, end });
+          const selected = bytes.slice(start, end);
+          return new Blob([selected]);
+        },
+        stream() {
+          assert.fail("a bounded range read must not stream the complete file");
+        },
+      };
+    },
+  };
+  const blobs = {
+    kind: "directory" as const,
+    async getFileHandle(name: string) {
+      if (name !== "model.bin") {
+        throw new DOMException("not found", "NotFoundError");
+      }
+      return fileHandle;
+    },
+  };
+  const root = {
+    kind: "directory" as const,
+    async getDirectoryHandle(name: string) {
+      if (name !== "blobs") {
+        throw new DOMException("not found", "NotFoundError");
+      }
+      return blobs;
+    },
+  };
+  const storage = BrowserOpfsStorage.fromRoot(
+    root as unknown as FileSystemDirectoryHandle,
+  ) as BrowserOpfsStorage & {
+    readRange(
+      path: string,
+      offset: number,
+      byteLength: number,
+      signal: AbortSignal,
+    ): Promise<Uint8Array | null>;
+  };
+  assert.equal(
+    typeof storage.readRange,
+    "function",
+    "the disk-backed tied tensor requires bounded OPFS random reads",
+  );
+
+  const result = await storage.readRange(
+    "blobs/model.bin",
+    7,
+    9,
+    new AbortController().signal,
+  );
+
+  assert.deepEqual(result, bytes.subarray(7, 16));
+  assert.deepEqual(slices, [{ start: 7, end: 16 }]);
+});
+
+test("model-cache range adapter always prefers bounded random access", async () => {
+  const subject = await modelCacheRangeSubject();
+  assert.equal(
+    typeof subject.createQwen35ModelCacheRangeReader,
+    "function",
+    "the loader requires a model-cache range-reader adapter",
+  );
+  const bytes = Uint8Array.of(7, 8, 9);
+  const calls: unknown[] = [];
+  const storage: ModelCacheStorage = {
+    async openAtomicWriter() { throw new Error("not used"); },
+    async openRead() {
+      assert.fail("production random access must not use the stream fallback");
+    },
+    async readRange(path, offset, byteLength, signal) {
+      calls.push({ path, offset, byteLength, signal });
+      return bytes;
+    },
+    async move() { return false; },
+    async list() { return []; },
+  };
+  const signal = new AbortController().signal;
+  const reader = subject.createQwen35ModelCacheRangeReader(storage);
+
+  const result = await reader.read({
+    storagePath: "blobs/model.bin",
+    offset: 11,
+    byteLength: 3,
+    signal,
+  });
+
+  assert.equal(result, bytes);
+  assert.deepEqual(calls, [{
+    path: "blobs/model.bin",
+    offset: 11,
+    byteLength: 3,
+    signal,
+  }]);
 });

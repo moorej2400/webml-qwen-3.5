@@ -11,6 +11,30 @@ import {
 } from "../dev/control/run-journal.js";
 import { deriveSocketDeviceMetadata } from "../dev/control/device-correlation.js";
 
+const LOAD_PHASES = [
+  "lock_wait",
+  "cache_scan",
+  "cache_download",
+  "cache_verify",
+  "tokenizer_load",
+  "device_probe",
+  "state_allocate",
+  "weights_allocate",
+  "weights_upload",
+  "driver_initialize",
+  "ready",
+  "failed",
+] as const;
+
+const ALLOCATION_DIAGNOSTIC_CODES = [
+  "gpu_out_of_memory",
+  "gpu_validation",
+  "buffer_creation",
+  "error_scope",
+  "allocation_conflict",
+  "unknown",
+] as const;
+
 test("server-derived local metadata keeps only coarse OS and the direct socket IP", () => {
   assert.deepEqual(
     deriveSocketDeviceMetadata({
@@ -77,6 +101,212 @@ test("telemetry uses a flat allowlist and omits private content", () => {
   assert.match(encoded, /tokensPerSecond/);
   assert.doesNotMatch(encoded, /cpuBytes|nested/i);
   assert.doesNotMatch(encoded, /private|secret|authorization|cookie|prompt|response|url|stack/i);
+});
+
+test("journal preserves only the allocation diagnostic enum and bounded numbers", () => {
+  for (const code of ALLOCATION_DIAGNOSTIC_CODES) {
+    const sanitized = sanitizeTelemetryEvent({
+      schemaVersion: 1,
+      category: "error",
+      name: "runtime_error",
+      timestampMs: 100,
+      metrics: {
+        code,
+        allocationBytes: 2_097_152,
+        count: 2,
+        message: "private GPU message at local-path:<path>/<model-id>.gguf",
+        name: "PrivateGpuError",
+        path: "local-path:<path>/<model-id>.gguf",
+        stack: "private stack local-path:<path>/<model-id>.gguf",
+      },
+    });
+
+    assert.deepEqual(sanitized.metrics, {
+      code,
+      allocationBytes: 2_097_152,
+      count: 2,
+    });
+    assert.doesNotMatch(
+      JSON.stringify(sanitized),
+      /private|local|model\.gguf|message|stack|path|PrivateGpuError/i,
+    );
+  }
+});
+
+test("journal maps an unapproved allocation diagnostic code to unknown", () => {
+  const sanitized = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "error",
+    name: "runtime_error",
+    timestampMs: 100,
+    metrics: {
+      code: "private_dynamic_gpu_error",
+      allocationBytes: 131_072,
+      message: "private message",
+      stack: "private stack",
+    },
+  });
+
+  assert.deepEqual(sanitized.metrics, {
+    code: "unknown",
+    allocationBytes: 131_072,
+  });
+  assert.doesNotMatch(JSON.stringify(sanitized), /private|dynamic|message|stack/i);
+});
+
+test("journal preserves exact bounded load progress and drops private runtime text", () => {
+  const privateText = "private prompt model URL path response error and stack";
+  for (const phase of LOAD_PHASES) {
+    const sanitized = sanitizeTelemetryEvent({
+      schemaVersion: 1,
+      category: "phase",
+      name: "load_started",
+      timestampMs: 100,
+      metrics: {
+        phase,
+        completedBytes: 32,
+        totalBytes: 64,
+        shardIndex: 0,
+        shardCount: 2,
+        currentGpuBytes: 16,
+        peakGpuBytes: 24,
+        prompt: privateText,
+        response: privateText,
+        url: privateText,
+        path: privateText,
+        error: privateText,
+        stack: privateText,
+      },
+    });
+
+    assert.deepEqual(sanitized.metrics, {
+      phase,
+      completedBytes: 32,
+      totalBytes: 64,
+      shardIndex: 0,
+      shardCount: 2,
+      currentGpuBytes: 16,
+      peakGpuBytes: 24,
+    });
+    assert.doesNotMatch(
+      JSON.stringify(sanitized),
+      /private|prompt|response|url|path|error|stack/i,
+    );
+  }
+});
+
+test("journal preserves only the bounded upload probe schema", () => {
+  for (const name of ["before_write", "after_write", "after_retire"] as const) {
+    const sanitized = sanitizeTelemetryEvent({
+      schemaVersion: 1,
+      category: "upload",
+      name,
+      timestampMs: 100,
+      metrics: {
+        ordinal: 17,
+        shardIndex: 13,
+        shardCount: 20,
+        segmentIndex: 4,
+        segmentCount: 18,
+        globalOffset: 1_824_496_640,
+        byteCount: 8 * 1024 * 1024,
+        bufferShardBytes: 128 * 1024 * 1024,
+        uploadLaneBytes: 8 * 1024 * 1024,
+        retireAfterEachWrite: false,
+        tensorName: "private tensor identity",
+        url: "https://private.invalid/model",
+        path: "/private/local/path",
+        prompt: "private prompt",
+        response: "private response",
+        stack: "private stack",
+        secret: "private secret",
+      },
+    });
+
+    assert.equal(sanitized.category, "upload");
+    assert.equal(sanitized.name, name);
+    assert.deepEqual(sanitized.metrics, {
+      ordinal: 17,
+      shardIndex: 13,
+      shardCount: 20,
+      segmentIndex: 4,
+      segmentCount: 18,
+      globalOffset: 1_824_496_640,
+      byteCount: 8 * 1024 * 1024,
+      bufferShardBytes: 128 * 1024 * 1024,
+      uploadLaneBytes: 8 * 1024 * 1024,
+      retireAfterEachWrite: false,
+    });
+    assert.doesNotMatch(
+      JSON.stringify(sanitized),
+      /tensor|private|url|path|prompt|response|stack|secret/i,
+    );
+  }
+});
+
+test("journal rejects invalid upload ordinals, boundary pairs, and byte ranges", () => {
+  const sanitized = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "upload",
+    name: "before_write",
+    timestampMs: 100,
+    metrics: {
+      ordinal: 0,
+      shardIndex: 20,
+      shardCount: 20,
+      segmentIndex: 4,
+      segmentCount: 0,
+      globalOffset: Number.MAX_SAFE_INTEGER - 3,
+      byteCount: 8,
+      bufferShardBytes: 0,
+      uploadLaneBytes: 3,
+      retireAfterEachWrite: "false",
+    },
+  });
+
+  assert.deepEqual(sanitized.metrics, {});
+
+  const exceedsLane = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "upload",
+    name: "after_write",
+    timestampMs: 100,
+    metrics: {
+      ordinal: 1,
+      shardIndex: 0,
+      shardCount: 1,
+      segmentIndex: 0,
+      segmentCount: 1,
+      globalOffset: 0,
+      byteCount: 8,
+      bufferShardBytes: 64,
+      uploadLaneBytes: 4,
+      retireAfterEachWrite: false,
+    },
+  });
+  assert.deepEqual(exceedsLane.metrics, {});
+});
+
+test("journal binds upload stage names to the upload category", () => {
+  const wrongCategory = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "generation",
+    name: "before_write",
+    timestampMs: 100,
+    metrics: { tokensPerSecond: 10 },
+  });
+  const wrongName = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "upload",
+    name: "token_rate",
+    timestampMs: 100,
+    metrics: { tokensPerSecond: 10 },
+  });
+
+  assert.equal(wrongCategory.name, "telemetry_omitted");
+  assert.deepEqual(wrongCategory.metrics, { tokensPerSecond: 10 });
+  assert.equal(wrongName.name, "telemetry_omitted");
+  assert.deepEqual(wrongName.metrics, { tokensPerSecond: 10 });
 });
 
 test("journal omits free-form telemetry strings, nested values, arrays, and unknown event names", () => {

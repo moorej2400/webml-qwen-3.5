@@ -9,6 +9,7 @@ import {
   type ModelPackageManifest,
   type PackageShard,
 } from "./manifest.js";
+import type { RuntimeLoadEvent } from "./qwen35-session.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -38,6 +39,13 @@ export interface CacheAtomicWriter {
 export interface ModelCacheStorage {
   openAtomicWriter(path: string): Promise<CacheAtomicWriter>;
   openRead(path: string): Promise<AsyncIterable<Uint8Array> | null>;
+  /** Optional bounded random read used by the production disk-backed tensor. */
+  readRange?(
+    path: string,
+    offset: number,
+    byteLength: number,
+    signal: AbortSignal,
+  ): Promise<Uint8Array | null>;
   move(source: string, destination: string): Promise<boolean>;
   list(
     prefix: string,
@@ -88,6 +96,7 @@ export interface ModelCacheMetrics {
 export interface ImmutableOpfsModelCacheOptions {
   attemptId?: () => string;
   now?: () => number;
+  onLoadEvent?: (event: RuntimeLoadEvent) => void;
 }
 
 export class ModelCacheError extends Error {
@@ -134,6 +143,7 @@ export function modelCacheKey(manifest: ModelPackageManifest): string {
 export class ImmutableOpfsModelCache {
   private readonly makeAttemptId: () => string;
   private readonly now: () => number;
+  private readonly onLoadEvent: ((event: RuntimeLoadEvent) => void) | undefined;
   private cacheHits = 0;
   private cacheMisses = 0;
   private bytesWritten = 0;
@@ -150,6 +160,7 @@ export class ImmutableOpfsModelCache {
       options.attemptId ??
       (() => crypto.randomUUID().replaceAll("-", "").toLowerCase());
     this.now = options.now ?? (() => performance.now());
+    this.onLoadEvent = options.onLoadEvent;
   }
 
   get metrics(): ModelCacheMetrics {
@@ -170,6 +181,16 @@ export class ImmutableOpfsModelCache {
   ): Promise<CachedModelPackage> {
     validateModelPackageManifest(manifest);
     const key = modelCacheKey(manifest);
+    const shardCount = manifest.shards.length;
+    const totalBytes = manifest.shards.reduce(
+      (total, shard) => total + safeByteLength(shard.length),
+      0,
+    );
+    this.reportLoadEvent({
+      phase: "cache_scan",
+      completedBytes: 0,
+      totalBytes,
+    });
     const existing = await this.findReady(manifest, key, signal);
     if (existing !== null) {
       this.cacheHits += 1;
@@ -206,19 +227,45 @@ export class ImmutableOpfsModelCache {
         if (source.byteLength !== expectedLength) {
           throw new ModelCacheError("source-length-mismatch");
         }
+        this.reportLoadEvent({
+          phase: "cache_download",
+          completedBytes: 0,
+          totalBytes: expectedLength,
+          shardIndex: index,
+          shardCount,
+        });
         await this.downloadImmutablePart(
           planned[index]!.storagePath,
           source,
           expectedLength,
           shard.sha256,
+          index,
+          shardCount,
           signal,
         );
       }
 
       const promoted: CachedShard[] = [];
-      for (const part of planned) {
+      for (const [index, part] of planned.entries()) {
         signal.throwIfAborted();
-        const verified = await this.verifyFile(part.storagePath, signal);
+        this.reportLoadEvent({
+          phase: "cache_verify",
+          completedBytes: 0,
+          totalBytes: part.byteLength,
+          shardIndex: index,
+          shardCount,
+        });
+        const verified = await this.verifyFile(
+          part.storagePath,
+          signal,
+          (completedBytes) => this.reportLoadEvent({
+            phase: "cache_verify",
+            completedBytes,
+            totalBytes: part.byteLength,
+            shardIndex: index,
+            shardCount,
+          }),
+        );
         if (
           verified.byteLength !== part.byteLength ||
           verified.sha256 !== part.sha256
@@ -301,8 +348,25 @@ export class ImmutableOpfsModelCache {
         }
         const record = parseReadyRecord(bytes, manifest, key);
         let valid = true;
-        for (const shard of record.shards) {
-          const verified = await this.verifyFile(shard.storagePath, signal);
+        for (const [index, shard] of record.shards.entries()) {
+          this.reportLoadEvent({
+            phase: "cache_verify",
+            completedBytes: 0,
+            totalBytes: shard.byteLength,
+            shardIndex: index,
+            shardCount: record.shards.length,
+          });
+          const verified = await this.verifyFile(
+            shard.storagePath,
+            signal,
+            (completedBytes) => this.reportLoadEvent({
+              phase: "cache_verify",
+              completedBytes,
+              totalBytes: shard.byteLength,
+              shardIndex: index,
+              shardCount: record.shards.length,
+            }),
+          );
           if (
             verified.byteLength !== shard.byteLength ||
             verified.sha256 !== shard.sha256
@@ -373,6 +437,8 @@ export class ImmutableOpfsModelCache {
     source: ImmutableRangeSource,
     expectedLength: number,
     expectedSha256: string,
+    shardIndex: number,
+    shardCount: number,
     signal: AbortSignal,
   ): Promise<void> {
     const writer = await this.storage.openAtomicWriter(path);
@@ -387,6 +453,13 @@ export class ImmutableOpfsModelCache {
           await writer.write(chunk);
           byteLength += chunk.byteLength;
           this.bytesWritten += chunk.byteLength;
+          this.reportLoadEvent({
+            phase: "cache_download",
+            completedBytes: byteLength,
+            totalBytes: expectedLength,
+            shardIndex,
+            shardCount,
+          });
         },
         signal,
       );
@@ -408,6 +481,7 @@ export class ImmutableOpfsModelCache {
   private async verifyFile(
     path: string,
     signal: AbortSignal,
+    onProgress?: (completedBytes: number) => void,
   ): Promise<VerifiedFile> {
     const source = await this.storage.openRead(path);
     if (source === null) {
@@ -419,10 +493,19 @@ export class ImmutableOpfsModelCache {
       signal.throwIfAborted();
       this.updateHash(hasher, chunk);
       byteLength += chunk.byteLength;
+      onProgress?.(byteLength);
     }
     const sha256 = hasher.digestHex();
     this.verifiedParts += 1;
     return { byteLength, sha256 };
+  }
+
+  private reportLoadEvent(event: RuntimeLoadEvent): void {
+    try {
+      this.onLoadEvent?.(Object.freeze(event));
+    } catch {
+      // Cache correctness does not depend on a progress observer.
+    }
   }
 
   private updateHash(hasher: IncrementalSha256, chunk: Uint8Array): void {
@@ -659,6 +742,46 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
         reader.releaseLock();
       }
     })();
+  }
+
+  async readRange(
+    path: string,
+    offset: number,
+    byteLength: number,
+    signal: AbortSignal,
+  ): Promise<Uint8Array | null> {
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      !Number.isSafeInteger(byteLength) ||
+      byteLength < 1 ||
+      !Number.isSafeInteger(offset + byteLength)
+    ) {
+      throw new ModelCacheError("cache-range-invalid");
+    }
+    signal.throwIfAborted();
+    let handle: FileSystemFileHandle;
+    try {
+      const { directory, name } = await this.parent(path, false);
+      handle = await directory.getFileHandle(name);
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw error;
+    }
+    const file = await handle.getFile();
+    if (offset + byteLength > file.size) {
+      throw new ModelCacheError("cache-range-invalid");
+    }
+    // Blob.slice is the production random-access seam. It prevents every token
+    // or logits tile from scanning a multi-hundred-megabyte shard from byte zero.
+    const bytes = new Uint8Array(
+      await file.slice(offset, offset + byteLength).arrayBuffer(),
+    );
+    signal.throwIfAborted();
+    if (bytes.byteLength !== byteLength) {
+      throw new ModelCacheError("cache-range-short");
+    }
+    return bytes;
   }
 
   async move(source: string, destination: string): Promise<boolean> {

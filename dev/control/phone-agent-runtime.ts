@@ -1,11 +1,13 @@
 import {
   CONTROL_SCHEMA_VERSION,
+  TERMINAL_COMMAND_STATES,
   type CommandMessage,
   type CommandState,
   type ControlCommand,
   type PhoneIdentity,
   type ReconcileMessage,
   type ServerToPhoneMessage,
+  type TerminalCommandState,
 } from "./protocol.js";
 import { PhoneEventOutbox } from "./phone-event-outbox.js";
 import { sanitizeStateResult, type SanitizedStateResult } from "./state-result.js";
@@ -33,7 +35,11 @@ interface AgentCommandRecord {
   state: Exclude<CommandState, "issued">;
   reason?: string;
   result?: SanitizedStateResult;
+  settledByServer?: true;
 }
+
+const isTerminalState = (state: CommandState): state is TerminalCommandState =>
+  (TERMINAL_COMMAND_STATES as readonly CommandState[]).includes(state);
 
 export class PhoneAgentRuntime {
   readonly #identity: PhoneIdentity;
@@ -140,6 +146,10 @@ export class PhoneAgentRuntime {
     reason?: string,
     result?: SanitizedStateResult,
   ): void {
+    // Reconciliation can settle a command while its handler promise is still
+    // pending. That late promise must not overwrite or emit past the server's
+    // authoritative terminal.
+    if (this.#commands.get(commandId)?.settledByServer === true) return;
     this.#commands.set(commandId, {
       state,
       ...(reason === undefined ? {} : { reason }),
@@ -185,7 +195,16 @@ export class PhoneAgentRuntime {
     for (const serverCommand of message.commands) {
       const local = this.#commands.get(serverCommand.commandId);
       if (local !== undefined) {
-        if (local.state !== serverCommand.state) this.#resendOrReport(serverCommand.commandId, local);
+        if (isTerminalState(serverCommand.state)) {
+          this.#commands.set(serverCommand.commandId, {
+            state: serverCommand.state,
+            ...(serverCommand.reason === undefined ? {} : { reason: serverCommand.reason }),
+            ...(serverCommand.result === undefined ? {} : { result: serverCommand.result }),
+            settledByServer: true,
+          });
+        } else if (local.state !== serverCommand.state) {
+          this.#resendOrReport(serverCommand.commandId, local);
+        }
         continue;
       }
       if (serverCommand.state !== "issued" && serverCommand.state !== "accepted") {
@@ -193,6 +212,7 @@ export class PhoneAgentRuntime {
           state: serverCommand.state,
           ...(serverCommand.reason === undefined ? {} : { reason: serverCommand.reason }),
           ...(serverCommand.result === undefined ? {} : { result: serverCommand.result }),
+          ...(isTerminalState(serverCommand.state) ? { settledByServer: true } : {}),
         });
       }
     }

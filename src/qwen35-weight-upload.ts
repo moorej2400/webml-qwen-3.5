@@ -11,6 +11,15 @@ import {
   type Qwen35WeightDirectory,
   type Qwen35WeightDirectoryView,
 } from "./qwen35-weight-directory.js";
+import {
+  createQwen35ModelCacheRangeReader,
+} from "./qwen35-disk-backed-tied-embedding.js";
+import {
+  createQwen35RollingLayerStore,
+  hasQwen35RollingLayerSet,
+  qwen35PermanentWeightPackage,
+  type Qwen35RollingLayerStore,
+} from "./qwen35-rolling-layer-weights.js";
 
 export interface Qwen35WeightWriteQueue {
   writeBuffer(
@@ -23,6 +32,8 @@ export interface Qwen35WeightWriteQueue {
   onSubmittedWorkDone(): Promise<void>;
 }
 
+export type Qwen35UploadRetirementPolicy = "window" | "per-write";
+
 interface UploadSegment {
   readonly tensor: Qwen35TensorWeight;
   readonly sourceStart: number;
@@ -34,6 +45,15 @@ interface UploadSegment {
 
 interface UploadWindow {
   outstandingBytes: number;
+}
+
+async function retireUploadWindow(input: {
+  readonly queue: Qwen35WeightWriteQueue;
+  readonly window: UploadWindow;
+}): Promise<void> {
+  if (input.window.outstandingBytes === 0) return;
+  await input.queue.onSubmittedWorkDone();
+  input.window.outstandingBytes = 0;
 }
 
 function safeByteNumber(value: string, label: string): number {
@@ -111,8 +131,10 @@ async function writePhysicalRange(input: {
   readonly dataOffset: number;
   readonly byteLength: number;
   readonly uploadLaneBytes: number;
+  readonly uploadRetirementPolicy: Qwen35UploadRetirementPolicy;
   readonly window: UploadWindow;
   readonly signal: AbortSignal;
+  readonly onBytesUploaded?: (byteLength: number) => void;
 }): Promise<void> {
   let tensorOffset = input.tensorByteOffset;
   let dataOffset = input.dataOffset;
@@ -153,8 +175,10 @@ async function writePhysicalRange(input: {
     ) {
       // GPUQueue copies writeBuffer data into queue-owned staging. Retire that
       // copy window throughout the model upload so it cannot grow to model size.
-      await input.queue.onSubmittedWorkDone();
-      input.window.outstandingBytes = 0;
+      await retireUploadWindow({
+        queue: input.queue,
+        window: input.window,
+      });
       input.signal.throwIfAborted();
     }
     input.queue.writeBuffer(
@@ -164,7 +188,15 @@ async function writePhysicalRange(input: {
       dataOffset,
       byteLength,
     );
+    input.onBytesUploaded?.(byteLength);
     input.window.outstandingBytes += byteLength;
+    if (input.uploadRetirementPolicy === "per-write") {
+      await retireUploadWindow({
+        queue: input.queue,
+        window: input.window,
+      });
+      input.signal.throwIfAborted();
+    }
     tensorOffset += byteLength;
     dataOffset += byteLength;
     remaining -= byteLength;
@@ -177,8 +209,10 @@ async function appendSegmentBytes(input: {
   readonly bytes: Uint8Array;
   readonly queue: Qwen35WeightWriteQueue;
   readonly uploadLaneBytes: number;
+  readonly uploadRetirementPolicy: Qwen35UploadRetirementPolicy;
   readonly window: UploadWindow;
   readonly signal: AbortSignal;
+  readonly onBytesUploaded?: (byteLength: number) => void;
 }): Promise<void> {
   const expectedSource = input.segment.sourceStart + input.segment.consumed;
   if (input.sourceOffset !== expectedSource) {
@@ -205,8 +239,12 @@ async function appendSegmentBytes(input: {
         dataOffset: 0,
         byteLength: 4,
         uploadLaneBytes: input.uploadLaneBytes,
+        uploadRetirementPolicy: input.uploadRetirementPolicy,
         window: input.window,
         signal: input.signal,
+        ...(input.onBytesUploaded === undefined
+          ? {}
+          : { onBytesUploaded: input.onBytesUploaded }),
       });
       input.segment.pending = new Uint8Array(0);
     } else {
@@ -225,8 +263,12 @@ async function appendSegmentBytes(input: {
       dataOffset: 0,
       byteLength: directBytes,
       uploadLaneBytes: input.uploadLaneBytes,
+      uploadRetirementPolicy: input.uploadRetirementPolicy,
       window: input.window,
       signal: input.signal,
+      ...(input.onBytesUploaded === undefined
+        ? {}
+        : { onBytesUploaded: input.onBytesUploaded }),
     });
     consumed += directBytes;
   }
@@ -244,7 +286,9 @@ export async function uploadQwen35CachedWeights(input: {
   readonly directory: Qwen35WeightDirectory;
   readonly queue: Qwen35WeightWriteQueue;
   readonly uploadLaneBytes: number;
+  readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
   readonly signal: AbortSignal;
+  readonly onProgress?: (completedBytes: number) => void;
 }): Promise<void> {
   const packageDirectory = Object.freeze({
     manifestSha256: input.directory.manifestSha256,
@@ -269,6 +313,13 @@ export async function uploadQwen35CachedWeights(input: {
       "The Qwen3.5 upload lane must be a positive u32 multiple",
     );
   }
+  const uploadRetirementPolicy = input.uploadRetirementPolicy ?? "window";
+  if (uploadRetirementPolicy !== "window" && uploadRetirementPolicy !== "per-write") {
+    throw diagnosticError(
+      "model-upload-retirement-policy-invalid",
+      "The Qwen3.5 upload retirement policy is invalid",
+    );
+  }
   if (
     input.cached.manifestSha256 !== packageDirectory.manifestSha256 ||
     input.cached.shards.length !== packageDirectory.shards.length
@@ -280,93 +331,108 @@ export async function uploadQwen35CachedWeights(input: {
   }
   const segmentsByShard = uploadSegments(packageDirectory, input.directory);
   const window: UploadWindow = { outstandingBytes: 0 };
-  for (const [shardIndex, cachedShard] of input.cached.shards.entries()) {
-    const packageShard = packageDirectory.shards[shardIndex]!;
-    const expectedBytes = safeByteNumber(packageShard.length, "Package shard length");
-    if (
-      cachedShard.byteLength !== expectedBytes ||
-      cachedShard.sha256 !== packageShard.sha256
-    ) {
-      throw diagnosticError(
-        "model-cache-shard-identity-mismatch",
-        "An authenticated cache shard does not match the package directory",
-      );
-    }
-    const stream = await input.storage.openRead(cachedShard.storagePath);
-    if (stream === null) {
-      throw diagnosticError(
-        "model-cache-shard-missing",
-        "Authenticated model cache shard is unavailable",
-      );
-    }
-    const segments = segmentsByShard[shardIndex]!;
-    let shardOffset = 0;
-    let segmentIndex = 0;
-    for await (const chunk of stream) {
-      input.signal.throwIfAborted();
-      const chunkStart = shardOffset;
-      const chunkEnd = chunkStart + chunk.byteLength;
-      if (chunkEnd > expectedBytes) {
+  let completedBytes = 0;
+  const onBytesUploaded = (byteLength: number): void => {
+    completedBytes += byteLength;
+    input.onProgress?.(completedBytes);
+  };
+  try {
+    for (const [shardIndex, cachedShard] of input.cached.shards.entries()) {
+      const packageShard = packageDirectory.shards[shardIndex]!;
+      const expectedBytes = safeByteNumber(packageShard.length, "Package shard length");
+      if (
+        cachedShard.byteLength !== expectedBytes ||
+        cachedShard.sha256 !== packageShard.sha256
+      ) {
+        throw diagnosticError(
+          "model-cache-shard-identity-mismatch",
+          "An authenticated cache shard does not match the package directory",
+        );
+      }
+      const segments = segmentsByShard[shardIndex]!;
+      // The cache already authenticated every immutable shard. A shard used
+      // only by token_embd stays in OPFS and must not be streamed during the
+      // permanent-weight upload.
+      if (segments.length === 0) continue;
+      const stream = await input.storage.openRead(cachedShard.storagePath);
+      if (stream === null) {
+        throw diagnosticError(
+          "model-cache-shard-missing",
+          "Authenticated model cache shard is unavailable",
+        );
+      }
+      let shardOffset = 0;
+      let segmentIndex = 0;
+      for await (const chunk of stream) {
+        input.signal.throwIfAborted();
+        const chunkStart = shardOffset;
+        const chunkEnd = chunkStart + chunk.byteLength;
+        if (chunkEnd > expectedBytes) {
+          throw diagnosticError(
+            "model-cache-shard-size-invalid",
+            "Authenticated model cache shard has an invalid length",
+          );
+        }
+        while (
+          segmentIndex < segments.length &&
+          segments[segmentIndex]!.sourceEnd <= chunkStart
+        ) {
+          segmentIndex += 1;
+        }
+        let scan = segmentIndex;
+        while (scan < segments.length && segments[scan]!.sourceStart < chunkEnd) {
+          const segment = segments[scan]!;
+          const intersectionStart = Math.max(chunkStart, segment.sourceStart);
+          const intersectionEnd = Math.min(chunkEnd, segment.sourceEnd);
+          if (intersectionStart < intersectionEnd) {
+            await appendSegmentBytes({
+              segment,
+              sourceOffset: intersectionStart,
+              bytes: chunk.subarray(
+                intersectionStart - chunkStart,
+                intersectionEnd - chunkStart,
+              ),
+              queue: input.queue,
+              uploadLaneBytes: input.uploadLaneBytes,
+              uploadRetirementPolicy,
+              window,
+              signal: input.signal,
+              onBytesUploaded,
+            });
+          }
+          if (segment.sourceEnd <= chunkEnd) {
+            segmentIndex = scan + 1;
+          }
+          scan += 1;
+        }
+        shardOffset = chunkEnd;
+      }
+      if (shardOffset !== expectedBytes) {
         throw diagnosticError(
           "model-cache-shard-size-invalid",
           "Authenticated model cache shard has an invalid length",
         );
       }
-      while (
-        segmentIndex < segments.length &&
-        segments[segmentIndex]!.sourceEnd <= chunkStart
-      ) {
-        segmentIndex += 1;
-      }
-      let scan = segmentIndex;
-      while (scan < segments.length && segments[scan]!.sourceStart < chunkEnd) {
-        const segment = segments[scan]!;
-        const intersectionStart = Math.max(chunkStart, segment.sourceStart);
-        const intersectionEnd = Math.min(chunkEnd, segment.sourceEnd);
-        if (intersectionStart < intersectionEnd) {
-          await appendSegmentBytes({
-            segment,
-            sourceOffset: intersectionStart,
-            bytes: chunk.subarray(
-              intersectionStart - chunkStart,
-              intersectionEnd - chunkStart,
-            ),
-            queue: input.queue,
-            uploadLaneBytes: input.uploadLaneBytes,
-            window,
-            signal: input.signal,
-          });
+      for (const segment of segments) {
+        if (
+          segment.consumed !== segment.sourceEnd - segment.sourceStart ||
+          segment.pending.byteLength !== 0
+        ) {
+          throw diagnosticError(
+            "model-weight-segment-incomplete",
+            "The cached shard did not fill a complete Qwen3.5 tensor segment",
+          );
         }
-        if (segment.sourceEnd <= chunkEnd) {
-          segmentIndex = scan + 1;
-        }
-        scan += 1;
-      }
-      shardOffset = chunkEnd;
-    }
-    if (shardOffset !== expectedBytes) {
-      throw diagnosticError(
-        "model-cache-shard-size-invalid",
-        "Authenticated model cache shard has an invalid length",
-      );
-    }
-    for (const segment of segments) {
-      if (
-        segment.consumed !== segment.sourceEnd - segment.sourceStart ||
-        segment.pending.byteLength !== 0
-      ) {
-        throw diagnosticError(
-          "model-weight-segment-incomplete",
-          "The cached shard did not fill a complete Qwen3.5 tensor segment",
-        );
       }
     }
+    input.signal.throwIfAborted();
+  } catch (error) {
+    // Writes accepted before cancellation still own their destinations until
+    // GPUQueue retirement; rollback may destroy buffers only after this await.
+    await retireUploadWindow({ queue: input.queue, window });
+    throw error;
   }
-  input.signal.throwIfAborted();
-  if (window.outstandingBytes > 0) {
-    await input.queue.onSubmittedWorkDone();
-    window.outstandingBytes = 0;
-  }
+  await retireUploadWindow({ queue: input.queue, window });
   input.signal.throwIfAborted();
 }
 
@@ -378,31 +444,82 @@ export async function initializeQwen35WeightExecution<T>(input: {
   readonly cached: CachedModelPackage;
   readonly queue: Qwen35WeightWriteQueue;
   readonly uploadLaneBytes: number;
+  readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
   readonly signal: AbortSignal;
-  readonly createDriver: (directory: Qwen35WeightDirectoryView) => Promise<T>;
-}): Promise<{ readonly directory: Qwen35WeightDirectory; readonly driver: T }> {
+  readonly onWeightsAllocated?: (completedBytes: number) => void;
+  readonly onWeightsUploaded?: (completedBytes: number) => void;
+  readonly onDriverInitialize?: () => void;
+  readonly createDriver: (
+    directory: Qwen35WeightDirectoryView,
+    rollingStore?: Qwen35RollingLayerStore,
+  ) => Promise<T>;
+}): Promise<{
+  readonly directory: Qwen35WeightDirectory;
+  readonly rollingStore?: Qwen35RollingLayerStore;
+  readonly driver: T;
+}> {
+  const residentPackage = qwen35PermanentWeightPackage(input.packageDirectory);
+  const usesRollingLayers = hasQwen35RollingLayerSet(input.packageDirectory);
   const directory = await allocateQwen35WeightDirectory(
     input.arena,
-    input.packageDirectory,
+    residentPackage,
+    {
+      ...(input.onWeightsAllocated === undefined
+        ? {}
+        : { onProgress: input.onWeightsAllocated }),
+    },
   );
+  let rollingStore: Qwen35RollingLayerStore | null = null;
   try {
+    input.onWeightsUploaded?.(0);
     await uploadQwen35CachedWeights({
       storage: input.storage,
       cached: input.cached,
       directory,
       queue: input.queue,
       uploadLaneBytes: input.uploadLaneBytes,
+      ...(input.uploadRetirementPolicy === undefined
+        ? {}
+        : { uploadRetirementPolicy: input.uploadRetirementPolicy }),
       signal: input.signal,
+      ...(input.onWeightsUploaded === undefined
+        ? {}
+        : { onProgress: input.onWeightsUploaded }),
     });
     input.signal.throwIfAborted();
-    const driver = await input.createDriver(directory.view);
-    return Object.freeze({ directory, driver });
+    if (usesRollingLayers) {
+      rollingStore = await createQwen35RollingLayerStore({
+        arena: input.arena,
+        queue: input.queue,
+        packageDirectory: input.packageDirectory,
+        cached: input.cached,
+        rangeReader: createQwen35ModelCacheRangeReader(input.storage),
+        uploadLaneBytes: input.uploadLaneBytes,
+        readChunkBytes: Math.min(input.uploadLaneBytes, 32 * 1024 * 1024),
+      });
+    }
+    input.signal.throwIfAborted();
+    input.onDriverInitialize?.();
+    const driver = await input.createDriver(
+      directory.view,
+      rollingStore ?? undefined,
+    );
+    return Object.freeze({
+      directory,
+      ...(rollingStore === null ? {} : { rollingStore }),
+      driver,
+    });
   } catch (error) {
     let rollbackFailed = false;
     try {
       // Cancellation does not cancel writes already accepted by GPUQueue.
       // Retire them before buffer destruction releases ledger ownership.
       await input.queue.onSubmittedWorkDone();
+    } catch {
+      rollbackFailed = true;
+    }
+    try {
+      await rollingStore?.dispose();
     } catch {
       rollbackFailed = true;
     }

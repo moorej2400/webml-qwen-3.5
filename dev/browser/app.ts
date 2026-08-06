@@ -1,9 +1,25 @@
-import { Qwen35Session } from "../../src/qwen35-session.js";
-import type { Qwen35BrowserLoadOptions } from "../../src/qwen35-model-loader.js";
+import {
+  startQwen35ChatApp,
+} from "../../src/chat-app.js";
+import type { BufferShardPolicy, WebGpuProbeSurface } from "../../src/device-profile.js";
+import type { ModelPackageManifest } from "../../src/manifest.js";
 import {
   createTextRuntimeController,
   type TextRuntimeController,
 } from "./text-runtime.js";
+import { createLocalWeightUploadProbe } from "./upload-probe.js";
+
+interface LocalRuntimeConfiguration {
+  readonly manifest?: ModelPackageManifest;
+  readonly bufferShardPolicy?: BufferShardPolicy;
+  readonly uploadDiagnostics?: true;
+  readonly uploadLaneBytes?: number;
+  readonly retireUploadAfterEachWrite?: boolean;
+}
+
+interface LocalRuntimeWindow extends Window {
+  readonly __QWEN35_RUNTIME_CONFIG__?: LocalRuntimeConfiguration;
+}
 
 declare global {
   // The injected development agent reads only this explicit command surface.
@@ -12,70 +28,132 @@ declare global {
   var __QWEN_LOCAL_CONTROL__: TextRuntimeController | undefined;
 }
 
-const requireElement = <T extends HTMLElement>(id: string): T => {
-  const element = document.getElementById(id);
-  if (element === null) throw new Error(`Required application element is missing: ${id}`);
-  return element as T;
-};
+const root = document.querySelector<HTMLElement>("#qwen-app");
+if (root === null) throw new Error("The polished application root is missing");
 
-const fetchRuntimeConfiguration = async (): Promise<Qwen35BrowserLoadOptions> => {
-  const response = await fetch("/.local-runtime-config.json", {
-    method: "GET",
-    cache: "no-store",
-    credentials: "omit",
-  });
-  if (!response.ok) throw new Error("Local runtime configuration is unavailable");
-  const input: unknown = await response.json();
-  if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    throw new Error("Local runtime configuration is invalid");
+const MIB = 1024 * 1024;
+const runtimeConfiguration = (window as LocalRuntimeWindow)
+  .__QWEN35_RUNTIME_CONFIG__;
+const localProbe = (() => {
+  if (runtimeConfiguration?.uploadDiagnostics !== true) return null;
+  const bufferShardBytes = runtimeConfiguration.bufferShardPolicy === "evidence-128"
+    ? 128 * MIB
+    : runtimeConfiguration.bufferShardPolicy === "evidence-64"
+    ? 64 * MIB
+    : null;
+  const uploadLaneBytes = runtimeConfiguration.uploadLaneBytes;
+  const retireAfterEachWrite = runtimeConfiguration.retireUploadAfterEachWrite;
+  if (
+    runtimeConfiguration.manifest === undefined ||
+    bufferShardBytes === null ||
+    !Number.isSafeInteger(uploadLaneBytes) ||
+    uploadLaneBytes === undefined ||
+    uploadLaneBytes < 4 ||
+    uploadLaneBytes % 4 !== 0 ||
+    typeof retireAfterEachWrite !== "boolean"
+  ) {
+    throw new Error("The local upload probe configuration is invalid");
   }
-  return input as Qwen35BrowserLoadOptions;
-};
+  const navigatorWithGpu = navigator as Navigator & {
+    readonly gpu?: WebGpuProbeSurface["gpu"];
+  };
+  const surface: WebGpuProbeSurface = {
+    ...(navigatorWithGpu.gpu === undefined ? {} : { gpu: navigatorWithGpu.gpu }),
+    performance: globalThis.performance as unknown as NonNullable<
+      WebGpuProbeSurface["performance"]
+    >,
+  };
+  return createLocalWeightUploadProbe({
+    surface,
+    manifest: runtimeConfiguration.manifest,
+    bufferShardBytes,
+    uploadLaneBytes,
+    retireAfterEachWrite,
+    onEvent(event) {
+      dispatchEvent(new CustomEvent("qwen-local-runtime-upload-event", {
+        detail: event,
+      }));
+    },
+  });
+})();
 
-const status = requireElement<HTMLOutputElement>("runtime-status");
-const output = requireElement<HTMLPreElement>("runtime-output");
-const prompt = requireElement<HTMLTextAreaElement>("runtime-prompt");
-const maxTokens = requireElement<HTMLInputElement>("runtime-max-tokens");
-const configuration = await fetchRuntimeConfiguration();
+// Development defers loading until the authenticated operator asks for it.
+const application = startQwen35ChatApp(root, {
+  autoLoad: false,
+  ...(localProbe === null
+    ? {}
+    : {
+        webGpuSurface: localProbe.surface,
+        uploadLaneBytes: runtimeConfiguration!.uploadLaneBytes!,
+        uploadRetirementPolicy:
+          runtimeConfiguration!.retireUploadAfterEachWrite === true
+            ? "per-write" as const
+            : "window" as const,
+      }),
+});
+let operatorOutput: HTMLElement | null = null;
+const appendOperatorMessage = (
+  role: "user" | "assistant",
+  text: string,
+): HTMLElement => {
+  const item = document.createElement("article");
+  item.className = `message message--${role}`;
+  const label = document.createElement("p");
+  label.className = "message__role";
+  label.textContent = role === "user" ? "Operator" : "Qwen";
+  const content = document.createElement("p");
+  content.className = "message__text";
+  content.textContent = text;
+  item.append(label, content);
+  document.querySelector<HTMLElement>("[data-messages]")?.append(item);
+  item.scrollIntoView({ block: "end", behavior: "smooth" });
+  return content;
+};
 const controller = createTextRuntimeController({
-  session: new Qwen35Session(),
-  loadOptions: configuration,
+  coordinator: application.coordinator,
+  onPromptStart(prompt) {
+    appendOperatorMessage("user", prompt);
+    operatorOutput = appendOperatorMessage("assistant", "");
+  },
   onText(text) {
-    output.textContent += text;
+    if (operatorOutput === null) {
+      operatorOutput = appendOperatorMessage("assistant", "");
+    }
+    operatorOutput.textContent += text;
   },
 });
-globalThis.__QWEN_LOCAL_CONTROL__ = controller;
-
-const reportState = (): void => {
-  status.value = JSON.stringify(controller.getState());
-};
-
-const runUiAction = async (action: () => Promise<void>): Promise<void> => {
-  status.value = "working";
-  try {
-    await action();
-    reportState();
-  } catch {
-    status.value = "operation failed";
-  }
-};
-
-requireElement<HTMLButtonElement>("runtime-load").addEventListener("click", () => {
-  void runUiAction(() => controller.load());
+globalThis.__QWEN_LOCAL_CONTROL__ = Object.freeze({
+  async load(payload?: unknown) {
+    try {
+      await controller.load(payload);
+    } finally {
+      // Cancellation can intentionally suppress a failed load event.
+      localProbe?.endWeightsUpload();
+    }
+  },
+  runPrompt: (payload?: unknown) => controller.runPrompt(payload),
+  async cancelPrompt() {
+    localProbe?.endWeightsUpload();
+    await controller.cancelPrompt();
+  },
+  async dispose() {
+    localProbe?.endWeightsUpload();
+    await controller.dispose();
+  },
+  getState: () => controller.getState(),
 });
-requireElement<HTMLButtonElement>("runtime-run").addEventListener("click", () => {
-  output.textContent = "";
-  void runUiAction(() => controller.runPrompt({
-    prompt: prompt.value,
-    maxNewTokens: Number(maxTokens.value),
+application.coordinator.subscribeLoadEvents((event) => {
+  if (event.phase === "weights_upload" && event.completedBytes === 0) {
+    localProbe?.beginWeightsUpload();
+  } else if (
+    event.phase === "driver_initialize" ||
+    event.phase === "ready" ||
+    event.phase === "failed"
+  ) {
+    localProbe?.endWeightsUpload();
+  }
+  dispatchEvent(new CustomEvent("qwen-local-runtime-load-event", {
+    detail: event,
   }));
 });
-requireElement<HTMLButtonElement>("runtime-cancel").addEventListener("click", () => {
-  void runUiAction(() => controller.cancelPrompt());
-});
-requireElement<HTMLButtonElement>("runtime-dispose").addEventListener("click", () => {
-  void runUiAction(() => controller.dispose());
-});
-requireElement<HTMLButtonElement>("runtime-state").addEventListener("click", reportState);
-reportState();
 dispatchEvent(new CustomEvent("qwen-local-runtime-ready"));

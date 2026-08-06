@@ -7,6 +7,7 @@ import { validateProtocolId } from "./protocol.js";
 const MAX_EVENT_BYTES = 16_384;
 const ALLOWED_CATEGORIES = new Set([
   "phase",
+  "upload",
   "download",
   "cache",
   "shader",
@@ -46,6 +47,22 @@ const ALLOWED_EVENT_NAMES = new Set([
   "benchmark_completed",
   "runtime_error",
   "telemetry_omitted",
+  "before_write",
+  "after_write",
+  "after_retire",
+]);
+const UPLOAD_EVENT_NAMES = new Set([
+  "before_write",
+  "after_write",
+  "after_retire",
+]);
+const ALLOCATION_DIAGNOSTIC_CODES = new Set([
+  "gpu_out_of_memory",
+  "gpu_validation",
+  "buffer_creation",
+  "error_scope",
+  "allocation_conflict",
+  "unknown",
 ]);
 const NUMERIC_METRIC_KEYS = new Set([
   "durationMs",
@@ -67,9 +84,30 @@ const NUMERIC_METRIC_KEYS = new Set([
   "observed",
   "sequence",
 ]);
+const LOAD_PROGRESS_METRIC_KEYS = new Set([
+  "completedBytes",
+  "totalBytes",
+  "shardIndex",
+  "shardCount",
+  "currentGpuBytes",
+  "peakGpuBytes",
+]);
 const BOOLEAN_METRIC_KEYS = new Set(["cacheHit", "deviceLost"]);
 const STRING_METRIC_VALUES: Readonly<Record<string, ReadonlySet<string>>> = {
-  phase: new Set(["adapter", "model", "download", "cache", "shader", "vision", "prefill", "generation", "ready", "disposed"]),
+  phase: new Set([
+    "lock_wait",
+    "cache_scan",
+    "cache_download",
+    "cache_verify",
+    "tokenizer_load",
+    "device_probe",
+    "state_allocate",
+    "weights_allocate",
+    "weights_upload",
+    "driver_initialize",
+    "ready",
+    "failed",
+  ]),
   thermalState: new Set(["unknown", "nominal", "fair", "serious", "critical"]),
   code: new Set(["unknown", "device_lost", "out_of_memory", "network_error", "timeout", "cancelled", "unsupported", "runtime_error"]),
   status: new Set(["accepted", "started", "completed", "failed", "cancelled", "timed_out", "indeterminate", "connected", "disconnected", "ready", "idle", "loading", "loaded", "unavailable"]),
@@ -77,10 +115,61 @@ const STRING_METRIC_VALUES: Readonly<Record<string, ReadonlySet<string>>> = {
   lifecycle: new Set(["pagehide", "navigation", "visibilitychange", "freeze", "resume", "reload"]),
 };
 
+const sanitizeUploadMetrics = (value: unknown): Record<string, unknown> => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  const input = value as Record<string, unknown>;
+  const positive = (entry: unknown): entry is number =>
+    Number.isSafeInteger(entry) && (entry as number) > 0;
+  const nonnegative = (entry: unknown): entry is number =>
+    Number.isSafeInteger(entry) && (entry as number) >= 0;
+  if (
+    !positive(input.ordinal) ||
+    !nonnegative(input.shardIndex) ||
+    !positive(input.shardCount) ||
+    input.shardIndex >= input.shardCount ||
+    !nonnegative(input.segmentIndex) ||
+    !positive(input.segmentCount) ||
+    input.segmentIndex >= input.segmentCount ||
+    !nonnegative(input.globalOffset) ||
+    input.globalOffset % 4 !== 0 ||
+    !positive(input.byteCount) ||
+    input.byteCount % 4 !== 0 ||
+    !Number.isSafeInteger(input.globalOffset + input.byteCount) ||
+    !positive(input.bufferShardBytes) ||
+    input.bufferShardBytes % 4 !== 0 ||
+    !positive(input.uploadLaneBytes) ||
+    input.uploadLaneBytes % 4 !== 0 ||
+    input.byteCount > input.uploadLaneBytes ||
+    typeof input.retireAfterEachWrite !== "boolean"
+  ) {
+    return {};
+  }
+  return {
+    ordinal: input.ordinal,
+    shardIndex: input.shardIndex,
+    shardCount: input.shardCount,
+    segmentIndex: input.segmentIndex,
+    segmentCount: input.segmentCount,
+    globalOffset: input.globalOffset,
+    byteCount: input.byteCount,
+    bufferShardBytes: input.bufferShardBytes,
+    uploadLaneBytes: input.uploadLaneBytes,
+    retireAfterEachWrite: input.retireAfterEachWrite,
+  };
+};
+
 const sanitizeMetrics = (value: unknown): Record<string, unknown> => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   const result: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
+    if (
+      LOAD_PROGRESS_METRIC_KEYS.has(key) &&
+      Number.isSafeInteger(entry) &&
+      (entry as number) >= 0
+    ) {
+      result[key] = entry;
+      continue;
+    }
     if (NUMERIC_METRIC_KEYS.has(key) && typeof entry === "number" && Number.isFinite(entry)) {
       result[key] = entry;
       continue;
@@ -90,6 +179,51 @@ const sanitizeMetrics = (value: unknown): Record<string, unknown> => {
       continue;
     }
     if (typeof entry === "string" && STRING_METRIC_VALUES[key]?.has(entry)) result[key] = entry;
+  }
+  if (
+    (typeof result.completedBytes === "number") !==
+      (typeof result.totalBytes === "number") ||
+    (typeof result.completedBytes === "number" &&
+      typeof result.totalBytes === "number" &&
+      result.completedBytes > result.totalBytes)
+  ) {
+    delete result.completedBytes;
+    delete result.totalBytes;
+  }
+  if (
+    (typeof result.shardIndex === "number") !==
+      (typeof result.shardCount === "number") ||
+    (typeof result.shardIndex === "number" &&
+      typeof result.shardCount === "number" &&
+      (result.shardCount === 0 || result.shardIndex >= result.shardCount))
+  ) {
+    delete result.shardIndex;
+    delete result.shardCount;
+  }
+  if (
+    typeof result.currentGpuBytes === "number" &&
+    typeof result.peakGpuBytes === "number" &&
+    result.currentGpuBytes > result.peakGpuBytes
+  ) {
+    delete result.currentGpuBytes;
+    delete result.peakGpuBytes;
+  }
+  return result;
+};
+
+const sanitizeRuntimeErrorMetrics = (value: unknown): Record<string, unknown> => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  const input = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  if (Object.hasOwn(input, "code")) {
+    result.code =
+      typeof input.code === "string" && ALLOCATION_DIAGNOSTIC_CODES.has(input.code)
+        ? input.code
+        : "unknown";
+  }
+  for (const key of ["allocationBytes", "peakBytes", "count"] as const) {
+    const entry = input[key];
+    if (Number.isSafeInteger(entry) && (entry as number) >= 0) result[key] = entry;
   }
   return result;
 };
@@ -142,17 +276,28 @@ export const sanitizeTelemetryEvent = (input: Record<string, unknown>): Sanitize
     typeof input.category === "string" && ALLOWED_CATEGORIES.has(input.category)
       ? input.category
       : "error";
+  let name =
+    typeof input.name === "string" && ALLOWED_EVENT_NAMES.has(input.name)
+      ? input.name
+      : "telemetry_omitted";
+  if ((category === "upload") !== UPLOAD_EVENT_NAMES.has(name)) {
+    name = "telemetry_omitted";
+  }
   const event: SanitizedTelemetryEvent = {
     schemaVersion: 1,
     category,
-    name: typeof input.name === "string" && ALLOWED_EVENT_NAMES.has(input.name) ? input.name : "telemetry_omitted",
+    name,
     timestampMs:
       typeof input.timestampMs === "number" && Number.isFinite(input.timestampMs)
         ? Math.max(0, Math.trunc(input.timestampMs))
         : 0,
     metrics: {},
   };
-  event.metrics = sanitizeMetrics(input.metrics);
+  event.metrics = category === "upload" && UPLOAD_EVENT_NAMES.has(name)
+    ? sanitizeUploadMetrics(input.metrics)
+    : category === "error" && name === "runtime_error"
+      ? sanitizeRuntimeErrorMetrics(input.metrics)
+      : sanitizeMetrics(input.metrics);
   for (const key of ["deviceId", "tabId", "documentId", "commandId", "benchmarkId"] as const) {
     try {
       if (input[key] !== undefined) event[key] = validateProtocolId(input[key], key);

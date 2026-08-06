@@ -27,6 +27,34 @@ export type Qwen35SessionState =
   | "disposed"
   | "failed";
 
+export const QWEN35_LOAD_PHASES = Object.freeze([
+  "lock_wait",
+  "cache_scan",
+  "cache_download",
+  "cache_verify",
+  "tokenizer_load",
+  "device_probe",
+  "state_allocate",
+  "weights_allocate",
+  "weights_upload",
+  "driver_initialize",
+  "ready",
+  "failed",
+] as const);
+
+export type RuntimeLoadPhase = (typeof QWEN35_LOAD_PHASES)[number];
+
+/** Public-safe load telemetry. Text and resource identities are never fields. */
+export interface RuntimeLoadEvent {
+  readonly phase: RuntimeLoadPhase;
+  readonly completedBytes: number;
+  readonly totalBytes: number;
+  readonly shardIndex?: number;
+  readonly shardCount?: number;
+  readonly currentGpuBytes?: number;
+  readonly peakGpuBytes?: number;
+}
+
 export type TextOrImageConversation = readonly Qwen35ChatMessage[];
 
 export interface SequenceState {
@@ -112,6 +140,7 @@ export interface Qwen35LoadedResources {
 
 export interface LoadOptions {
   readonly signal?: AbortSignal;
+  readonly onLoadEvent?: (event: RuntimeLoadEvent) => void;
   readonly [key: string]: unknown;
 }
 
@@ -196,6 +225,76 @@ function isAbortError(error: unknown): boolean {
     : error instanceof Error && error.name === "AbortError";
 }
 
+const LOAD_PHASE_SET = new Set<string>(QWEN35_LOAD_PHASES);
+
+function isBoundedLoadNumber(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+export function sanitizeRuntimeLoadEvent(
+  input: unknown,
+): RuntimeLoadEvent | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    return null;
+  }
+  const value = input as Record<string, unknown>;
+  if (
+    typeof value.phase !== "string" ||
+    !LOAD_PHASE_SET.has(value.phase) ||
+    !isBoundedLoadNumber(value.completedBytes) ||
+    !isBoundedLoadNumber(value.totalBytes) ||
+    value.completedBytes > value.totalBytes
+  ) {
+    return null;
+  }
+  const event: {
+    phase: RuntimeLoadPhase;
+    completedBytes: number;
+    totalBytes: number;
+    shardIndex?: number;
+    shardCount?: number;
+    currentGpuBytes?: number;
+    peakGpuBytes?: number;
+  } = {
+    phase: value.phase as RuntimeLoadPhase,
+    completedBytes: value.completedBytes,
+    totalBytes: value.totalBytes,
+  };
+  if (
+    isBoundedLoadNumber(value.currentGpuBytes) &&
+    isBoundedLoadNumber(value.peakGpuBytes) &&
+    value.currentGpuBytes <= value.peakGpuBytes
+  ) {
+    event.currentGpuBytes = value.currentGpuBytes;
+    event.peakGpuBytes = value.peakGpuBytes;
+  }
+  if (
+    isBoundedLoadNumber(value.shardIndex) &&
+    isBoundedLoadNumber(value.shardCount) &&
+    value.shardCount > 0 &&
+    value.shardIndex < value.shardCount
+  ) {
+    event.shardIndex = value.shardIndex;
+    event.shardCount = value.shardCount;
+  }
+  return Object.freeze(event);
+}
+
+function createLoadReporter(
+  observer: LoadOptions["onLoadEvent"],
+): (event: unknown) => void {
+  return (event) => {
+    const sanitized = sanitizeRuntimeLoadEvent(event);
+    if (sanitized === null || observer === undefined) return;
+    try {
+      // Observability must not gain control of model ownership or loading.
+      observer(sanitized);
+    } catch {
+      // A failed development observer is intentionally non-fatal.
+    }
+  };
+}
+
 function productionRuntime(): Qwen35SessionRuntime {
   const locks = globalThis.navigator?.locks;
   return {
@@ -276,6 +375,16 @@ export class Qwen35Session {
     const lock = new OriginModelLock(this.#runtime.lockManager);
     this.#lock = lock;
     const started = this.#now();
+    const reportLoadEvent = createLoadReporter(options.onLoadEvent);
+    const runtimeOptions: LoadOptions = {
+      ...options,
+      onLoadEvent: reportLoadEvent,
+    };
+    reportLoadEvent({
+      phase: "lock_wait",
+      completedBytes: 0,
+      totalBytes: 0,
+    });
 
     // The lock callback stays pending for the complete loaded lifetime. Returning
     // from load only resolves `ready`; only dispose resolves `lifetime`.
@@ -283,7 +392,7 @@ export class Qwen35Session {
       run: async (signal) => {
         try {
           options.signal?.throwIfAborted();
-          const resources = await this.#runtime.load(signal, options);
+          const resources = await this.#runtime.load(signal, runtimeOptions);
           // Ownership transfers before either cancellation check so lock-held
           // cleanup also covers a runtime that finishes concurrently with abort.
           this.#resources = resources;
@@ -303,6 +412,13 @@ export class Qwen35Session {
           }
           this.#state = "ready";
           this.#recordPhase("load", started);
+          reportLoadEvent({
+            phase: "ready",
+            completedBytes: 0,
+            totalBytes: 0,
+            currentGpuBytes: this.#trackedGpuBytes,
+            peakGpuBytes: this.#peakTrackedGpuBytes,
+          });
           ready.resolve(undefined);
           await lifetime.promise;
         } catch (error) {
@@ -342,11 +458,24 @@ export class Qwen35Session {
         () => null,
         (failure: unknown) => failure,
       );
+      const loadFailure = lockError ?? error;
       const stateAfterLock = this.#state as Qwen35SessionState;
       if (stateAfterLock !== "disposing" && stateAfterLock !== "disposed") {
         this.#state = "failed";
       }
-      throw lockError ?? error;
+      if (
+        !isAbortError(loadFailure) ||
+        (!this.#disposeRequested && !this.#loadCancellationRequested)
+      ) {
+        reportLoadEvent({
+          phase: "failed",
+          completedBytes: 0,
+          totalBytes: 0,
+          currentGpuBytes: this.#trackedGpuBytes,
+          peakGpuBytes: this.#peakTrackedGpuBytes,
+        });
+      }
+      throw loadFailure;
     } finally {
       options.signal?.removeEventListener("abort", abort);
     }

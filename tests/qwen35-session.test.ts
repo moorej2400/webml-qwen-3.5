@@ -12,6 +12,30 @@ import {
 } from "../src/qwen35-session.js";
 import type { CompiledTokenizerTables } from "../src/tokenizer-binary.js";
 
+const LOAD_PHASES = [
+  "lock_wait",
+  "cache_scan",
+  "cache_download",
+  "cache_verify",
+  "tokenizer_load",
+  "device_probe",
+  "state_allocate",
+  "weights_allocate",
+  "weights_upload",
+  "driver_initialize",
+  "ready",
+] as const;
+
+type LoadEvent = {
+  readonly phase: (typeof LOAD_PHASES)[number] | "failed";
+  readonly completedBytes: number;
+  readonly totalBytes: number;
+  readonly shardIndex?: number;
+  readonly shardCount?: number;
+  readonly currentGpuBytes?: number;
+  readonly peakGpuBytes?: number;
+};
+
 function tokenizer(): Qwen35Tokenizer {
   const added = [
     "<|im_start|>",
@@ -180,6 +204,99 @@ test("loads only after origin lock acquisition and exposes a ready state", async
 
   assert.equal(session.state, "ready");
   assert.deepEqual(events, ["lock", "load"]);
+  await session.dispose();
+});
+
+test("load observers receive every exact phase from lock wait through ready", async () => {
+  const fake = driver();
+  const observed: LoadEvent[] = [];
+  const innerPhases = LOAD_PHASES.slice(1, -1);
+  const session = new Qwen35Session({
+    lockManager: new ImmediateLockManager(),
+    async load(signal, options): Promise<Qwen35LoadedResources> {
+      signal.throwIfAborted();
+      const report = options.onLoadEvent as ((event: LoadEvent) => void) | undefined;
+      assert.ok(report, "the session must give its runtime a load-event reporter");
+      for (const [index, phase] of innerPhases.entries()) {
+        report({
+          phase,
+          completedBytes: index,
+          totalBytes: innerPhases.length,
+          shardIndex: 0,
+          shardCount: 1,
+          currentGpuBytes: index,
+          peakGpuBytes: index,
+        });
+      }
+      return {
+        tokenizer: tokenizer(),
+        driver: fake.driver,
+        cacheHit: false,
+        trackedCpuBytes: 12,
+        trackedGpuBytes: 34,
+        async dispose() { await fake.driver.dispose(); },
+      };
+    },
+  });
+
+  await session.load({
+    onLoadEvent: (event: LoadEvent) => observed.push(event),
+  });
+
+  assert.deepEqual(observed.map(({ phase }) => phase), LOAD_PHASES);
+  await session.dispose();
+});
+
+test("load observers receive bounded fields without private runtime text", async () => {
+  const privateText = "private prompt model URL path response and stack";
+  const fake = driver();
+  const observed: LoadEvent[] = [];
+  const session = new Qwen35Session({
+    lockManager: new ImmediateLockManager(),
+    async load(_signal, options): Promise<Qwen35LoadedResources> {
+      const report = options.onLoadEvent as ((event: Record<string, unknown>) => void) | undefined;
+      assert.ok(report, "the session must give its runtime a load-event reporter");
+      report({
+        phase: "cache_download",
+        completedBytes: 32,
+        totalBytes: 64,
+        shardIndex: 0,
+        shardCount: 2,
+        currentGpuBytes: 0,
+        peakGpuBytes: 0,
+        prompt: privateText,
+        response: privateText,
+        url: privateText,
+        path: privateText,
+        error: privateText,
+        stack: privateText,
+      });
+      return {
+        tokenizer: tokenizer(),
+        driver: fake.driver,
+        cacheHit: false,
+        trackedCpuBytes: 12,
+        trackedGpuBytes: 34,
+        async dispose() { await fake.driver.dispose(); },
+      };
+    },
+  });
+
+  await session.load({
+    onLoadEvent: (event: LoadEvent) => observed.push(event),
+  });
+
+  const download = observed.find(({ phase }) => phase === "cache_download");
+  assert.deepEqual(download, {
+    phase: "cache_download",
+    completedBytes: 32,
+    totalBytes: 64,
+    shardIndex: 0,
+    shardCount: 2,
+    currentGpuBytes: 0,
+    peakGpuBytes: 0,
+  });
+  assert.doesNotMatch(JSON.stringify(observed), /private|prompt|response|url|path|error|stack/i);
   await session.dispose();
 });
 

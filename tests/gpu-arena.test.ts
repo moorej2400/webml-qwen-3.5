@@ -149,6 +149,10 @@ test("rolls back created buffers and ledger ownership after partial failure", as
       }),
     (error: unknown) => {
       assert.ok(error instanceof Error);
+      assert.equal(
+        (error as Error & { readonly code?: unknown }).code,
+        "buffer_creation",
+      );
       assert.match(error.message, /GPU buffer allocation failed/i);
       assert.doesNotMatch(error.message, /synthetic|partial/i);
       return true;
@@ -263,7 +267,15 @@ test("uses only the ledger as the cumulative allocation budget", async () => {
         usage: 128,
         alignment: 16,
       }),
-    /ledger limit/i,
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        (error as Error & { readonly code?: unknown }).code,
+        "allocation_conflict",
+      );
+      assert.match(error.message, /ledger limit/i);
+      return true;
+    },
   );
   assert.equal(ledger.snapshot().currentBytes, 64n);
   first.destroy();
@@ -361,15 +373,21 @@ test("rejects illegal GPUBufferUsage combinations before opening error scopes", 
 });
 
 test("rolls back every buffer after asynchronous validation or OOM errors", async () => {
-  for (const popResults of [
-    [
-      null,
-      { message: "validation at local-path:<path>/<tensor-id>.gguf" },
-    ],
-    [
-      { message: "OOM for https://example.invalid/<model-id>.gguf" },
-      null,
-    ],
+  for (const { popResults, expectedCode } of [
+    {
+      popResults: [
+        null,
+        { message: "validation at local-path:<path>/<tensor-id>.gguf" },
+      ],
+      expectedCode: "gpu_validation",
+    },
+    {
+      popResults: [
+        { message: "OOM for https://example.invalid/<model-id>.gguf" },
+        null,
+      ],
+      expectedCode: "gpu_out_of_memory",
+    },
   ] as const) {
     const fake = fakeDevice({
       maxBufferSize: 32,
@@ -391,6 +409,10 @@ test("rolls back every buffer after asynchronous validation or OOM errors", asyn
       }),
       (error: unknown) => {
         assert.ok(error instanceof Error);
+        assert.equal(
+          (error as Error & { readonly code?: unknown }).code,
+          expectedCode,
+        );
         assert.match(error.message, /GPU buffer allocation failed/i);
         assert.doesNotMatch(
           error.message,
@@ -405,6 +427,150 @@ test("rolls back every buffer after asynchronous validation or OOM errors", asyn
     assert.deepEqual(fake.poppedScopes, ["out-of-memory", "validation"]);
     ledger.assertAllReleased();
   }
+});
+
+test("classifies an error-scope failure without exposing browser error text", async () => {
+  const fake = fakeDevice();
+  const device = {
+    ...fake.device,
+    popErrorScope(): Promise<null> {
+      throw new Error("private scope failure at local-path:<path>/<model-id>.gguf");
+    },
+  };
+  const ledger = new AllocationLedger(64n);
+  const arena = new GpuArena(device, ledger, {
+    bufferShardCapBytes: 64n,
+  });
+
+  await assert.rejects(
+    arena.allocate({
+      id: "scope-failure",
+      category: "scratch",
+      byteLength: 16n,
+      usage: 128,
+      alignment: 4,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        (error as Error & { readonly code?: unknown }).code,
+        "error_scope",
+      );
+      assert.doesNotMatch(error.message, /private|local|model\.gguf|scope failure/i);
+      return true;
+    },
+  );
+  assert.equal(fake.buffers[0]?.destroyCount, 1);
+  ledger.assertAllReleased();
+});
+
+test("classifies a pushErrorScope failure as error_scope", async () => {
+  const fake = fakeDevice();
+  const push = fake.device.pushErrorScope.bind(fake.device);
+  const device = {
+    ...fake.device,
+    pushErrorScope(filter: "validation" | "out-of-memory"): void {
+      if (filter === "out-of-memory") {
+        throw new Error("private push scope failure local-path:<path>/<model-id>.gguf");
+      }
+      push(filter);
+    },
+  };
+  const ledger = new AllocationLedger(64n);
+  const arena = new GpuArena(device, ledger, {
+    bufferShardCapBytes: 64n,
+  });
+
+  await assert.rejects(
+    arena.allocate({
+      id: "push-scope-failure",
+      category: "scratch",
+      byteLength: 16n,
+      usage: 128,
+      alignment: 4,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        (error as Error & { readonly code?: unknown }).code,
+        "error_scope",
+      );
+      assert.doesNotMatch(error.message, /private|local|model\.gguf|push scope/i);
+      return true;
+    },
+  );
+  assert.deepEqual(fake.pushedScopes, ["validation"]);
+  assert.deepEqual(fake.poppedScopes, ["validation"]);
+  ledger.assertAllReleased();
+});
+
+test("classifies simultaneous validation and OOM results without raw text", async () => {
+  const fake = fakeDevice({
+    popResults: [
+      { message: "private OOM text" },
+      { message: "private validation text" },
+    ],
+  });
+  const ledger = new AllocationLedger(64n);
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 64n,
+  });
+
+  await assert.rejects(
+    arena.allocate({
+      id: "ambiguous-failure",
+      category: "scratch",
+      byteLength: 16n,
+      usage: 128,
+      alignment: 4,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        (error as Error & { readonly code?: unknown }).code,
+        "gpu_ambiguous_scopes",
+      );
+      assert.doesNotMatch(error.message, /private|OOM text|validation text/i);
+      return true;
+    },
+  );
+  ledger.assertAllReleased();
+});
+
+test("classifies duplicate arena allocation ownership as allocation_conflict", async () => {
+  const fake = fakeDevice();
+  const ledger = new AllocationLedger(64n);
+  const arena = new GpuArena(fake.device, ledger, {
+    bufferShardCapBytes: 64n,
+  });
+  const first = await arena.allocate({
+    id: "duplicate-allocation",
+    category: "activation",
+    byteLength: 16n,
+    usage: 128,
+    alignment: 4,
+  });
+
+  await assert.rejects(
+    arena.allocate({
+      id: "duplicate-allocation",
+      category: "activation",
+      byteLength: 16n,
+      usage: 128,
+      alignment: 4,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        (error as Error & { readonly code?: unknown }).code,
+        "allocation_conflict",
+      );
+      return true;
+    },
+  );
+
+  first.destroy();
+  ledger.assertAllReleased();
 });
 
 test("keeps overlapping allocations paired with their own device error scopes", async () => {

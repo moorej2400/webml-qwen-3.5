@@ -15,6 +15,7 @@ import type {
   Qwen35TensorWeightView,
   Qwen35WeightDirectoryView,
 } from "./qwen35-weight-directory.js";
+import type { Qwen35StagedPackedRows } from "./qwen35-disk-backed-tied-embedding.js";
 import type {
   Qwen35BufferBinding,
   Qwen35DispatchRequest,
@@ -633,6 +634,112 @@ export function planQwen35PackedEmbeddingDispatch(input: {
   });
 }
 
+/** Plans one exact Q6_K row already staged in the bounded tied-input cache. */
+export function planQwen35StagedPackedEmbeddingDispatch(input: {
+  readonly rows: Qwen35StagedPackedRows;
+  readonly output: Qwen35ForwardBufferSlice;
+  readonly uniform: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): Qwen35ForwardDispatchPlan {
+  const selected = PACKED_EMBEDDING_KERNELS.find(
+    (candidate) => candidate.storageType === "q6-k-212",
+  );
+  const source = EMBEDDING_KERNEL_SOURCES.get("q6-k-212");
+  if (
+    selected === undefined ||
+    source === undefined ||
+    input.rows.tensorName !== "token_embd.weight" ||
+    input.rows.storageType !== "q6-k-212" ||
+    input.rows.rowCount !== 1 ||
+    input.rows.rowBytes !== 2_120 ||
+    input.rows.byteLength !== 2_120 ||
+    !Number.isSafeInteger(input.rows.firstRow) ||
+    input.rows.firstRow < 0 ||
+    input.rows.firstRow >= QWEN35_VOCABULARY_SIZE ||
+    !Number.isSafeInteger(input.rows.bufferOffset) ||
+    input.rows.bufferOffset < 0 ||
+    input.rows.bufferOffset % 4 !== 0 ||
+    !Number.isSafeInteger(input.rows.bufferOffset + input.rows.byteLength)
+  ) {
+    throw diagnosticError(
+      "forward-staged-embedding-invalid",
+      "The staged Qwen3.5 embedding row is invalid",
+    );
+  }
+  let logical: ReturnType<typeof planPackedEmbeddingRow>;
+  try {
+    logical = planPackedEmbeddingRow({
+      ggmlType: selected.ggmlType,
+      storageType: selected.storageType,
+      tokenId: 0,
+      vocabSize: 1,
+      embeddingLength: QWEN35_HIDDEN_SIZE,
+      maxComputeWorkgroupsPerDimension:
+        input.limits.maxComputeWorkgroupsPerDimension,
+    });
+  } catch {
+    throw diagnosticError(
+      "forward-staged-embedding-invalid",
+      "The staged Qwen3.5 embedding row is invalid",
+    );
+  }
+  const alignment = input.limits.minStorageBufferOffsetAlignment;
+  if (!positiveLimit(alignment)) {
+    throw diagnosticError(
+      "forward-binding-invalid",
+      "A packed Qwen3.5 weight range cannot be bound on this device",
+    );
+  }
+  const alignedOffset = Math.floor(input.rows.bufferOffset / alignment) * alignment;
+  const prefixBytes = input.rows.bufferOffset - alignedOffset;
+  // Cache slots are row-aligned, not WebGPU-binding-aligned. Bind the safe
+  // prefix and pass its u32 distance to the existing Q6_K kernel ABI.
+  const stagedView: Qwen35PhysicalRowView = Object.freeze({
+    buffer: input.rows.buffer,
+    firstRow: 0,
+    rowCount: 1,
+    tensorByteOffset: 0,
+    bufferByteOffset: alignedOffset,
+    byteLength: prefixBytes + input.rows.rowBytes,
+  });
+  const packedRange = physicalPackedRangeBinding(
+    selected.abi.bindings.packedTable,
+    stagedView,
+    prefixBytes,
+    input.rows.rowBytes,
+    input.limits,
+  );
+  const outputBinding = binding(
+    selected.abi.bindings.output,
+    "storage",
+    input.output,
+    QWEN35_HIDDEN_SIZE * 4,
+    input.limits,
+  );
+  const uniformBinding = binding(
+    selected.abi.bindings.uniforms,
+    "uniform",
+    input.uniform,
+    selected.abi.uniformWords * 4,
+    input.limits,
+  );
+  requireWritableOutputDisjoint(outputBinding, [
+    packedRange.binding,
+    uniformBinding,
+  ]);
+  return dispatchPlan({
+    kernel: source,
+    bindings: [packedRange.binding, outputBinding, uniformBinding],
+    uniformWords: [
+      packedRange.wordOffset,
+      logical.outputElements,
+      QWEN35_HIDDEN_SIZE / selected.abi.valuesPerBlock,
+      0,
+    ],
+    workgroups: logical.workgroups,
+  });
+}
+
 function gemvKernel(
   tensor: Qwen35TensorWeightView,
 ): { readonly layout: GemvLayout; readonly kernel: LanguageGemvKernel; readonly source: Qwen35KernelSource } {
@@ -904,4 +1011,139 @@ export function planQwen35TiedLogitsDispatches(input: Omit<
     });
   });
   return Object.freeze(plans);
+}
+
+/** Plans one complete logical logits tile from the bounded Q6_K output cache. */
+export function planQwen35StagedTiedLogitsDispatch(input: {
+  readonly tile: Qwen35StagedPackedRows;
+  readonly activation: Qwen35ForwardBufferSlice;
+  readonly output: Qwen35ForwardBufferSlice;
+  readonly uniform: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): Qwen35TiedLogitsDispatchPlan {
+  const selected = LANGUAGE_GEMV_KERNELS.find(
+    (candidate) => candidate.layout === "q6-k-212",
+  );
+  const source = GEMV_KERNEL_SOURCES.get("q6-k-212");
+  const tileIndex = input.tile.firstRow / MAX_LOGITS_TILE_ROWS;
+  const expectedRows = Math.min(
+    MAX_LOGITS_TILE_ROWS,
+    QWEN35_DECODABLE_LOGIT_ROWS - input.tile.firstRow,
+  );
+  if (
+    selected === undefined ||
+    source === undefined ||
+    input.tile.tensorName !== "token_embd.weight" ||
+    input.tile.storageType !== "q6-k-212" ||
+    input.tile.rowBytes !== 2_120 ||
+    !Number.isSafeInteger(input.tile.firstRow) ||
+    input.tile.firstRow < 0 ||
+    input.tile.firstRow >= QWEN35_DECODABLE_LOGIT_ROWS ||
+    input.tile.firstRow % MAX_LOGITS_TILE_ROWS !== 0 ||
+    !Number.isSafeInteger(tileIndex) ||
+    input.tile.rowCount !== expectedRows ||
+    input.tile.byteLength !== input.tile.rowCount * input.tile.rowBytes ||
+    !Number.isSafeInteger(input.tile.bufferOffset) ||
+    input.tile.bufferOffset < 0 ||
+    input.tile.bufferOffset % 4 !== 0 ||
+    !Number.isSafeInteger(input.tile.bufferOffset + input.tile.byteLength)
+  ) {
+    throw diagnosticError(
+      "forward-staged-logits-invalid",
+      "The staged Qwen3.5 logits tile is invalid",
+    );
+  }
+  let logical: ReturnType<typeof planGemvDispatch>;
+  try {
+    logical = planGemvDispatch({
+      layout: selected.layout,
+      ggmlType: selected.ggmlType,
+      localRows: input.tile.rowCount,
+      columns: QWEN35_HIDDEN_SIZE,
+      outputRowOffset: 0,
+      maxWorkgroupsPerDimension:
+        input.limits.maxComputeWorkgroupsPerDimension,
+    });
+  } catch {
+    throw diagnosticError(
+      "forward-staged-logits-invalid",
+      "The staged Qwen3.5 logits tile is invalid",
+    );
+  }
+  const alignment = input.limits.minStorageBufferOffsetAlignment;
+  if (!positiveLimit(alignment)) {
+    throw diagnosticError(
+      "forward-binding-invalid",
+      "A packed Qwen3.5 weight range cannot be bound on this device",
+    );
+  }
+  const alignedOffset = Math.floor(input.tile.bufferOffset / alignment) * alignment;
+  const prefixBytes = input.tile.bufferOffset - alignedOffset;
+  const stagedView: Qwen35PhysicalRowView = Object.freeze({
+    buffer: input.tile.buffer,
+    firstRow: 0,
+    rowCount: input.tile.rowCount,
+    tensorByteOffset: 0,
+    bufferByteOffset: alignedOffset,
+    byteLength: prefixBytes + input.tile.byteLength,
+  });
+  const packedRange = physicalPackedRangeBinding(
+    selected.abi.bindings.packedWeights,
+    stagedView,
+    prefixBytes,
+    input.tile.byteLength,
+    input.limits,
+  );
+  const activationBinding = binding(
+    selected.abi.bindings.activation,
+    "storage",
+    input.activation,
+    QWEN35_HIDDEN_SIZE * 4,
+    input.limits,
+  );
+  const outputBinding = binding(
+    selected.abi.bindings.output,
+    "storage",
+    input.output,
+    input.tile.rowCount * 4,
+    input.limits,
+  );
+  const uniformBinding = binding(
+    selected.abi.bindings.uniforms,
+    "uniform",
+    input.uniform,
+    selected.abi.uniformWords * 4,
+    input.limits,
+  );
+  requireWritableOutputDisjoint(outputBinding, [
+    packedRange.binding,
+    activationBinding,
+    uniformBinding,
+  ]);
+  const base = dispatchPlan({
+    kernel: source,
+    bindings: [
+      packedRange.binding,
+      activationBinding,
+      outputBinding,
+      uniformBinding,
+    ],
+    uniformWords: [
+      logical.uniforms.localRows,
+      logical.uniforms.columns,
+      logical.uniforms.blocksPerRow,
+      packedRange.wordOffset,
+      0,
+    ],
+    workgroups: logical.workgroups,
+  });
+  return Object.freeze({
+    ...base,
+    tileIndex,
+    vocabularyStart: input.tile.firstRow,
+    tileRows: input.tile.rowCount,
+    pieceOutputOffset: 0,
+    pieceRows: input.tile.rowCount,
+    completesTile: true,
+  });
 }

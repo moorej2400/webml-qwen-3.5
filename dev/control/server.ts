@@ -554,9 +554,13 @@ export const createDevelopmentRequestHandler = (
             .replaceAll(">", "\\u003e")
             .replaceAll("&", "\\u0026")};</script>`;
       const injection = `${runtimeConfig}<script src="/.local-agent.js"></script>`;
-      const html = options.html.includes("</body>")
-        ? options.html.replace("</body>", `${injection}</body>`)
-        : `${options.html}${injection}`;
+      const developmentEntry = '<script type="module" src="/assets/dev/browser/app.js"></script>';
+      const publicEntry = '<script type="module" src="/assets/public/chat-app.js"></script>';
+      const html = options.html.includes(publicEntry)
+        ? options.html.replace(publicEntry, `${injection}${developmentEntry}`)
+        : options.html.includes("</body>")
+          ? options.html.replace("</body>", `${injection}${developmentEntry}</body>`)
+          : `${options.html}${injection}${developmentEntry}`;
       response.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",

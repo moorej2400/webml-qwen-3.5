@@ -68,8 +68,9 @@ export class AllocationLedger {
     }
     const nextBytes = this.#currentBytes + reservation.bytes;
     if (nextBytes > this.#limitBytes) {
-      throw new Error(
-        `Allocation would exceed ledger limit of ${this.#limitBytes} bytes`,
+      throw diagnosticError(
+        "ALLOCATION_LIMIT_EXCEEDED",
+        "Allocation would exceed ledger limit",
       );
     }
 

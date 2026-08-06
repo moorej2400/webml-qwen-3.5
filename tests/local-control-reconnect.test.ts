@@ -65,6 +65,126 @@ test("terminal state completed while disconnected is reconciled without rerunnin
   assert.equal((delivered.at(-1) as { state: string }).state, "completed");
 });
 
+test("server terminal wins a reconcile conflict without replaying or rerunning prompt", async () => {
+  const delivered: unknown[] = [];
+  let generations = 0;
+  const agent = new PhoneAgentRuntime({
+    identity: phoneIdentity,
+    platform: {
+      send(message) {
+        delivered.push(message);
+      },
+      reload() {},
+      setTimer() {
+        return 1;
+      },
+      clearTimer() {},
+    },
+    handlers: {
+      runPrompt() {
+        generations += 1;
+      },
+    },
+  });
+  const command = {
+    schemaVersion: 1 as const,
+    type: "command" as const,
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt" as const,
+  };
+  await agent.receive(command);
+  assert.equal(generations, 1);
+  assert.equal((delivered.at(-1) as { readonly state?: string }).state, "completed");
+  await agent.receive({
+    schemaVersion: 1,
+    type: "eventAck",
+    documentId: phoneIdentity.documentId,
+    status: "accepted",
+    acknowledgedSeq: 3,
+    expectedSeq: 4,
+  });
+  const beforeReconcile = delivered.length;
+  const reconcile = {
+    schemaVersion: 1 as const,
+    type: "reconcile" as const,
+    commands: [{
+      commandId: command.commandId,
+      command: command.command,
+      state: "timed_out" as const,
+      issuedAtMs: 1,
+      startedAtMs: 2,
+      terminalAtMs: 3,
+      reason: "command_timeout",
+    }],
+  };
+
+  await agent.receive(reconcile);
+  await agent.receive(reconcile);
+  assert.equal(delivered.length, beforeReconcile);
+  await agent.receive(command);
+  assert.equal(generations, 1);
+  assert.equal((delivered.at(-1) as { readonly state?: string }).state, "timed_out");
+});
+
+test("server terminal settles an in-flight PhoneAgentRuntime handler", async () => {
+  const delivered: unknown[] = [];
+  let generations = 0;
+  let finishPrompt!: () => void;
+  const pendingPrompt = new Promise<void>((resolve) => {
+    finishPrompt = resolve;
+  });
+  const agent = new PhoneAgentRuntime({
+    identity: phoneIdentity,
+    platform: {
+      send(message) {
+        delivered.push(message);
+      },
+      reload() {},
+      setTimer() {
+        return 1;
+      },
+      clearTimer() {},
+    },
+    handlers: {
+      runPrompt() {
+        generations += 1;
+        return pendingPrompt;
+      },
+    },
+  });
+  const command = {
+    schemaVersion: 1 as const,
+    type: "command" as const,
+    commandId: "command_0123456789abcdef",
+    command: "runPrompt" as const,
+  };
+  const running = agent.receive(command);
+  await Promise.resolve();
+  assert.equal(generations, 1);
+  const beforeReconcile = delivered.length;
+
+  await agent.receive({
+    schemaVersion: 1,
+    type: "reconcile",
+    commands: [{
+      commandId: command.commandId,
+      command: command.command,
+      state: "timed_out",
+      issuedAtMs: 1,
+      terminalAtMs: 2,
+      reason: "command_timeout",
+    }],
+  });
+  assert.equal(delivered.length, beforeReconcile);
+
+  finishPrompt();
+  await running;
+  assert.equal(delivered.length, beforeReconcile);
+  await agent.receive(command);
+  assert.equal(generations, 1);
+  assert.equal((delivered.at(-1) as { readonly state?: string }).state, "timed_out");
+});
+
 test("sequence sync prunes an accepted frame whose acknowledgement was lost", async () => {
   const delivered: unknown[] = [];
   const agent = new PhoneAgentRuntime({

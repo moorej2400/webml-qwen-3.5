@@ -533,6 +533,419 @@ test("ordinary command timeout is timed_out", () => {
   assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "timed_out");
 });
 
+test("runPrompt uses its longer execution lease after it starts", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({
+    clock,
+    commandTimeoutMs: 500,
+    promptTimeoutMs: 2_000,
+  });
+  const currentIdentity = identity("document_0123456789abcdef");
+  const phone = connect(plane, currentIdentity);
+  const commandId = "command_prompt_0123456789";
+  plane.issueCommand({
+    deviceId: currentIdentity.deviceId,
+    tabId: currentIdentity.tabId,
+    commandId,
+    command: "runPrompt",
+  });
+  plane.receive(phone.connectionId, {
+    schemaVersion: 1,
+    type: "commandState",
+    ...currentIdentity,
+    eventSeq: 1,
+    commandId,
+    state: "accepted",
+  });
+  plane.receive(phone.connectionId, {
+    schemaVersion: 1,
+    type: "commandState",
+    ...currentIdentity,
+    eventSeq: 2,
+    commandId,
+    state: "started",
+  });
+
+  clock.advance(1_999);
+  assert.equal(plane.getCommand(commandId)?.state, "started");
+  clock.advance(1);
+  assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+});
+
+test("healthy load progress refreshes the 120 second inactivity deadline for 414989 ms", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, commandTimeoutMs: 120_000 });
+  const currentIdentity = identity("document_0123456789abcdef");
+  const phone = connect(plane, currentIdentity);
+  const commandId = "command_load_0123456789";
+  plane.issueCommand({
+    deviceId: currentIdentity.deviceId,
+    tabId: currentIdentity.tabId,
+    commandId,
+    command: "load",
+  });
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+  ] as const) {
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...currentIdentity,
+      eventSeq,
+      commandId,
+      state,
+    });
+  }
+
+  let eventSeq = 3;
+  let completedBytes = 0;
+  for (const elapsedMs of [119_999, 119_999, 119_999, 54_992]) {
+    clock.advance(elapsedMs);
+    completedBytes += 32 * 1_024 * 1_024;
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "telemetry",
+      ...currentIdentity,
+      eventSeq,
+      event: {
+        category: "phase",
+        name: "load_started",
+        timestampMs: clock.now(),
+        metrics: {
+          phase: "weights_upload",
+          completedBytes,
+          totalBytes: 2_816_000_000,
+        },
+      },
+    });
+    eventSeq += 1;
+    assert.equal(plane.getCommand(commandId)?.state, "started");
+  }
+
+  assert.equal(clock.nowMs - 1_000, 414_989);
+  plane.receive(phone.connectionId, {
+    schemaVersion: 1,
+    type: "commandState",
+    ...currentIdentity,
+    eventSeq,
+    commandId,
+    state: "completed",
+  });
+  assert.equal(plane.getCommand(commandId)?.state, "completed");
+});
+
+test("load started near the delivery deadline receives a fresh inactivity lease", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, commandTimeoutMs: 120_000 });
+  const currentIdentity = identity("document_0123456789abcdef");
+  const phone = connect(plane, currentIdentity);
+  const commandId = "command_load_0123456789";
+  plane.issueCommand({
+    deviceId: currentIdentity.deviceId,
+    tabId: currentIdentity.tabId,
+    commandId,
+    command: "load",
+  });
+
+  clock.advance(119_999);
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+  ] as const) {
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...currentIdentity,
+      eventSeq,
+      commandId,
+      state,
+    });
+  }
+  clock.advance(119_999);
+  assert.equal(plane.getCommand(commandId)?.state, "started");
+  clock.advance(1);
+  assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+});
+
+for (const lateState of ["completed", "failed"] as const) {
+  test(`late phone terminal ${lateState} acknowledges a server timed_out command without regression`, () => {
+    const clock = new FakeClock();
+    const plane = new ControlPlane({
+      clock,
+      commandTimeoutMs: 10,
+      retentionMs: 1_000,
+    });
+    const currentIdentity = identity("document_0123456789abcdef");
+    const phone = connect(plane, currentIdentity);
+    const commandId = "command_load_0123456789";
+    plane.issueCommand({
+      deviceId: currentIdentity.deviceId,
+      tabId: currentIdentity.tabId,
+      commandId,
+      command: "load",
+    });
+    for (const [eventSeq, state] of [
+      [1, "accepted"],
+      [2, "started"],
+    ] as const) {
+      plane.receive(phone.connectionId, {
+        schemaVersion: 1,
+        type: "commandState",
+        ...currentIdentity,
+        eventSeq,
+        commandId,
+        state,
+      });
+    }
+    clock.advance(11);
+    assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+
+    const terminalMessage = {
+      schemaVersion: 1 as const,
+      type: "commandState" as const,
+      ...currentIdentity,
+      eventSeq: 3,
+      commandId,
+      state: lateState,
+      ...(lateState === "failed" ? { reason: "gpu_out_of_memory" } : {}),
+    };
+    assert.deepEqual(plane.receive(phone.connectionId, terminalMessage), {
+      accepted: true,
+      expected: 3,
+    });
+    assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+    assert.deepEqual(phone.sent.at(-1), {
+      schemaVersion: 1,
+      type: "eventAck",
+      documentId: currentIdentity.documentId,
+      status: "accepted",
+      acknowledgedSeq: 3,
+      expectedSeq: 4,
+    });
+    assert.deepEqual(plane.receive(phone.connectionId, terminalMessage), {
+      accepted: false,
+      classification: "replay",
+      expected: 4,
+    });
+    assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+  });
+}
+
+test("timed-out command rejects a terminal from a replacement document", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({
+    clock,
+    commandTimeoutMs: 5,
+    retentionMs: 1_000,
+  });
+  const originalIdentity = identity("document_0123456789abcdef");
+  connect(plane, originalIdentity);
+  const commandId = "command_load_0123456789";
+  plane.issueCommand({
+    deviceId: originalIdentity.deviceId,
+    tabId: originalIdentity.tabId,
+    commandId,
+    command: "load",
+  });
+  clock.advance(6);
+  assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+
+  const replacementIdentity = identity("document_1123456789abcdef");
+  const replacement = connect(plane, replacementIdentity);
+  assert.throws(
+    () => plane.receive(replacement.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...replacementIdentity,
+      eventSeq: 1,
+      commandId,
+      state: "completed",
+    }),
+    /document mismatch/i,
+  );
+  assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+});
+
+test("server timeout drains a late originating lifecycle without state regression", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({
+    clock,
+    commandTimeoutMs: 5,
+    retentionMs: 1_000,
+  });
+  const currentIdentity = identity("document_0123456789abcdef");
+  const phone = connect(plane, currentIdentity);
+  const commandId = "command_prompt_0123456789";
+  plane.issueCommand({
+    deviceId: currentIdentity.deviceId,
+    tabId: currentIdentity.tabId,
+    commandId,
+    command: "runPrompt",
+  });
+  clock.advance(6);
+  assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+    [3, "completed"],
+  ] as const) {
+    assert.deepEqual(
+      plane.receive(phone.connectionId, {
+        schemaVersion: 1,
+        type: "commandState",
+        ...currentIdentity,
+        eventSeq,
+        commandId,
+        state,
+      }),
+      { accepted: true, expected: eventSeq },
+    );
+    assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+    assert.deepEqual(phone.sent.at(-1), {
+      schemaVersion: 1,
+      type: "eventAck",
+      documentId: currentIdentity.documentId,
+      status: "accepted",
+      acknowledgedSeq: eventSeq,
+      expectedSeq: eventSeq + 1,
+    });
+  }
+});
+
+test("late terminal for a pruned command is acknowledged without rehydrating or looping", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({
+    clock,
+    commandTimeoutMs: 5,
+    retentionMs: 10,
+  });
+  const currentIdentity = identity("document_0123456789abcdef");
+  const phone = connect(plane, currentIdentity);
+  const commandId = "command_load_0123456789";
+  plane.issueCommand({
+    deviceId: currentIdentity.deviceId,
+    tabId: currentIdentity.tabId,
+    commandId,
+    command: "load",
+  });
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+  ] as const) {
+    plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...currentIdentity,
+      eventSeq,
+      commandId,
+      state,
+    });
+  }
+  clock.advance(6);
+  assert.equal(plane.getCommand(commandId)?.state, "timed_out");
+  clock.advance(11);
+  assert.equal(plane.getCommand(commandId), undefined);
+
+  const lateTerminal = {
+    schemaVersion: 1 as const,
+    type: "commandState" as const,
+    ...currentIdentity,
+    eventSeq: 3,
+    commandId,
+    state: "completed" as const,
+  };
+  assert.deepEqual(plane.receive(phone.connectionId, lateTerminal), {
+    accepted: true,
+    expected: 3,
+  });
+  assert.equal(plane.getCommand(commandId), undefined);
+  assert.deepEqual(phone.sent.at(-1), {
+    schemaVersion: 1,
+    type: "eventAck",
+    documentId: currentIdentity.documentId,
+    status: "accepted",
+    acknowledgedSeq: 3,
+    expectedSeq: 4,
+  });
+  assert.deepEqual(plane.receive(phone.connectionId, lateTerminal), {
+    accepted: false,
+    classification: "replay",
+    expected: 4,
+  });
+
+  const replacement = connect(plane, currentIdentity);
+  const reconcile = replacement.sent.find((message) => message.type === "reconcile");
+  assert.ok(reconcile && reconcile.type === "reconcile");
+  assert.deepEqual(reconcile.commands, []);
+});
+
+test("pruned command tombstone accepts only its originating phone document", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({
+    clock,
+    commandTimeoutMs: 5,
+    retentionMs: 10,
+  });
+  const originalIdentity = identity("document_0123456789abcdef");
+  const original = connect(plane, originalIdentity);
+  const commandId = "command_load_0123456789";
+  plane.issueCommand({
+    deviceId: originalIdentity.deviceId,
+    tabId: originalIdentity.tabId,
+    commandId,
+    command: "load",
+  });
+  clock.advance(6);
+  clock.advance(11);
+  assert.equal(plane.getCommand(commandId), undefined);
+
+  const replacementIdentity = identity("document_1123456789abcdef");
+  const replacement = connect(plane, replacementIdentity);
+  assert.throws(
+    () => plane.receive(replacement.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...replacementIdentity,
+      eventSeq: 1,
+      commandId,
+      state: "completed",
+    }),
+    /document mismatch/i,
+  );
+  assert.deepEqual(
+    plane.receive(original.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...originalIdentity,
+      eventSeq: 1,
+      commandId,
+      state: "completed",
+    }),
+    { accepted: true, expected: 1 },
+  );
+  assert.equal(plane.getCommand(commandId), undefined);
+});
+
+test("unknown nonterminal command state remains a protocol error", () => {
+  const plane = new ControlPlane({ clock: new FakeClock() });
+  const currentIdentity = identity("document_0123456789abcdef");
+  const phone = connect(plane, currentIdentity);
+
+  assert.throws(
+    () => plane.receive(phone.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...currentIdentity,
+      eventSeq: 1,
+      commandId: "command_unknown_01234567",
+      state: "started",
+    }),
+    /unknown commandId/i,
+  );
+});
+
 test("disconnect classifier does not claim a crash without device evidence", () => {
   assert.equal(classifyDisconnect({ kind: "socket_loss" }).classification, "socket_loss");
   assert.equal(

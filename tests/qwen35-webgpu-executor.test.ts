@@ -222,6 +222,28 @@ test("shares pipeline and bind-group caches across identical cloned kernels", as
   assert.equal(events.filter((event) => event === "submit").length, 2);
 });
 
+test("releases transient bind groups without recompiling pipelines", async () => {
+  const { device, events } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const buffer = { destroy() {} };
+  const request = {
+    kernel: {
+      id: "qwen35-transient-kernel",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [{ binding: 0, kind: "storage" as const, buffer, offset: 0, size: 16 }],
+    workgroups: { x: 1, y: 1, z: 1 },
+  };
+
+  await executor.dispatch(request);
+  executor.releaseBindGroups();
+  await executor.dispatch(request);
+
+  assert.equal(events.filter((event) => event === "pipeline").length, 1);
+  assert.equal(events.filter((event) => event === "bind:1").length, 2);
+});
+
 test("bounds the fixed-program kernel cache at exactly 39 lifetime entries", async () => {
   const { device, events } = fakeDevice();
   const executor = new Qwen35WebGpuExecutor(device);
