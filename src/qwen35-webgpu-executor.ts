@@ -10,6 +10,10 @@ const GPU_MAP_MODE_READ = 0x0001;
 // resident execution uses two reduction kernels, while disk-backed execution
 // replaces them with one staged reduction kernel. Vision adds its fixed set.
 const QWEN35_FIXED_ABI_KERNEL_CAPACITY = 39;
+// Full-attention page bindings are keyed by page and prefill workspace. Keep
+// the cache useful for the common path without retaining every context page
+// for the lifetime of a long prompt.
+const QWEN35_BIND_GROUP_CACHE_CAPACITY = 4_096;
 
 /** Opaque buffer identity accepted for binding without transferring ownership. */
 export type Qwen35WebGpuBuffer = object;
@@ -56,12 +60,15 @@ export interface Qwen35CommandEncoder {
 }
 
 export interface Qwen35WebGpuDevice {
+  readonly features?: Iterable<string>;
   readonly limits: {
     readonly minStorageBufferOffsetAlignment: number;
     readonly minUniformBufferOffsetAlignment: number;
     readonly maxStorageBufferBindingSize: number;
     readonly maxUniformBufferBindingSize: number;
     readonly maxComputeWorkgroupsPerDimension: number;
+    readonly minSubgroupSize?: number;
+    readonly maxSubgroupSize?: number;
   };
   readonly queue: {
     writeBuffer(
@@ -144,6 +151,11 @@ interface Qwen35KernelSnapshot {
   readonly entryPoint: string;
 }
 
+interface Qwen35ReadbackSlot {
+  readonly buffer: Qwen35OwnedWebGpuBuffer;
+  busy: boolean;
+}
+
 function requirePositiveInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
 }
@@ -205,12 +217,16 @@ export class Qwen35WebGpuExecutor {
   readonly #device: Qwen35WebGpuDevice;
   readonly #performanceCounters: Qwen35PerformanceCounters | undefined;
   readonly #pipelines = new Map<number, Promise<Qwen35ComputePipeline>>();
-  readonly #bindGroups = new Map<string, unknown>();
+  readonly #bindGroups = new Map<string, {
+    readonly group: unknown;
+    readonly buffers: readonly object[];
+  }>();
   readonly #bufferIds = new WeakMap<object, number>();
   readonly #kernelSnapshots = new WeakMap<object, Qwen35KernelSnapshot>();
   readonly #kernelContentIdentities = new Map<string, number>();
   readonly #uniforms = new WeakSet<object>();
   readonly #ownedBuffers = new Set<Qwen35OwnedWebGpuBuffer>();
+  readonly #readbackSlots: Qwen35ReadbackSlot[] = [];
   readonly #operations = new Set<Promise<unknown>>();
   #nextBufferId = 1;
   #nextKernelContentIdentity = 1;
@@ -305,15 +321,51 @@ export class Qwen35WebGpuExecutor {
 
   /** Encodes one model step without paying one queue submission per kernel. */
   dispatchBatch(requests: readonly Qwen35DispatchRequest[]): Promise<void> {
-    return this.#track(this.#dispatchBatch(requests));
+    return this.#track(this.#dispatchBatch(requests, null).then(() => undefined));
   }
 
-  async #dispatchBatch(requests: readonly Qwen35DispatchRequest[]): Promise<void> {
+  /** Encodes token selection after compute so one submission proves both operations. */
+  dispatchBatchAndReadU32(
+    requests: readonly Qwen35DispatchRequest[],
+    source: Qwen35WebGpuBuffer,
+    byteOffset: number,
+  ): Promise<number> {
+    return this.#track(this.#dispatchBatch(requests, { source, byteOffset }).then(
+      (value) => {
+        if (value === null) {
+          throw diagnosticError(
+            "webgpu-readback-failed",
+            "Qwen3.5 WebGPU readback failed",
+          );
+        }
+        return value;
+      },
+    ));
+  }
+
+  async #dispatchBatch(
+    requests: readonly Qwen35DispatchRequest[],
+    readback: {
+      readonly source: Qwen35WebGpuBuffer;
+      readonly byteOffset: number;
+    } | null,
+  ): Promise<number | null> {
     this.#assertUsable();
     if (requests.length === 0) {
       throw diagnosticError(
         "webgpu-dispatch-invalid",
         "Qwen3.5 WebGPU dispatch is invalid",
+      );
+    }
+    if (
+      readback !== null &&
+      (!Number.isSafeInteger(readback.byteOffset) ||
+        readback.byteOffset < 0 ||
+        readback.byteOffset % 4 !== 0)
+    ) {
+      throw diagnosticError(
+        "webgpu-readback-invalid",
+        "Qwen3.5 WebGPU readback range is invalid",
       );
     }
     for (const request of requests) validateDispatch(request, this.#device.limits);
@@ -330,10 +382,16 @@ export class Qwen35WebGpuExecutor {
         "Qwen3.5 WebGPU dispatch validation failed",
       );
     }
+    let readbackSlot: Qwen35ReadbackSlot | null = null;
+    let readbackBuffer: Qwen35OwnedWebGpuBuffer | null = null;
     try {
       const encoder = this.#device.createCommandEncoder({
         label: "qwen35-model-step",
       });
+      if (readback !== null) {
+        readbackSlot = this.#acquireReadbackSlot();
+        readbackBuffer = readbackSlot.buffer;
+      }
       const pass = encoder.beginComputePass();
       requests.forEach((request, index) => {
         const pipeline = pipelines[index];
@@ -353,11 +411,22 @@ export class Qwen35WebGpuExecutor {
         );
       });
       pass.end();
+      if (readback !== null && readbackBuffer !== null) {
+        encoder.copyBufferToBuffer(
+          readback.source,
+          readback.byteOffset,
+          readbackBuffer,
+          0,
+          4,
+        );
+      }
       this.#device.queue.submit([encoder.finish()]);
       this.#performanceCounters?.recordDispatch(requests.length);
       this.#performanceCounters?.recordQueueSubmission();
+      if (readback !== null) this.#performanceCounters?.recordGpuReadback();
     } catch {
       await this.#retireFailedScope();
+      this.#discardReadbackSlot(readbackSlot);
       throw diagnosticError(
         "webgpu-dispatch-validation-failed",
         "Qwen3.5 WebGPU dispatch validation failed",
@@ -368,6 +437,7 @@ export class Qwen35WebGpuExecutor {
       validationError = await this.#device.popErrorScope();
     } catch {
       this.#poisoned = true;
+      this.#discardReadbackSlot(readbackSlot);
       throw diagnosticError(
         "webgpu-dispatch-validation-failed",
         "Qwen3.5 WebGPU dispatch validation failed",
@@ -375,15 +445,54 @@ export class Qwen35WebGpuExecutor {
     }
     if (validationError !== null) {
       this.#poisoned = true;
+      this.#discardReadbackSlot(readbackSlot);
       throw diagnosticError(
         "webgpu-dispatch-validation-failed",
         "Qwen3.5 WebGPU dispatch validation failed",
       );
     }
+    if (readbackBuffer === null || readbackSlot === null) return null;
+    let value: number;
+    try {
+      if (
+        readbackBuffer.mapAsync === undefined ||
+        readbackBuffer.getMappedRange === undefined ||
+        readbackBuffer.unmap === undefined
+      ) {
+        throw new Error("readback methods unavailable");
+      }
+      await readbackBuffer.mapAsync(GPU_MAP_MODE_READ);
+      const mapped = readbackBuffer.getMappedRange();
+      if (mapped.byteLength < 4) throw new Error("readback range is short");
+      value = new DataView(mapped).getUint32(0, true);
+      readbackBuffer.unmap();
+    } catch {
+      this.#poisoned = true;
+      this.#discardReadbackSlot(readbackSlot);
+      throw diagnosticError(
+        "webgpu-readback-failed",
+        "Qwen3.5 WebGPU readback failed",
+      );
+    }
+    this.#releaseReadbackSlot(readbackSlot);
+    // A successful map proves this submission and all earlier queue work have
+    // completed, so no separate submittedWorkDone call is needed.
+    this.#performanceCounters?.recordQueueRetirement();
+    return value;
   }
 
   async submittedWorkDone(): Promise<void> {
-    await this.#device.queue.onSubmittedWorkDone();
+    try {
+      await this.#device.queue.onSubmittedWorkDone();
+    } catch {
+      // A failed fence leaves queue ownership uncertain. Reuse would let a
+      // later dispatch observe work whose lifetime was never proven complete.
+      this.#poisoned = true;
+      throw diagnosticError(
+        "webgpu-queue-retirement-failed",
+        "Qwen3.5 WebGPU queue retirement failed",
+      );
+    }
     this.#performanceCounters?.recordQueueRetirement();
   }
 
@@ -391,6 +500,18 @@ export class Qwen35WebGpuExecutor {
   releaseBindGroups(): void {
     this.#assertUsable();
     this.#bindGroups.clear();
+  }
+
+  /** Releases only groups that can retain caller-owned transient weight buffers. */
+  releaseBindGroupsForBuffers(buffers: readonly object[]): void {
+    this.#assertUsable();
+    const released = new Set(buffers);
+    if (released.size === 0) return;
+    for (const [key, entry] of this.#bindGroups) {
+      if (entry.buffers.some((buffer) => released.has(buffer))) {
+        this.#bindGroups.delete(key);
+      }
+    }
   }
 
   /** Reads only the GPU-selected token or count, never a vocabulary score tile. */
@@ -492,7 +613,13 @@ export class Qwen35WebGpuExecutor {
     ].join(":"));
     const key = `${this.#kernelSnapshot(request.kernel).contentIdentity}\u0000${bindings.join("|")}`;
     const cached = this.#bindGroups.get(key);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      // Refresh the entry so eviction is least-recently-used rather than
+      // dependent on planner order.
+      this.#bindGroups.delete(key);
+      this.#bindGroups.set(key, cached);
+      return cached.group;
+    }
     const bindGroup = this.#device.createBindGroup({
       label: `${request.kernel.id}-bindings`,
       layout: pipeline.getBindGroupLayout(0),
@@ -505,7 +632,14 @@ export class Qwen35WebGpuExecutor {
         },
       })),
     });
-    this.#bindGroups.set(key, bindGroup);
+    if (this.#bindGroups.size >= QWEN35_BIND_GROUP_CACHE_CAPACITY) {
+      const oldest = this.#bindGroups.keys().next().value;
+      if (typeof oldest === "string") this.#bindGroups.delete(oldest);
+    }
+    this.#bindGroups.set(key, Object.freeze({
+      group: bindGroup,
+      buffers: Object.freeze(request.bindings.map((binding) => binding.buffer as object)),
+    }));
     return bindGroup;
   }
 
@@ -565,6 +699,7 @@ export class Qwen35WebGpuExecutor {
         "Qwen3.5 WebGPU readback range is invalid",
       );
     }
+    let readbackSlot: Qwen35ReadbackSlot | null = null;
     let readback: Qwen35OwnedWebGpuBuffer | null = null;
     try {
       this.#device.pushErrorScope("validation");
@@ -576,12 +711,8 @@ export class Qwen35WebGpuExecutor {
       );
     }
     try {
-      readback = this.#device.createBuffer({
-        label: "qwen35-selected-u32",
-        size: 4,
-        usage: GPU_BUFFER_USAGE_MAP_READ | GPU_BUFFER_USAGE_COPY_DST,
-      });
-      this.#ownedBuffers.add(readback);
+      readbackSlot = this.#acquireReadbackSlot();
+      readback = readbackSlot.buffer;
       const encoder = this.#device.createCommandEncoder({
         label: "qwen35-selected-u32-copy",
       });
@@ -591,7 +722,7 @@ export class Qwen35WebGpuExecutor {
       this.#performanceCounters?.recordQueueSubmission();
     } catch {
       await this.#retireFailedScope();
-      this.#releaseOwnedBuffer(readback);
+      this.#discardReadbackSlot(readbackSlot);
       throw diagnosticError(
         "webgpu-readback-failed",
         "Qwen3.5 WebGPU readback failed",
@@ -602,7 +733,7 @@ export class Qwen35WebGpuExecutor {
       validationError = await this.#device.popErrorScope();
     } catch {
       this.#poisoned = true;
-      this.#releaseOwnedBuffer(readback);
+      this.#discardReadbackSlot(readbackSlot);
       throw diagnosticError(
         "webgpu-readback-failed",
         "Qwen3.5 WebGPU readback failed",
@@ -610,7 +741,14 @@ export class Qwen35WebGpuExecutor {
     }
     if (validationError !== null) {
       this.#poisoned = true;
-      this.#releaseOwnedBuffer(readback);
+      this.#discardReadbackSlot(readbackSlot);
+      throw diagnosticError(
+        "webgpu-readback-failed",
+        "Qwen3.5 WebGPU readback failed",
+      );
+    }
+    if (readback === null || readbackSlot === null) {
+      this.#poisoned = true;
       throw diagnosticError(
         "webgpu-readback-failed",
         "Qwen3.5 WebGPU readback failed",
@@ -632,19 +770,43 @@ export class Qwen35WebGpuExecutor {
       readback.unmap();
     } catch {
       this.#poisoned = true;
-      this.#releaseOwnedBuffer(readback);
+      this.#discardReadbackSlot(readbackSlot);
       throw diagnosticError(
         "webgpu-readback-failed",
         "Qwen3.5 WebGPU readback failed",
       );
     }
-    if (!this.#releaseOwnedBuffer(readback)) {
-      throw diagnosticError(
-        "webgpu-readback-cleanup-failed",
-        "Qwen3.5 WebGPU readback cleanup failed",
-      );
-    }
+    this.#releaseReadbackSlot(readbackSlot);
     return value;
+  }
+
+  #acquireReadbackSlot(): Qwen35ReadbackSlot {
+    const reusable = this.#readbackSlots.find((slot) => !slot.busy);
+    if (reusable !== undefined) {
+      reusable.busy = true;
+      return reusable;
+    }
+    const buffer = this.#device.createBuffer({
+      label: "qwen35-selected-u32",
+      size: 4,
+      usage: GPU_BUFFER_USAGE_MAP_READ | GPU_BUFFER_USAGE_COPY_DST,
+    });
+    this.#ownedBuffers.add(buffer);
+    const created: Qwen35ReadbackSlot = { buffer, busy: true };
+    this.#readbackSlots.push(created);
+    return created;
+  }
+
+  /** A mapped readback proves its queue work is complete before the slot is reused. */
+  #releaseReadbackSlot(slot: Qwen35ReadbackSlot): void {
+    slot.busy = false;
+  }
+
+  #discardReadbackSlot(slot: Qwen35ReadbackSlot | null): void {
+    if (slot === null) return;
+    const index = this.#readbackSlots.indexOf(slot);
+    if (index >= 0) this.#readbackSlots.splice(index, 1);
+    this.#releaseOwnedBuffer(slot.buffer);
   }
 
   #releaseOwnedBuffer(buffer: Qwen35OwnedWebGpuBuffer | null): boolean {
@@ -680,6 +842,7 @@ export class Qwen35WebGpuExecutor {
       }
     }
     this.#ownedBuffers.clear();
+    this.#readbackSlots.splice(0);
     this.#bindGroups.clear();
     this.#pipelines.clear();
     this.#kernelContentIdentities.clear();
@@ -692,6 +855,13 @@ export class Qwen35WebGpuExecutor {
   }
 
   async #compile(kernel: Qwen35KernelSnapshot): Promise<Qwen35ComputePipeline> {
+    // Kernel IDs are repository-owned labels. Keeping a bounded label in the
+    // diagnostic lets physical-device runs identify the incompatible shader
+    // without exposing browser compiler text or machine-specific details.
+    const compileDiagnosticCode = `webgpu-compile-${kernel.id
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .slice(0, 48)}`.slice(0, 64);
     let module: Qwen35ShaderModule;
     try {
       module = this.#device.createShaderModule({
@@ -700,7 +870,7 @@ export class Qwen35WebGpuExecutor {
       });
     } catch {
       throw diagnosticError(
-        "webgpu-kernel-compile-failed",
+        compileDiagnosticCode,
         "Qwen3.5 WebGPU kernel compilation failed",
       );
     }
@@ -709,13 +879,13 @@ export class Qwen35WebGpuExecutor {
       info = await module.getCompilationInfo();
     } catch {
       throw diagnosticError(
-        "webgpu-kernel-compile-failed",
+        compileDiagnosticCode,
         "Qwen3.5 WebGPU kernel compilation failed",
       );
     }
     if (Array.from(info.messages).some((message) => message.type === "error")) {
       throw diagnosticError(
-        "webgpu-kernel-compile-failed",
+        compileDiagnosticCode,
         "Qwen3.5 WebGPU kernel compilation failed",
       );
     }
@@ -727,7 +897,7 @@ export class Qwen35WebGpuExecutor {
       });
     } catch {
       throw diagnosticError(
-        "webgpu-kernel-compile-failed",
+        compileDiagnosticCode,
         "Qwen3.5 WebGPU kernel compilation failed",
       );
     }

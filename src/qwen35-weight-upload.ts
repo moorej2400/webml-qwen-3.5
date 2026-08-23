@@ -21,7 +21,9 @@ import {
 import {
   createQwen35RollingLayerStore,
   hasQwen35RollingLayerSet,
+  qwen35HybridStreamedLayers,
   qwen35PermanentWeightPackage,
+  QWEN35_ROLLING_LAYER_ORDER,
   type Qwen35RollingLayerStore,
 } from "./qwen35-rolling-layer-weights.js";
 
@@ -37,7 +39,7 @@ export interface Qwen35WeightWriteQueue {
 }
 
 export type Qwen35UploadRetirementPolicy = "window" | "per-write";
-export type Qwen35WeightResidencyPolicy = "rolling" | "resident" | "auto";
+export type Qwen35WeightResidencyPolicy = "rolling" | "resident" | "hybrid" | "auto";
 
 const RETRYABLE_RESIDENT_FAILURES = new Set<string>(
   ALLOCATION_DIAGNOSTIC_CODES,
@@ -460,7 +462,9 @@ async function initializeQwen35WeightExecutionAttempt<T>(input: {
   readonly queue: Qwen35WeightWriteQueue;
   readonly uploadLaneBytes: number;
   readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
-  readonly residencyPolicy: "rolling" | "resident";
+  readonly residencyPolicy: "rolling" | "resident" | "hybrid";
+  /** Required only by the local hybrid-residency experiment. */
+  readonly residentLayerCount?: number;
   readonly signal: AbortSignal;
   readonly onWeightsAllocated?: (completedBytes: number) => void;
   readonly onWeightsUploaded?: (completedBytes: number) => void;
@@ -474,11 +478,21 @@ async function initializeQwen35WeightExecutionAttempt<T>(input: {
   readonly rollingStore?: Qwen35RollingLayerStore;
   readonly driver: T;
 }> {
-  const residentPackage = input.residencyPolicy === "resident"
+  const streamedLayers = input.residencyPolicy === "resident"
+    ? undefined
+    : input.residencyPolicy === "rolling"
+      ? QWEN35_ROLLING_LAYER_ORDER
+      : qwen35HybridStreamedLayers(input.residentLayerCount);
+  const residentPackage = streamedLayers === undefined
     ? input.packageDirectory
-    : qwen35PermanentWeightPackage(input.packageDirectory);
+    : qwen35PermanentWeightPackage(
+        input.packageDirectory,
+        streamedLayers,
+        input.residencyPolicy === "hybrid" ? "resident" : "streamed",
+      );
   const usesRollingLayers =
-    input.residencyPolicy === "rolling" &&
+    streamedLayers !== undefined &&
+    streamedLayers.length > 0 &&
     hasQwen35RollingLayerSet(input.packageDirectory);
   const directory = await allocateQwen35WeightDirectory(
     input.arena,
@@ -516,6 +530,7 @@ async function initializeQwen35WeightExecutionAttempt<T>(input: {
         rangeReader: createQwen35ModelCacheRangeReader(input.storage),
         uploadLaneBytes: input.uploadLaneBytes,
         readChunkBytes: Math.min(input.uploadLaneBytes, 32 * 1024 * 1024),
+        streamedLayers,
       });
     }
     input.signal.throwIfAborted();
@@ -568,6 +583,8 @@ export async function initializeQwen35WeightExecution<T>(input: {
   readonly uploadLaneBytes: number;
   readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
   readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
+  /** Local-only hybrid-residency experiment. */
+  readonly residentLayerCount?: number;
   readonly signal: AbortSignal;
   readonly onWeightsAllocated?: (completedBytes: number) => void;
   readonly onWeightsUploaded?: (completedBytes: number) => void;
@@ -582,7 +599,12 @@ export async function initializeQwen35WeightExecution<T>(input: {
   readonly driver: T;
 }> {
   const policy = input.residencyPolicy ?? "rolling";
-  if (policy !== "rolling" && policy !== "resident" && policy !== "auto") {
+  if (
+    policy !== "rolling" &&
+    policy !== "resident" &&
+    policy !== "hybrid" &&
+    policy !== "auto"
+  ) {
     throw diagnosticError(
       "model-residency-policy-invalid",
       "The Qwen3.5 weight residency policy is invalid",

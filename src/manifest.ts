@@ -5,9 +5,7 @@ import {
 } from "./gguf.js";
 import {
   MTP_EXCLUSION_REASON,
-  WEBGPU_LANGUAGE_TENSOR_LAYOUTS,
   isMtpTensorName,
-  webGpuLanguageTensorLayout,
   type WebGpuTensorStorageType,
 } from "./tensor-policy.js";
 
@@ -106,10 +104,36 @@ const TENSOR_STORAGE_TYPES: ReadonlySet<TensorStorageType> = new Set([
   "f32",
   "q8-0-36",
   "q3-k-112",
+  "q3-k-nibble-148",
+  "q3-k-fused-f32-192",
   "q4-k-144",
+  "q4-k-fused-f32-192",
   "q5-k-176",
+  "q5-k-fused-f32-224",
   "q6-k-212",
+  "q6-k-fused-f32-256",
 ]);
+const WEBGPU_STORAGE_LAYOUTS = new Map<WebGpuTensorStorageType, {
+  readonly ggmlType: GgmlType;
+  readonly blockElements: number;
+  readonly sourceBlockBytes: number;
+  readonly outputBlockBytes: number;
+}>([
+  ["f32", { ggmlType: GgmlType.F32, blockElements: 1, sourceBlockBytes: 4, outputBlockBytes: 4 }],
+  ["q8-0-36", { ggmlType: GgmlType.Q8_0, blockElements: 32, sourceBlockBytes: 34, outputBlockBytes: 36 }],
+  ["q3-k-112", { ggmlType: GgmlType.Q3_K, blockElements: 256, sourceBlockBytes: 110, outputBlockBytes: 112 }],
+  ["q3-k-nibble-148", { ggmlType: GgmlType.Q3_K, blockElements: 256, sourceBlockBytes: 110, outputBlockBytes: 148 }],
+  ["q3-k-fused-f32-192", { ggmlType: GgmlType.Q3_K, blockElements: 256, sourceBlockBytes: 110, outputBlockBytes: 192 }],
+  ["q4-k-144", { ggmlType: GgmlType.Q4_K, blockElements: 256, sourceBlockBytes: 144, outputBlockBytes: 144 }],
+  ["q4-k-fused-f32-192", { ggmlType: GgmlType.Q4_K, blockElements: 256, sourceBlockBytes: 144, outputBlockBytes: 192 }],
+  ["q5-k-176", { ggmlType: GgmlType.Q5_K, blockElements: 256, sourceBlockBytes: 176, outputBlockBytes: 176 }],
+  ["q5-k-fused-f32-224", { ggmlType: GgmlType.Q5_K, blockElements: 256, sourceBlockBytes: 176, outputBlockBytes: 224 }],
+  ["q6-k-212", { ggmlType: GgmlType.Q6_K, blockElements: 256, sourceBlockBytes: 210, outputBlockBytes: 212 }],
+  ["q6-k-fused-f32-256", { ggmlType: GgmlType.Q6_K, blockElements: 256, sourceBlockBytes: 210, outputBlockBytes: 256 }],
+]);
+const WEBGPU_GGML_TYPES = new Set(
+  [...WEBGPU_STORAGE_LAYOUTS.values()].map(({ ggmlType }) => ggmlType),
+);
 
 function requireString(
   value: unknown,
@@ -384,13 +408,11 @@ export function validateModelPackageManifest(
           `tensor ${tensor.name} shardOffset must be u32 aligned`,
         );
       }
-      const policy = webGpuLanguageTensorLayout(
-        tensor.ggmlType as GgmlType,
+      const policy = WEBGPU_STORAGE_LAYOUTS.get(
+        tensor.storageType as WebGpuTensorStorageType,
       );
-      if (policy?.storageType !== tensor.storageType) {
-        const expectedType = WEBGPU_LANGUAGE_TENSOR_LAYOUTS.find(
-          (candidate) => candidate.storageType === tensor.storageType,
-        )?.ggmlType;
+      if (policy?.ggmlType !== tensor.ggmlType) {
+        const expectedType = policy?.ggmlType;
         throw new Error(
           `tensor ${tensor.name} uses ${tensor.storageType} storage without GGML ${
             expectedType === undefined
@@ -425,7 +447,7 @@ export function validateModelPackageManifest(
         (sourceBytes / BigInt(policy.sourceBlockBytes)) * outputBlockBytes;
     } else {
       if (
-        webGpuLanguageTensorLayout(tensor.ggmlType as GgmlType) !== undefined
+        WEBGPU_GGML_TYPES.has(tensor.ggmlType as GgmlType)
       ) {
         throw new Error(
           `tensor ${tensor.name} must use its explicit WebGPU storage layout`,

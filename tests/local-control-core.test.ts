@@ -333,6 +333,44 @@ test("warm reload completes only after a replacement document reports ready", ()
   assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "completed");
 });
 
+test("replacement document immediately terminates a started load from the lost document", () => {
+  const clock = new FakeClock();
+  const plane = new ControlPlane({ clock, commandTimeoutMs: 120_000 });
+  const originalIdentity = identity("document_0123456789abcdef");
+  const original = connect(plane, originalIdentity);
+  const commandId = "command_load_0123456789";
+  plane.issueCommand({
+    deviceId: originalIdentity.deviceId,
+    tabId: originalIdentity.tabId,
+    commandId,
+    command: "load",
+  });
+  for (const [eventSeq, state] of [
+    [1, "accepted"],
+    [2, "started"],
+  ] as const) {
+    plane.receive(original.connectionId, {
+      schemaVersion: 1,
+      type: "commandState",
+      ...originalIdentity,
+      eventSeq,
+      commandId,
+      state,
+    });
+  }
+
+  const replacement = connect(plane, identity("document_1123456789abcdef"));
+
+  const terminal = plane.getCommand(commandId);
+  assert.equal(terminal?.state, "timed_out");
+  assert.equal(terminal?.reason, "origin_document_replaced");
+  const reconcile = replacement.sent.find((message) => message.type === "reconcile");
+  assert.ok(reconcile && reconcile.type === "reconcile");
+  assert.equal(reconcile.commands[0]?.state, "timed_out");
+  assert.equal(reconcile.commands[0]?.reason, "origin_document_replaced");
+  assert.equal(replacement.sent.some((message) => message.type === "command"), false);
+});
+
 test("disconnect before reload start cannot prove replacement completion", () => {
   const plane = new ControlPlane({ clock: new FakeClock(), reloadTimeoutMs: 5_000 });
   const stale = connect(plane, identity("document_0123456789abcdef"));
@@ -411,6 +449,9 @@ test("replacement ready cannot complete reload until the old document disconnect
     eventSeq: 1,
   });
   assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "started");
+
+  plane.disconnect(original.connectionId, { kind: "page_lifecycle", lifecycle: "navigation" });
+  assert.equal(plane.getCommand("command_0123456789abcdef")?.state, "completed");
 });
 
 test("reload timeout is indeterminate when no replacement document can be proven", () => {

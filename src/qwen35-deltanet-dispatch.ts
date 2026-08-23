@@ -19,6 +19,8 @@ import type {
 } from "./qwen35-activation-workspace.js";
 import {
   planQwen35PackedGemvDispatches,
+  planQwen35TwinF32GemvDispatch,
+  planQwen35TwinQ3GemvDispatches,
   type Qwen35ForwardBufferSlice,
   type Qwen35ForwardDeviceLimits,
   type Qwen35ForwardDispatchPlan,
@@ -52,10 +54,12 @@ export type Qwen35DeltaNetLayerStage =
   | "attention-qkv-projection"
   | "deltanet-alpha-projection"
   | "deltanet-beta-projection"
+  | "deltanet-alpha-beta-projection"
   | "deltanet-parameters"
   | "deltanet-conv"
   | "deltanet-recurrent"
   | "deltanet-gated-norm"
+  | "deltanet-recurrent-gated-norm"
   | "deltanet-output-projection"
   | "attention-residual"
   | "post-attention-rms"
@@ -81,14 +85,14 @@ export interface Qwen35DeltaNetLayerDispatchPlan {
    * failure makes that state indeterminate until the owning session disposes it.
    */
   readonly stateSemantics: Readonly<{
-    readonly mutatingStages: readonly ["deltanet-conv", "deltanet-recurrent"];
+    readonly mutatingStages: readonly ["deltanet-conv", "deltanet-recurrent-gated-norm"];
     readonly failureAfterSubmission: "persistent-state-indeterminate-dispose-required";
     readonly advancePositionAfter: "successful-queue-retirement";
   }>;
 }
 
 export interface Qwen35DeltaNetLayerGeometry {
-  readonly fixedUniformCount: 5;
+  readonly fixedUniformCount: 4;
   readonly physicalGemvPieceCount: number;
   readonly uniformCount: number;
 }
@@ -362,6 +366,7 @@ function workspaceSlice(
   workspace: PlanQwen35DeltaNetLayerDispatchInput["workspace"],
   kind: Qwen35ActivationResourceKind,
   requiredBytes: number,
+  scalarType: "f16" | "f32" = "f32",
 ): Qwen35ForwardBufferSlice {
   let view: Qwen35ActivationResourceView | undefined;
   // The workspace callback is caller-owned, so its thrown text cannot cross this boundary.
@@ -373,9 +378,9 @@ function workspaceSlice(
   if (
     view === undefined ||
     view.kind !== kind ||
-    view.scalarType !== "f32" ||
+    view.scalarType !== scalarType ||
     view.bytes !== BigInt(view.byteLength) ||
-    view.elementCount * 4 !== view.byteLength ||
+    view.elementCount * (scalarType === "f16" ? 2 : 4) !== view.byteLength ||
     view.binding.offset !== 0 ||
     view.binding.size !== view.byteLength ||
     view.byteLength < requiredBytes
@@ -477,6 +482,30 @@ function f32Word(value: number): number {
   return new DataView(bytes).getUint32(0, true);
 }
 
+function canFuseTwinQ3(
+  first: Qwen35TensorWeightView,
+  second: Qwen35TensorWeightView,
+): boolean {
+  return first.ggmlType === GgmlType.Q3_K && second.ggmlType === GgmlType.Q3_K &&
+    first.storageType === "q3-k-fused-f32-192" && second.storageType === "q3-k-fused-f32-192" &&
+    first.shape.length === 2 && second.shape.length === 2 &&
+    first.shape[0] === second.shape[0] && first.shape[1] === second.shape[1] &&
+    first.shape[0]! % 512 === 0 && first.rowBytes === second.rowBytes &&
+    first.physicalRows.length === 1 && second.physicalRows.length === 1;
+}
+
+function canFuseTwinF32(
+  first: Qwen35TensorWeightView,
+  second: Qwen35TensorWeightView,
+): boolean {
+  return first.ggmlType === GgmlType.F32 && second.ggmlType === GgmlType.F32 &&
+    first.storageType === "f32" && second.storageType === "f32" &&
+    first.shape.length === 2 && second.shape.length === 2 &&
+    first.shape[0] === second.shape[0] && first.shape[1] === second.shape[1] &&
+    first.shape[0]! % 32 === 0 &&
+    first.physicalRows.length === 1 && second.physicalRows.length === 1;
+}
+
 function deltaNetGeometryData(input: {
   readonly program: Qwen35Program;
   readonly invocation: Extract<Qwen35Invocation, { kind: "gated-deltanet" }>;
@@ -507,13 +536,16 @@ function deltaNetGeometryData(input: {
     ffnUp: requireWeight(input.weights, sequence.ffnUpWeight, [HIDDEN, FFN]),
     ffnDown: requireWeight(input.weights, sequence.ffnDownWeight, [FFN, HIDDEN]),
   });
-  const physicalGemvPieceCount = Object.values(matrixWeights).reduce(
+  const rawPhysicalGemvPieceCount = Object.values(matrixWeights).reduce(
     (count, tensor) => count + tensor.physicalRows.length,
     0,
   );
+  const physicalGemvPieceCount = rawPhysicalGemvPieceCount -
+    (canFuseTwinQ3(matrixWeights.ffnGate, matrixWeights.ffnUp) ? 2 : 0) -
+    (canFuseTwinF32(matrixWeights.alpha, matrixWeights.beta) ? 1 : 0);
   if (
-    !Number.isSafeInteger(physicalGemvPieceCount) ||
-    physicalGemvPieceCount < Object.keys(matrixWeights).length
+    !Number.isSafeInteger(rawPhysicalGemvPieceCount) ||
+    rawPhysicalGemvPieceCount < Object.keys(matrixWeights).length
   ) {
     fail(
       "deltanet-weight-invalid",
@@ -521,9 +553,9 @@ function deltaNetGeometryData(input: {
     );
   }
   const geometry = Object.freeze({
-    fixedUniformCount: 5 as const,
+    fixedUniformCount: 4 as const,
     physicalGemvPieceCount,
-    uniformCount: physicalGemvPieceCount + 5,
+    uniformCount: physicalGemvPieceCount + 4,
   });
   return Object.freeze({ sequence, matrixWeights, geometry });
 }
@@ -594,6 +626,12 @@ export function planQwen35DeltaNetLayerDispatch(
     ffnGate: workspaceSlice(input.workspace, "ffn-gate", FFN * 4),
     ffnUp: workspaceSlice(input.workspace, "ffn-up", FFN * 4),
     ffnProduct: workspaceSlice(input.workspace, "ffn-product", FFN * 4),
+    packedGemvInput: workspaceSlice(
+      input.workspace,
+      "packed-gemv-input-f16",
+      FFN * 2,
+      "f16",
+    ),
   };
   const convState = stateSlice(input.state.conv, CONV_BYTES, input.limits);
   const recurrentState = stateSlice(input.state.recurrent, RECURRENT_BYTES, input.limits);
@@ -656,7 +694,11 @@ export function planQwen35DeltaNetLayerDispatch(
     weightBinding?: Qwen35BufferBinding,
   ): void => {
     const slot = nextUniform(16);
-    const plan = planPrimitiveDispatch({ operation, elementCount });
+    const plan = planPrimitiveDispatch({
+      operation,
+      elementCount,
+      ...(operation === "rms-norm" ? { width: elementCount } : {}),
+    });
     if (plan.workgroups.x > input.limits.maxComputeWorkgroupsPerDimension) {
       fail("deltanet-dispatch-invalid", "A Qwen3.5 primitive exceeds device limits");
     }
@@ -693,11 +735,93 @@ export function planQwen35DeltaNetLayerDispatch(
       weights: input.weights,
       tensorName: tensor.name,
       activation,
+      packedActivation: activations.packedGemvInput,
       output,
       uniforms: slots,
       limits: input.limits,
     });
     commands.push(...plans.map((plan) => gemvCommand(stage, plan)));
+  };
+  const addResidualRms = (): void => {
+    const slot = nextUniform(16);
+    const plan = planPrimitiveDispatch({
+      operation: "residual-rms-norm",
+      elementCount: HIDDEN,
+      width: HIDDEN,
+    });
+    const bindings = [
+      storage(0, activations.normalized, HIDDEN * 4),
+      storage(1, activations.hidden, HIDDEN * 4),
+      Object.freeze({ ...direct.postNorm.binding, binding: 2 }),
+      storage(3, activations.hiddenSecondary, HIDDEN * 4),
+      uniformBinding(4, slot, 16),
+    ];
+    requireOutputDisjoint(bindings[3]!, bindings.slice(0, 3));
+    commands.push(frozenCommand({
+      stage: "post-attention-rms",
+      kernel: primitiveKernel("residual-rms-norm"),
+      bindings,
+      workgroups: plan.workgroups,
+      uniformWords: [HIDDEN, HIDDEN, f32Word(sequence.epsilon), 0],
+    }));
+  };
+  const addTwinFfnGemv = (): boolean => {
+    const eligible = canFuseTwinQ3(matrixWeights.ffnGate, matrixWeights.ffnUp);
+    const gateSlots = matrixWeights.ffnGate.physicalRows.map(() => nextUniform(20));
+    const upSlots = eligible
+      ? []
+      : matrixWeights.ffnUp.physicalRows.map(() => nextUniform(20));
+    const fused = eligible
+      ? planQwen35TwinQ3GemvDispatches({
+          weights: input.weights,
+          firstTensorName: matrixWeights.ffnGate.name,
+          secondTensorName: matrixWeights.ffnUp.name,
+          activation: activations.normalized,
+          packedActivation: activations.packedGemvInput,
+          output: activations.ffnProduct,
+          uniform: gateSlots[0]!,
+          limits: input.limits,
+        })
+      : null;
+    if (eligible && fused === null) {
+      fail("deltanet-dispatch-invalid", "The fused Qwen3.5 FFN projection is unavailable");
+    }
+    if (fused !== null) {
+      commands.push(...fused.map((plan) => gemvCommand(
+        plan.kernel.id.includes("swiglu") ? "swiglu" : "ffn-gate-projection",
+        plan,
+      )));
+      return true;
+    }
+    const gatePlans = planQwen35PackedGemvDispatches({
+      weights: input.weights, tensorName: matrixWeights.ffnGate.name,
+      activation: activations.normalized, packedActivation: activations.packedGemvInput,
+      output: activations.ffnGate, uniforms: gateSlots, limits: input.limits,
+    });
+    const upPlans = planQwen35PackedGemvDispatches({
+      weights: input.weights, tensorName: matrixWeights.ffnUp.name,
+      activation: activations.normalized, packedActivation: activations.packedGemvInput,
+      output: activations.ffnUp, uniforms: upSlots, limits: input.limits,
+    });
+    commands.push(...gatePlans.map((plan) => gemvCommand("ffn-gate-projection", plan)));
+    commands.push(...upPlans.map((plan) => gemvCommand("ffn-up-projection", plan)));
+    return false;
+  };
+  const addAttentionGemvs = (): void => {
+    const gateSlots = matrixWeights.attentionGate.physicalRows.map(() => nextUniform(20));
+    const qkvSlots = matrixWeights.qkv.physicalRows.map(() => nextUniform(20));
+    const gatePlans = planQwen35PackedGemvDispatches({
+      weights: input.weights, tensorName: matrixWeights.attentionGate.name,
+      activation: activations.normalized, packedActivation: activations.packedGemvInput,
+      output: activations.innerPrimary, uniforms: gateSlots, limits: input.limits,
+    });
+    const qkvPlans = planQwen35PackedGemvDispatches({
+      weights: input.weights, tensorName: matrixWeights.qkv.name,
+      activation: activations.normalized, packedActivation: activations.packedGemvInput,
+      output: activations.projectionPrimary, uniforms: qkvSlots, limits: input.limits,
+    });
+    commands.push(...gatePlans.map((plan) => gemvCommand("attention-gate-projection", plan)));
+    commands.push(...qkvPlans.map((plan) => gemvCommand("attention-qkv-projection", plan)));
   };
 
   addPrimitive(
@@ -708,10 +832,27 @@ export function planQwen35DeltaNetLayerDispatch(
     [HIDDEN, HIDDEN, f32Word(sequence.epsilon), 0],
     direct.inputNorm.binding,
   );
-  addGemv("attention-gate-projection", matrixWeights.attentionGate, activations.normalized, activations.innerPrimary);
-  addGemv("attention-qkv-projection", matrixWeights.qkv, activations.normalized, activations.projectionPrimary);
-  addGemv("deltanet-alpha-projection", matrixWeights.alpha, activations.normalized, activations.rawAlpha);
-  addGemv("deltanet-beta-projection", matrixWeights.beta, activations.normalized, activations.rawBeta);
+  addAttentionGemvs();
+  if (canFuseTwinF32(matrixWeights.alpha, matrixWeights.beta)) {
+    const slot = nextUniform(16);
+    const fused = planQwen35TwinF32GemvDispatch({
+      weights: input.weights,
+      firstTensorName: matrixWeights.alpha.name,
+      secondTensorName: matrixWeights.beta.name,
+      activation: activations.normalized,
+      firstOutput: activations.rawAlpha,
+      secondOutput: activations.rawBeta,
+      uniform: slot,
+      limits: input.limits,
+    });
+    if (fused === null) {
+      fail("deltanet-dispatch-invalid", "The fused DeltaNet parameter projection is unavailable");
+    }
+    commands.push(gemvCommand("deltanet-alpha-beta-projection", fused));
+  } else {
+    addGemv("deltanet-alpha-projection", matrixWeights.alpha, activations.normalized, activations.rawAlpha);
+    addGemv("deltanet-beta-projection", matrixWeights.beta, activations.normalized, activations.rawBeta);
+  }
 
   const parameterPlan = planQwen35HybridDispatch({
     operation: "deltanet-parameters",
@@ -754,7 +895,7 @@ export function planQwen35DeltaNetLayerDispatch(
   }));
 
   const recurrentPlan = planQwen35HybridDispatch({
-    operation: "deltanet-recurrent",
+    operation: "deltanet-recurrent-gated-norm",
     maxComputeWorkgroupsPerDimension: input.limits.maxComputeWorkgroupsPerDimension,
   });
   const recurrentBindings = [
@@ -762,60 +903,31 @@ export function planQwen35DeltaNetLayerDispatch(
     storage(1, activations.betaOutput, PARAMETER_BYTES),
     storage(2, activations.decay, PARAMETER_BYTES),
     storage(3, recurrentState, RECURRENT_BYTES),
-    storage(4, activations.innerSecondary, INNER * 4),
+    storage(4, activations.innerPrimary, INNER * 4),
+    Object.freeze({ ...direct.norm.binding, binding: 5 }),
+    storage(6, activations.projectionPrimary, INNER * 4),
   ];
-  requireOutputDisjoint(recurrentBindings[4]!, recurrentBindings.slice(0, 4));
+  requireOutputDisjoint(recurrentBindings[6]!, recurrentBindings.slice(0, 6));
   commands.push(frozenCommand({
-    stage: "deltanet-recurrent",
-    kernel: hybridKernel("deltanet-recurrent"),
+    stage: "deltanet-recurrent-gated-norm",
+    kernel: hybridKernel("deltanet-recurrent-gated-norm"),
     bindings: recurrentBindings,
     workgroups: recurrentPlan.workgroups,
     mutatesPersistentState: true,
   }));
 
-  const gatedPlan = planQwen35HybridDispatch({
-    operation: "deltanet-gated-norm",
-    maxComputeWorkgroupsPerDimension: input.limits.maxComputeWorkgroupsPerDimension,
-  });
-  const gatedBindings = [
-    storage(0, activations.innerSecondary, INNER * 4),
-    storage(1, activations.innerPrimary, INNER * 4),
-    Object.freeze({ ...direct.norm.binding, binding: 2 }),
-    storage(3, activations.projectionPrimary, INNER * 4),
-  ];
-  requireOutputDisjoint(gatedBindings[3]!, gatedBindings.slice(0, 3));
-  commands.push(frozenCommand({
-    stage: "deltanet-gated-norm",
-    kernel: hybridKernel("deltanet-gated-norm"),
-    bindings: gatedBindings,
-    workgroups: gatedPlan.workgroups,
-  }));
-
   addGemv("deltanet-output-projection", matrixWeights.output, activations.projectionPrimary, activations.normalized);
-  addPrimitive(
-    "attention-residual",
-    "residual-add",
-    [activations.normalized, activations.hidden, activations.hiddenSecondary],
-    HIDDEN,
-    [HIDDEN, 0, 0, 0],
-  );
-  addPrimitive(
-    "post-attention-rms",
-    "rms-norm",
-    [activations.hiddenSecondary, activations.normalized],
-    HIDDEN,
-    [HIDDEN, HIDDEN, f32Word(sequence.epsilon), 0],
-    direct.postNorm.binding,
-  );
-  addGemv("ffn-gate-projection", matrixWeights.ffnGate, activations.normalized, activations.ffnGate);
-  addGemv("ffn-up-projection", matrixWeights.ffnUp, activations.normalized, activations.ffnUp);
-  addPrimitive(
-    "swiglu",
-    "swiglu",
-    [activations.ffnGate, activations.ffnUp, activations.ffnProduct],
-    FFN,
-    [FFN, 0, 0, 0],
-  );
+  addResidualRms();
+  const fusedSwiGlu = addTwinFfnGemv();
+  if (!fusedSwiGlu) {
+    addPrimitive(
+      "swiglu",
+      "swiglu",
+      [activations.ffnGate, activations.ffnUp, activations.ffnProduct],
+      FFN,
+      [FFN, 0, 0, 0],
+    );
+  }
   addGemv("ffn-down-projection", matrixWeights.ffnDown, activations.ffnProduct, activations.normalized);
   addPrimitive(
     "mlp-residual",
@@ -845,7 +957,7 @@ export function planQwen35DeltaNetLayerDispatch(
     stateSemantics: Object.freeze({
       mutatingStages: Object.freeze([
         "deltanet-conv",
-        "deltanet-recurrent",
+        "deltanet-recurrent-gated-norm",
       ] as const),
       failureAfterSubmission: "persistent-state-indeterminate-dispose-required",
       advancePositionAfter: "successful-queue-retirement",

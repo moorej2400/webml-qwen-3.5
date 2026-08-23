@@ -21,6 +21,7 @@ import type {
 } from "./qwen35-activation-workspace.js";
 import {
   planQwen35PackedGemvDispatches,
+  planQwen35TwinQ3GemvDispatches,
   type Qwen35ForwardBufferSlice,
   type Qwen35ForwardDeviceLimits,
   type Qwen35ForwardDispatchPlan,
@@ -43,7 +44,7 @@ const ATTENTION_OUTPUT = 4_096;
 const FFN = 9_216;
 const KV_ROW_BYTES = 2_048;
 const MAX_KV_PAGE_COUNT = 16_384 / QWEN35_HYBRID_STATE_PAGE_TOKENS;
-const NON_ONLINE_FIXED_UNIFORM_COUNT = 6;
+const NON_ONLINE_FIXED_UNIFORM_COUNT = 5;
 
 export type Qwen35FullAttentionLayerStage =
   | "input-rms"
@@ -102,7 +103,7 @@ export interface PlanQwen35FullAttentionLayerGeometryInput {
 export interface Qwen35FullAttentionLayerGeometry {
   readonly layer: number;
   /** Maximum fixed slots; online attention consumes one slot per resident page. */
-  readonly fixedUniformCount: 70;
+  readonly fixedUniformCount: 69;
   readonly physicalGemvPieceCount: number;
   readonly uniformCount: number;
 }
@@ -271,9 +272,14 @@ function requirePhysicalMatrixRows(tensor: Qwen35TensorWeightView): void {
     f32: { values: 1, bytes: 4, ggmlType: GgmlType.F32 },
     "q8-0-36": { values: 32, bytes: 36, ggmlType: GgmlType.Q8_0 },
     "q3-k-112": { values: 256, bytes: 112, ggmlType: GgmlType.Q3_K },
+    "q3-k-nibble-148": { values: 256, bytes: 148, ggmlType: GgmlType.Q3_K },
+    "q3-k-fused-f32-192": { values: 256, bytes: 192, ggmlType: GgmlType.Q3_K },
     "q4-k-144": { values: 256, bytes: 144, ggmlType: GgmlType.Q4_K },
+    "q4-k-fused-f32-192": { values: 256, bytes: 192, ggmlType: GgmlType.Q4_K },
     "q5-k-176": { values: 256, bytes: 176, ggmlType: GgmlType.Q5_K },
+    "q5-k-fused-f32-224": { values: 256, bytes: 224, ggmlType: GgmlType.Q5_K },
     "q6-k-212": { values: 256, bytes: 212, ggmlType: GgmlType.Q6_K },
+    "q6-k-fused-f32-256": { values: 256, bytes: 256, ggmlType: GgmlType.Q6_K },
   }[tensor.storageType];
   const columns = tensor.shape[0];
   const rows = tensor.shape[1];
@@ -356,13 +362,15 @@ function fullAttentionGeometryData(
     keyNorm: requireDirectF32Tensor(input.weights, names.keyNorm, [256]),
     postNorm: requireDirectF32Tensor(input.weights, sequence.postAttentionNormWeight, [HIDDEN]),
   });
-  const physicalGemvPieceCount = Object.values(matrixWeights).reduce(
+  const rawPhysicalGemvPieceCount = Object.values(matrixWeights).reduce(
     (sum, tensor) => sum + tensor.physicalRows.length,
     0,
   );
+  const physicalGemvPieceCount = rawPhysicalGemvPieceCount -
+    (canFuseTwinQ3(matrixWeights.ffnGate, matrixWeights.ffnUp) ? 2 : 0);
   const geometry = Object.freeze({
     layer: input.invocation.layer,
-    fixedUniformCount: (NON_ONLINE_FIXED_UNIFORM_COUNT + MAX_KV_PAGE_COUNT) as 70,
+    fixedUniformCount: (NON_ONLINE_FIXED_UNIFORM_COUNT + MAX_KV_PAGE_COUNT) as 69,
     physicalGemvPieceCount,
     uniformCount:
       physicalGemvPieceCount + NON_ONLINE_FIXED_UNIFORM_COUNT +
@@ -426,6 +434,7 @@ function workspaceSlice(
   workspace: PlanQwen35FullAttentionLayerDispatchInput["workspace"],
   kind: Qwen35ActivationResourceKind,
   requiredBytes: number,
+  scalarType: "f16" | "f32" = "f32",
 ): Qwen35ForwardBufferSlice {
   let view: Qwen35ActivationResourceView | undefined;
   // The workspace callback is caller-owned, so its thrown text cannot cross this boundary.
@@ -435,8 +444,9 @@ function workspaceSlice(
     fail("full-attention-workspace-invalid", "A Qwen3.5 full-attention activation view is invalid");
   }
   if (
-    view === undefined || view.kind !== kind || view.scalarType !== "f32" ||
-    view.bytes !== BigInt(view.byteLength) || view.elementCount * 4 !== view.byteLength ||
+    view === undefined || view.kind !== kind || view.scalarType !== scalarType ||
+    view.bytes !== BigInt(view.byteLength) ||
+    view.elementCount * (scalarType === "f16" ? 2 : 4) !== view.byteLength ||
     view.binding.offset !== 0 || view.binding.size !== view.byteLength ||
     view.byteLength < requiredBytes
   ) {
@@ -553,6 +563,18 @@ function f32Word(value: number): number {
   return view.getUint32(0, true);
 }
 
+function canFuseTwinQ3(
+  first: Qwen35TensorWeightView,
+  second: Qwen35TensorWeightView,
+): boolean {
+  return first.ggmlType === GgmlType.Q3_K && second.ggmlType === GgmlType.Q3_K &&
+    first.storageType === "q3-k-fused-f32-192" && second.storageType === "q3-k-fused-f32-192" &&
+    first.shape.length === 2 && second.shape.length === 2 &&
+    first.shape[0] === second.shape[0] && first.shape[1] === second.shape[1] &&
+    first.shape[0]! % 512 === 0 && first.rowBytes === second.rowBytes &&
+    first.physicalRows.length === 1 && second.physicalRows.length === 1;
+}
+
 /** Builds one fixed decode-layer schedule; it never submits or advances state. */
 export function planQwen35FullAttentionLayerDispatch(
   input: PlanQwen35FullAttentionLayerDispatchInput,
@@ -645,6 +667,12 @@ export function planQwen35FullAttentionLayerDispatch(
     ffnGate: workspaceSlice(input.workspace, "ffn-gate", FFN * 4),
     ffnUp: workspaceSlice(input.workspace, "ffn-up", FFN * 4),
     ffnProduct: workspaceSlice(input.workspace, "ffn-product", FFN * 4),
+    packedGemvInput: workspaceSlice(
+      input.workspace,
+      "packed-gemv-input-f16",
+      FFN * 2,
+      "f16",
+    ),
   };
   const mutableRanges: BufferRange[] = Object.values(activations).map((slice) => ({
     buffer: slice.buffer, offset: slice.offset, size: slice.byteLength,
@@ -696,7 +724,11 @@ export function planQwen35FullAttentionLayerDispatch(
     weight?: Qwen35BufferBinding,
   ): void => {
     const slot = nextUniform(3, 16);
-    const plan = planPrimitiveDispatch({ operation, elementCount: elements });
+    const plan = planPrimitiveDispatch({
+      operation,
+      elementCount: elements,
+      ...(operation === "rms-norm" ? { width: elements } : {}),
+    });
     if (plan.workgroups.x > input.limits.maxComputeWorkgroupsPerDimension) {
       fail("full-attention-dispatch-invalid", "A Qwen3.5 primitive exceeds device limits");
     }
@@ -724,9 +756,74 @@ export function planQwen35FullAttentionLayerDispatch(
   ): void => {
     const slots = tensor.physicalRows.map(() => nextUniform(3, 20));
     const plans = planQwen35PackedGemvDispatches({
-      weights: input.weights, tensorName: tensor.name, activation, output, uniforms: slots, limits: input.limits,
+      weights: input.weights, tensorName: tensor.name, activation, packedActivation: activations.packedGemvInput, output, uniforms: slots, limits: input.limits,
     });
     commands.push(...plans.map((plan) => gemvCommand(stage, plan)));
+  };
+  const addResidualRms = (): void => {
+    const slot = nextUniform(4, 16);
+    const plan = planPrimitiveDispatch({
+      operation: "residual-rms-norm",
+      elementCount: HIDDEN,
+      width: HIDDEN,
+    });
+    const bindings = [
+      storage(0, activations.normalized, HIDDEN * 4),
+      storage(1, activations.hidden, HIDDEN * 4),
+      Object.freeze({ ...direct.postNorm.binding, binding: 2 }),
+      storage(3, activations.hiddenSecondary, HIDDEN * 4),
+      uniformBinding(4, slot, 16),
+    ];
+    requireOutputDisjoint(bindings[3]!, bindings.slice(0, 3));
+    commands.push(frozenCommand({
+      stage: "post-attention-rms",
+      kernel: primitiveKernel("residual-rms-norm"),
+      bindings,
+      workgroups: plan.workgroups,
+      uniformWords: [HIDDEN, HIDDEN, f32Word(sequence.epsilon), 0],
+    }));
+  };
+  const addTwinFfnGemv = (): boolean => {
+    const eligible = canFuseTwinQ3(matrixWeights.ffnGate, matrixWeights.ffnUp);
+    const gateSlots = matrixWeights.ffnGate.physicalRows.map(() => nextUniform(3, 20));
+    const upSlots = eligible
+      ? []
+      : matrixWeights.ffnUp.physicalRows.map(() => nextUniform(3, 20));
+    const fused = eligible
+      ? planQwen35TwinQ3GemvDispatches({
+          weights: input.weights,
+          firstTensorName: matrixWeights.ffnGate.name,
+          secondTensorName: matrixWeights.ffnUp.name,
+          activation: activations.normalized,
+          packedActivation: activations.packedGemvInput,
+          output: activations.ffnProduct,
+          uniform: gateSlots[0]!,
+          limits: input.limits,
+        })
+      : null;
+    if (eligible && fused === null) {
+      fail("full-attention-dispatch-invalid", "The fused Qwen3.5 FFN projection is unavailable");
+    }
+    if (fused !== null) {
+      commands.push(...fused.map((plan) => gemvCommand(
+        plan.kernel.id.includes("swiglu") ? "swiglu" : "ffn-gate-projection",
+        plan,
+      )));
+      return true;
+    }
+    const gatePlans = planQwen35PackedGemvDispatches({
+      weights: input.weights, tensorName: matrixWeights.ffnGate.name,
+      activation: activations.normalized, packedActivation: activations.packedGemvInput,
+      output: activations.ffnGate, uniforms: gateSlots, limits: input.limits,
+    });
+    const upPlans = planQwen35PackedGemvDispatches({
+      weights: input.weights, tensorName: matrixWeights.ffnUp.name,
+      activation: activations.normalized, packedActivation: activations.packedGemvInput,
+      output: activations.ffnUp, uniforms: upSlots, limits: input.limits,
+    });
+    commands.push(...gatePlans.map((plan) => gemvCommand("ffn-gate-projection", plan)));
+    commands.push(...upPlans.map((plan) => gemvCommand("ffn-up-projection", plan)));
+    return false;
   };
 
   addPrimitive("input-rms", "rms-norm", [activations.hidden, activations.normalized], HIDDEN,
@@ -807,12 +904,11 @@ export function planQwen35FullAttentionLayerDispatch(
   }
 
   addGemv("attention-output-projection", matrixWeights.output, activations.attention, activations.normalized);
-  addPrimitive("attention-residual", "residual-add", [activations.normalized, activations.hidden, activations.hiddenSecondary], HIDDEN, [HIDDEN, 0, 0, 0]);
-  addPrimitive("post-attention-rms", "rms-norm", [activations.hiddenSecondary, activations.normalized], HIDDEN,
-    [HIDDEN, HIDDEN, f32Word(sequence.epsilon), 0], direct.postNorm.binding);
-  addGemv("ffn-gate-projection", matrixWeights.ffnGate, activations.normalized, activations.ffnGate);
-  addGemv("ffn-up-projection", matrixWeights.ffnUp, activations.normalized, activations.ffnUp);
-  addPrimitive("swiglu", "swiglu", [activations.ffnGate, activations.ffnUp, activations.ffnProduct], FFN, [FFN, 0, 0, 0]);
+  addResidualRms();
+  const fusedSwiGlu = addTwinFfnGemv();
+  if (!fusedSwiGlu) {
+    addPrimitive("swiglu", "swiglu", [activations.ffnGate, activations.ffnUp, activations.ffnProduct], FFN, [FFN, 0, 0, 0]);
+  }
   addGemv("ffn-down-projection", matrixWeights.ffnDown, activations.ffnProduct, activations.normalized);
   addPrimitive("mlp-residual", "residual-add", [activations.normalized, activations.hiddenSecondary, activations.hidden], HIDDEN, [HIDDEN, 0, 0, 0]);
 

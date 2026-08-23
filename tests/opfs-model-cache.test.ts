@@ -127,7 +127,7 @@ function manifestFor(bytes: Uint8Array, expectedHash = hash(bytes)): ModelPackag
       size: String(bytes.byteLength),
       sha256: expectedHash,
     },
-    runtime: { abi: "qwen35-webgpu-v1" },
+    runtime: { abi: "qwen35-webgpu-v2" },
     tokenizer: {
       repository: "public/tokenizer",
       revision: TOKENIZER_REVISION,
@@ -517,9 +517,13 @@ test("OPFS enumeration counts the requested prefix against the depth limit", asy
 test("OPFS random reads slice only the requested immutable byte range", async () => {
   const bytes = Uint8Array.from({ length: 32 }, (_, index) => index);
   const slices: Array<{ readonly start: number; readonly end: number }> = [];
+  let directoryLookups = 0;
+  let fileHandleLookups = 0;
+  let fileSnapshots = 0;
   const fileHandle = {
     kind: "file" as const,
     async getFile() {
+      fileSnapshots += 1;
       return {
         size: bytes.byteLength,
         slice(start = 0, end = bytes.byteLength) {
@@ -536,6 +540,7 @@ test("OPFS random reads slice only the requested immutable byte range", async ()
   const blobs = {
     kind: "directory" as const,
     async getFileHandle(name: string) {
+      fileHandleLookups += 1;
       if (name !== "model.bin") {
         throw new DOMException("not found", "NotFoundError");
       }
@@ -545,6 +550,7 @@ test("OPFS random reads slice only the requested immutable byte range", async ()
   const root = {
     kind: "directory" as const,
     async getDirectoryHandle(name: string) {
+      directoryLookups += 1;
       if (name !== "blobs") {
         throw new DOMException("not found", "NotFoundError");
       }
@@ -573,9 +579,19 @@ test("OPFS random reads slice only the requested immutable byte range", async ()
     9,
     new AbortController().signal,
   );
+  const second = await storage.readRange(
+    "blobs/model.bin",
+    16,
+    4,
+    new AbortController().signal,
+  );
 
   assert.deepEqual(result, bytes.subarray(7, 16));
-  assert.deepEqual(slices, [{ start: 7, end: 16 }]);
+  assert.deepEqual(second, bytes.subarray(16, 20));
+  assert.deepEqual(slices, [{ start: 7, end: 16 }, { start: 16, end: 20 }]);
+  assert.equal(directoryLookups, 1);
+  assert.equal(fileHandleLookups, 1);
+  assert.equal(fileSnapshots, 1);
 });
 
 test("model-cache range adapter always prefers bounded random access", async () => {

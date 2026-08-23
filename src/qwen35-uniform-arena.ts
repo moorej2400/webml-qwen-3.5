@@ -96,6 +96,7 @@ class OwnedQwen35UniformArena implements Qwen35UniformArena {
   readonly #slotWordCapacity: number;
   readonly #stride: number;
   readonly #slots = new Map<number, Qwen35UniformSlot>();
+  readonly #lastValues = new Map<number, Uint32Array<ArrayBuffer>>();
   #disposed = false;
   #poisoned = false;
   #disposePromise: Promise<void> | null = null;
@@ -203,6 +204,14 @@ class OwnedQwen35UniformArena implements Qwen35UniformArena {
         "Qwen3.5 uniform update size is invalid",
       );
     }
+    const previous = this.#lastValues.get(index);
+    if (
+      previous !== undefined &&
+      previous.length === values.length &&
+      previous.every((value, word) => value === values[word])
+    ) {
+      return;
+    }
     try {
       this.#queue.writeBuffer(
         this.#buffer,
@@ -211,6 +220,9 @@ class OwnedQwen35UniformArena implements Qwen35UniformArena {
         values.byteOffset,
         values.byteLength,
       );
+      // Copy only after a successful queue write. A failed upload poisons the
+      // arena and must never make a later caller believe the GPU has new data.
+      this.#lastValues.set(index, values.slice());
     } catch {
       this.#poisoned = true;
       throw diagnosticError(
@@ -233,6 +245,7 @@ class OwnedQwen35UniformArena implements Qwen35UniformArena {
       failed = true;
     }
     this.#slots.clear();
+    this.#lastValues.clear();
     if (failed) {
       throw diagnosticError(
         "uniform-arena-cleanup-failed",

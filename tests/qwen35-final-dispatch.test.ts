@@ -171,7 +171,7 @@ test("assembles the exact final output RMS command", async () => {
     new DataView(epsilon).getUint32(0, true),
     0,
   ]);
-  assert.equal(plan.command.workgroups.x, 10);
+  assert.equal(plan.command.workgroups.x, 1);
   assert.equal(Object.isFrozen(plan), true);
   assert.equal(Object.isFrozen(plan.command), true);
   assert.equal(Object.isFrozen(plan.command.bindings), true);

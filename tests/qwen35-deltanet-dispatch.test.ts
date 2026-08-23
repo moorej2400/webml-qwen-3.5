@@ -34,8 +34,8 @@ const limits: Qwen35ForwardDeviceLimits = {
 
 const storageTypes = new Map([
   [GgmlType.F32, "f32"],
-  [GgmlType.Q3_K, "q3-k-112"],
-  [GgmlType.Q6_K, "q6-k-212"],
+  [GgmlType.Q3_K, "q3-k-fused-f32-192"],
+  [GgmlType.Q6_K, "q6-k-fused-f32-256"],
 ] as const);
 
 function programTensor(
@@ -82,7 +82,8 @@ function programDirectory(): Qwen35TensorDirectoryEntry[] {
           ["ssm_out.weight", [4_096, 2_560]],
         ] as const;
     for (const [suffix, shape] of [...attention, ...mlp]) {
-      const direct = shape.length === 1 || suffix === "ssm_conv1d.weight";
+      const direct = shape.length === 1 || suffix === "ssm_conv1d.weight" ||
+        suffix === "ssm_alpha.weight" || suffix === "ssm_beta.weight";
       entries.push(programTensor(
         `blk.${layer}.${suffix}`,
         shape,
@@ -99,8 +100,8 @@ function weightView(
 ): Qwen35TensorWeightView {
   const layout = {
     f32: { values: 1, bytes: 4 },
-    "q3-k-112": { values: 256, bytes: 112 },
-    "q6-k-212": { values: 256, bytes: 212 },
+    "q3-k-fused-f32-192": { values: 256, bytes: 192 },
+    "q6-k-fused-f32-256": { values: 256, bytes: 256 },
   }[entry.storageType];
   if (layout === undefined) throw new Error("unsupported test layout");
   const rowBytes = (entry.shape[0]! / layout.values) * layout.bytes;
@@ -214,7 +215,7 @@ function hybridState(
 }
 
 function uniforms(
-  count = 13,
+  count = 9,
   buffer: object = {},
 ): readonly Qwen35ForwardBufferSlice[] {
   return Object.freeze(Array.from({ length: count }, (_, index) => Object.freeze({
@@ -274,7 +275,7 @@ async function geometryPlanner(): Promise<(input: Pick<
   ReturnType<typeof fixture>,
   "program" | "invocation" | "weights"
 >) => {
-  readonly fixedUniformCount: 5;
+  readonly fixedUniformCount: 4;
   readonly physicalGemvPieceCount: number;
   readonly uniformCount: number;
 }> {
@@ -287,9 +288,9 @@ test("derives exact DeltaNet uniform geometry before allocating buffers", async 
   const valid = fixture();
   const geometry = (await geometryPlanner())(valid);
   assert.deepEqual(geometry, {
-    fixedUniformCount: 5,
-    physicalGemvPieceCount: 8,
-    uniformCount: 13,
+    fixedUniformCount: 4,
+    physicalGemvPieceCount: 5,
+    uniformCount: 9,
   });
   assert.equal(Object.isFrozen(geometry), true);
 });
@@ -299,22 +300,17 @@ test("assembles the exact one-token DeltaNet command order and live buffers", as
   const plan = (await planner())(input);
 
   assert.equal(plan.layer, 0);
-  assert.equal(plan.uniformCount, 13);
+  assert.equal(plan.uniformCount, 9);
   assert.deepEqual(plan.commands.map(({ stage }) => stage), [
     "input-rms",
     "attention-gate-projection",
     "attention-qkv-projection",
-    "deltanet-alpha-projection",
-    "deltanet-beta-projection",
+    "deltanet-alpha-beta-projection",
     "deltanet-parameters",
     "deltanet-conv",
-    "deltanet-recurrent",
-    "deltanet-gated-norm",
+    "deltanet-recurrent-gated-norm",
     "deltanet-output-projection",
-    "attention-residual",
     "post-attention-rms",
-    "ffn-gate-projection",
-    "ffn-up-projection",
     "swiglu",
     "ffn-down-projection",
     "mlp-residual",
@@ -322,18 +318,40 @@ test("assembles the exact one-token DeltaNet command order and live buffers", as
   assert.deepEqual(
     plan.commands.filter(({ mutatesPersistentState }) => mutatesPersistentState)
       .map(({ stage }) => stage),
-    ["deltanet-conv", "deltanet-recurrent"],
+    ["deltanet-conv", "deltanet-recurrent-gated-norm"],
   );
-  assert.equal(plan.commands[5]!.bindings[0]!.buffer,
+  const parameterProjection = plan.commands.find(
+    ({ stage }) => stage === "deltanet-alpha-beta-projection",
+  )!;
+  assert.equal(parameterProjection.kernel.id, "f32-twin-gemv-portable");
+  assert.doesNotMatch(parameterProjection.kernel.source, /enable subgroups/);
+  assert.match(parameterProjection.kernel.source, /var<workgroup> first_partials/);
+  const parameters = plan.commands.find(({ stage }) => stage === "deltanet-parameters")!;
+  const convolution = plan.commands.find(({ stage }) => stage === "deltanet-conv")!;
+  const recurrent = plan.commands.find(
+    ({ stage }) => stage === "deltanet-recurrent-gated-norm",
+  )!;
+  assert.equal(parameters.bindings[0]!.buffer,
     input.workspace.get("deltanet-beta").binding.buffer);
-  assert.equal(plan.commands[5]!.bindings[4]!.buffer,
+  assert.equal(parameters.bindings[4]!.buffer,
     input.workspace.get("full-attention-key").binding.buffer);
-  assert.equal(plan.commands[5]!.bindings[5]!.buffer,
+  assert.equal(parameters.bindings[5]!.buffer,
     input.workspace.get("full-attention-value").binding.buffer);
-  assert.equal(plan.commands[6]!.bindings[2]!.buffer,
+  assert.equal(convolution.bindings[2]!.buffer,
     input.state.kind === "gated-deltanet" ? input.state.conv.shards[0]!.buffer : null);
-  assert.equal(plan.commands[7]!.bindings[3]!.buffer,
+  assert.equal(recurrent.bindings[3]!.buffer,
     input.state.kind === "gated-deltanet" ? input.state.recurrent.shards[0]!.buffer : null);
+  assert.equal(recurrent.bindings[4]!.buffer,
+    input.workspace.get("attention-inner-primary").binding.buffer);
+  assert.equal(
+    plan.commands.find(({ kernel }) =>
+      kernel.id.includes("swiglu"))?.stage,
+    "swiglu",
+  );
+  assert.doesNotMatch(
+    plan.commands.find(({ stage }) => stage === "swiglu")!.kernel.source,
+    /enable subgroups/,
+  );
   assert.equal(plan.commands.at(-1)!.bindings[2]!.buffer,
     input.workspace.get("packed-embedding-output").binding.buffer);
   assert.equal(
@@ -385,17 +403,19 @@ test("preserves DeltaNet stage order across multiple physical matrix row views",
     (stage, index) => index === 0 || stage !== stages[index - 1],
   );
 
-  assert.equal(plan.uniformCount, 14);
-  assert.equal(plan.commands.length, 18);
-  assert.deepEqual(stages.slice(0, 4), [
+  assert.equal(plan.uniformCount, 10);
+  assert.equal(plan.commands.length, 13);
+  assert.deepEqual(stages.slice(0, 5), [
     "input-rms",
     "attention-gate-projection",
     "attention-gate-projection",
     "attention-qkv-projection",
+    "deltanet-alpha-beta-projection",
   ]);
   assert.deepEqual(
     plan.commands
       .filter(({ stage }) => stage === "attention-gate-projection")
+      .filter(({ uniformWords }) => uniformWords.length > 0)
       .map(({ uniformWords }) => uniformWords),
     [
       [firstRowCount, 2_560, 10, 0, 0],
@@ -406,17 +426,12 @@ test("preserves DeltaNet stage order across multiple physical matrix row views",
     "input-rms",
     "attention-gate-projection",
     "attention-qkv-projection",
-    "deltanet-alpha-projection",
-    "deltanet-beta-projection",
+    "deltanet-alpha-beta-projection",
     "deltanet-parameters",
     "deltanet-conv",
-    "deltanet-recurrent",
-    "deltanet-gated-norm",
+    "deltanet-recurrent-gated-norm",
     "deltanet-output-projection",
-    "attention-residual",
     "post-attention-rms",
-    "ffn-gate-projection",
-    "ffn-up-projection",
     "swiglu",
     "ffn-down-projection",
     "mlp-residual",
@@ -436,8 +451,15 @@ test("returns deeply frozen executable requests and encoded uniform words", asyn
     Object.isFrozen(command.uniformWords) &&
     Object.isFrozen(command.workgroups)));
   assert.deepEqual(plan.commands[0]!.uniformWords.slice(0, 2), [2_560, 2_560]);
-  assert.deepEqual(plan.commands[10]!.uniformWords, [2_560, 0, 0, 0]);
-  assert.deepEqual(plan.commands[14]!.uniformWords, [9_216, 0, 0, 0]);
+  assert.deepEqual(
+    plan.commands.find(({ stage }) => stage === "post-attention-rms")!.uniformWords
+      .slice(0, 2),
+    [2_560, 2_560],
+  );
+  assert.deepEqual(
+    plan.commands.find(({ stage }) => stage === "swiglu")!.uniformWords,
+    [9_216, 2_560, 10, 0, 0],
+  );
 });
 
 test("rejects wrong invocation identity, layer kind, and direct tensor storage", async () => {
@@ -486,7 +508,7 @@ test("rejects wrong invocation identity, layer kind, and direct tensor storage",
   const directName = "blk.0.ssm_conv1d.weight";
   const badTensors = valid.weights.tensors.map((tensor) =>
     tensor.name === directName
-      ? Object.freeze({ ...tensor, ggmlType: GgmlType.Q3_K, storageType: "q3-k-112" })
+      ? Object.freeze({ ...tensor, ggmlType: GgmlType.Q3_K, storageType: "q3-k-fused-f32-192" })
       : tensor);
   assert.throws(
     () => plan({ ...valid, weights: weights(badTensors) }),
@@ -498,11 +520,11 @@ test("rejects insufficient, overlapping, and activation-state aliased buffers", 
   const plan = await planner();
   const valid = fixture();
   assert.throws(
-    () => plan({ ...valid, uniforms: uniforms(12) }),
+    () => plan({ ...valid, uniforms: uniforms(8) }),
     /uniform/i,
   );
   const sharedUniform = {};
-  const aliasedUniforms = uniforms(13, sharedUniform).map((slot, index) =>
+  const aliasedUniforms = uniforms(10, sharedUniform).map((slot, index) =>
     index === 1 ? Object.freeze({ ...slot, offset: 0 }) : slot);
   assert.throws(
     () => plan({ ...valid, uniforms: aliasedUniforms }),

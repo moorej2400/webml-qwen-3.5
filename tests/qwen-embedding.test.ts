@@ -114,10 +114,22 @@ test("rejects shader u32 overflow and device dispatch overflow", () => {
   );
 });
 
-test("defines six direct packed embedding kernels and phase registry entries", () => {
+test("defines legacy and browser-native packed embedding kernels", () => {
   assert.deepEqual(
     PACKED_EMBEDDING_KERNELS.map((kernel) => kernel.storageType),
-    ["f32", "q8-0-36", "q3-k-112", "q4-k-144", "q5-k-176", "q6-k-212"],
+    [
+      "f32",
+      "q8-0-36",
+      "q3-k-112",
+      "q3-k-nibble-148",
+      "q3-k-fused-f32-192",
+      "q4-k-144",
+      "q4-k-fused-f32-192",
+      "q5-k-176",
+      "q5-k-fused-f32-224",
+      "q6-k-212",
+      "q6-k-fused-f32-256",
+    ],
   );
   for (const kernel of PACKED_EMBEDDING_KERNELS) {
     assert.match(kernel.source, /array<u32>/);

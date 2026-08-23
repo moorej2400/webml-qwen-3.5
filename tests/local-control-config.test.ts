@@ -61,7 +61,7 @@ const runtimeManifest = (): ModelPackageManifest => ({
   format: "webml-qwen-package",
   version: 1,
   packageKind: "language",
-  runtime: { abi: "qwen35-webgpu-v1" },
+  runtime: { abi: "qwen35-webgpu-v2" },
   source: {
     repository: "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF",
     revision: "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
@@ -126,7 +126,7 @@ test("browser runtime configuration requires local manifest bytes and immutable 
   assert.equal(config.expectedPackageBaseUrl, environment.QWEN_RUNTIME_PACKAGE_BASE_URL);
   assert.equal(config.expectedManifestSha256, modelCacheKey(manifest));
   assert.equal(config.compiledTokenizerUrl, environment.QWEN_RUNTIME_TOKENIZER_URL);
-  assert.equal(config.manifest.runtime.abi, "qwen35-webgpu-v1");
+  assert.equal(config.manifest.runtime.abi, "qwen35-webgpu-v2");
   assert.equal(Object.isFrozen(config), true);
   assert.equal("manifestPath" in config, false);
 });
@@ -148,6 +148,8 @@ test("browser runtime configuration carries the selected allocation-shaping expe
     QWEN_RUNTIME_TOKENIZER_URL:
       `https://huggingface.co/example/browser-package/resolve/${revision}/tokenizer.bin`,
     QWEN_RUNTIME_BUFFER_SHARD_POLICY: "evidence-64",
+    QWEN_RUNTIME_RESIDENCY_POLICY: "hybrid",
+    QWEN_RUNTIME_RESIDENT_LAYER_COUNT: "24",
   });
 
   const config = await loadBrowserRuntimeConfiguration({
@@ -156,6 +158,43 @@ test("browser runtime configuration carries the selected allocation-shaping expe
   });
   assert.equal(environment.bufferShardPolicy, "evidence-64");
   assert.equal(config.bufferShardPolicy, "evidence-64");
+  assert.equal(environment.residencyPolicy, "hybrid");
+  assert.equal(environment.residentLayerCount, 24);
+  assert.equal(config.residencyPolicy, "hybrid");
+  assert.equal(config.residentLayerCount, 24);
+});
+
+test("browser runtime configuration requires a bounded resident prefix for hybrid residency", () => {
+  const revision = "c".repeat(40);
+  const base = {
+    QWEN_RUNTIME_MANIFEST: ".local/model/manifest.json",
+    QWEN_RUNTIME_PACKAGE_BASE_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/`,
+    QWEN_RUNTIME_MANIFEST_SHA256: "a".repeat(64),
+    QWEN_RUNTIME_TOKENIZER_URL:
+      `https://huggingface.co/example/browser-package/resolve/${revision}/tokenizer.bin`,
+    QWEN_RUNTIME_RESIDENCY_POLICY: "hybrid",
+  };
+
+  const environment = loadBrowserRuntimeEnvironment({
+    ...base,
+    QWEN_RUNTIME_RESIDENT_LAYER_COUNT: "24",
+  });
+  assert.equal(environment.residencyPolicy, "hybrid");
+  assert.equal(environment.residentLayerCount, 24);
+  assert.throws(() => loadBrowserRuntimeEnvironment(base), /resident layer count/i);
+  assert.throws(
+    () => loadBrowserRuntimeEnvironment({ ...base, QWEN_RUNTIME_RESIDENT_LAYER_COUNT: "32" }),
+    /resident layer count/i,
+  );
+  assert.throws(
+    () => loadBrowserRuntimeEnvironment({
+      ...base,
+      QWEN_RUNTIME_RESIDENCY_POLICY: "rolling",
+      QWEN_RUNTIME_RESIDENT_LAYER_COUNT: "24",
+    }),
+    /resident layer count/i,
+  );
 });
 
 test("upload probe trials change exactly one memory variable from the 128 MiB baseline", () => {
@@ -182,6 +221,11 @@ test("upload probe trials change exactly one memory variable from the 128 MiB ba
     "lane-16": {
       bufferShardPolicy: "evidence-128",
       uploadLaneBytes: 16 * 1024 * 1024,
+      retireUploadAfterEachWrite: false,
+    },
+    "lane-64": {
+      bufferShardPolicy: "evidence-128",
+      uploadLaneBytes: 64 * 1024 * 1024,
       retireUploadAfterEachWrite: false,
     },
     "lane-8": {
@@ -306,6 +350,13 @@ test("browser runtime configuration rejects mutable, credentialed, or mismatched
       QWEN_RUNTIME_BUFFER_SHARD_POLICY: "unrecognized-policy",
     }),
     /buffer shard policy/i,
+  );
+  assert.throws(
+    () => loadBrowserRuntimeEnvironment({
+      ...base,
+      QWEN_RUNTIME_RESIDENCY_POLICY: "guess",
+    }),
+    /residency policy/i,
   );
   const environment = loadBrowserRuntimeEnvironment({
     ...base,

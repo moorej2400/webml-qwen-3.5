@@ -8,7 +8,11 @@ import {
   type SequenceState,
   type TextOrImageConversation,
 } from "./qwen35-session.js";
-import type { Qwen35ChatContentPart, Qwen35ChatMessage } from "./qwen-chat-template.js";
+import type {
+  Qwen35ChatContentPart,
+  Qwen35ChatMessage,
+  Qwen35ConversationOptions,
+} from "./qwen-chat-template.js";
 import {
   QWEN35_DEFAULT_DECODED_SOURCE_BYTE_BUDGET,
   planQwen35VisionImage,
@@ -43,6 +47,12 @@ const VISION_SETTINGS = Object.freeze({
   imageStd: [0.5, 0.5, 0.5] as const,
 });
 
+// The chat surface must return the requested answer, not spend its bounded
+// generation budget on Qwen's hidden reasoning transcript.
+export const QWEN35_CHAT_CONVERSATION_OPTIONS = Object.freeze({
+  enableThinking: false,
+});
+
 interface RuntimeConfig {
   readonly manifest?: ModelPackageManifest;
   readonly manifestUrl?: string;
@@ -58,6 +68,8 @@ interface RuntimeConfig {
   readonly compiledTokenizerUrl: string;
   readonly bufferShardPolicy?: BufferShardPolicy;
   readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
+  /** Local-only prefix count used only when residencyPolicy is hybrid. */
+  readonly residentLayerCount?: number;
 }
 
 interface RuntimeConfigWindow extends Window {
@@ -67,7 +79,10 @@ interface RuntimeConfigWindow extends Window {
 export interface Qwen35RuntimeCoordinator {
   readonly state: Qwen35SessionState;
   load(): Promise<void>;
-  replaceConversation(input: TextOrImageConversation): Promise<SequenceState>;
+  replaceConversation(
+    input: TextOrImageConversation,
+    options?: Pick<Qwen35ConversationOptions, "enableThinking">,
+  ): Promise<SequenceState>;
   generate(options: GenerateOptions): AsyncIterable<GeneratedToken>;
   cancel(): Promise<void>;
   reset(): Promise<void>;
@@ -206,7 +221,14 @@ function readRuntimeConfig(): RuntimeConfig | null {
   const hasResidencyPolicy =
     residencyPolicy === "auto" ||
     residencyPolicy === "resident" ||
-    residencyPolicy === "rolling";
+    residencyPolicy === "rolling" ||
+    residencyPolicy === "hybrid";
+  const residentLayerCount = injected.residentLayerCount;
+  const hasResidentLayerCount =
+    Number.isSafeInteger(residentLayerCount) &&
+    residentLayerCount !== undefined &&
+    residentLayerCount >= 1 &&
+    residentLayerCount <= 31;
   const hasManifest = typeof injected.manifest === "object" && injected.manifest !== null;
   const hasManifestUrl = typeof injected.manifestUrl === "string" && injected.manifestUrl.length > 0;
   if (
@@ -217,6 +239,8 @@ function readRuntimeConfig(): RuntimeConfig | null {
     typeof compiledTokenizerUrl !== "string" || compiledTokenizerUrl.length === 0
     || (bufferShardPolicy !== undefined && !hasBufferShardPolicy)
     || (residencyPolicy !== undefined && !hasResidencyPolicy)
+    || (residencyPolicy === "hybrid" && !hasResidentLayerCount)
+    || (residencyPolicy !== "hybrid" && residentLayerCount !== undefined)
   ) {
     return null;
   }
@@ -239,6 +263,7 @@ function readRuntimeConfig(): RuntimeConfig | null {
     compiledTokenizerUrl,
     ...(hasBufferShardPolicy ? { bufferShardPolicy } : {}),
     ...(hasResidencyPolicy ? { residencyPolicy } : {}),
+    ...(hasResidentLayerCount ? { residentLayerCount } : {}),
   });
 }
 
@@ -285,6 +310,7 @@ function createRuntimeCoordinator(
   const listeners = new Set<(event: RuntimeLoadEvent) => void>();
   let session: Qwen35Session | null = null;
   let loadingPromise: Promise<void> | null = null;
+  let disposingPromise: Promise<void> | null = null;
   let loadController: AbortController | null = null;
   let hasSequence = false;
   let lastMetrics = emptyRuntimeMetrics("idle");
@@ -310,23 +336,27 @@ function createRuntimeCoordinator(
       return session?.state ?? lastMetrics.state;
     },
     async load() {
-      if (session?.state === "ready") return;
       if (loadingPromise !== null) return loadingPromise;
-      if (session !== null) {
-        lastMetrics = session.getMetrics();
-        await session.dispose().catch(() => undefined);
-        session = null;
-      }
-      const created = new Qwen35Session();
       const controller = new AbortController();
-      session = created;
       loadController = controller;
-      let failedEventReported = false;
-      const reportAttempt = (event: RuntimeLoadEvent): void => {
-        if (event.phase === "failed") failedEventReported = true;
-        report(event);
-      };
       const pending = (async () => {
+        if (disposingPromise !== null) {
+          await disposingPromise;
+          controller.signal.throwIfAborted();
+        }
+        if (session?.state === "ready") return;
+        if (session !== null) {
+          lastMetrics = session.getMetrics();
+          await session.dispose().catch(() => undefined);
+          session = null;
+        }
+        const created = new Qwen35Session();
+        session = created;
+        let failedEventReported = false;
+        const reportAttempt = (event: RuntimeLoadEvent): void => {
+          if (event.phase === "failed") failedEventReported = true;
+          report(event);
+        };
         try {
           const loadOptions = await resolveLoadOptions(controller.signal);
           // The resolver may ignore cancellation. This boundary prevents any
@@ -369,13 +399,13 @@ function createRuntimeCoordinator(
         if (loadController === controller) loadController = null;
       }
     },
-    async replaceConversation(input) {
+    async replaceConversation(input, options) {
       const active = requireSession();
       if (hasSequence) {
         await active.reset();
         hasSequence = false;
       }
-      const sequence = await active.prefill(input);
+      const sequence = await active.prefill(input, options);
       hasSequence = true;
       return sequence;
     },
@@ -392,16 +422,33 @@ function createRuntimeCoordinator(
       hasSequence = false;
     },
     async dispose() {
-      const pendingLoad = loadingPromise;
+      // A load may queue behind the active disposal. Abort it before returning
+      // the shared disposal promise so teardown cannot later publish a session.
       loadController?.abort();
-      const active = session;
-      if (active !== null) {
-        await active.dispose();
-        lastMetrics = active.getMetrics();
-        if (session === active) session = null;
+      if (disposingPromise !== null) {
+        const activeDisposal = disposingPromise;
+        const queuedLoad = loadingPromise;
+        await activeDisposal;
+        await queuedLoad?.catch(() => undefined);
+        return;
       }
-      await pendingLoad?.catch(() => undefined);
-      hasSequence = false;
+      const pendingLoad = loadingPromise;
+      const active = session;
+      const pending = (async () => {
+        if (active !== null) {
+          await active.dispose();
+          lastMetrics = active.getMetrics();
+          if (session === active) session = null;
+        }
+        await pendingLoad?.catch(() => undefined);
+        hasSequence = false;
+      })();
+      disposingPromise = pending;
+      try {
+        await pending;
+      } finally {
+        if (disposingPromise === pending) disposingPromise = null;
+      }
     },
     getMetrics() {
       return session?.getMetrics() ?? lastMetrics;
@@ -478,6 +525,7 @@ export function startQwen35ChatApp(
   let pendingImage: PendingImage | null = null;
   let preprocessController: AbortController | null = null;
   let sendController: AbortController | null = null;
+  let pageExitDisposal: Promise<void> | null = null;
   let generationLimit = 192;
   const operationGate = new ChatOperationGate();
   const coordinator = createRuntimeCoordinator(async (signal) => {
@@ -510,6 +558,9 @@ export function startQwen35ChatApp(
             residencyPolicy: options.residencyPolicy ??
               runtimeConfig.residencyPolicy,
           }),
+      ...(runtimeConfig.residentLayerCount === undefined
+        ? {}
+        : { residentLayerCount: runtimeConfig.residentLayerCount }),
       ...(runtimeConfig.allowInsecureLocalhost === true
         ? { allowInsecureLocalhost: true }
         : {}),
@@ -570,7 +621,10 @@ export function startQwen35ChatApp(
     try {
       loaded = await ensureSession();
       statusText("Prefilling conversation");
-      const state = await loaded.replaceConversation(nextMessages);
+      const state = await loaded.replaceConversation(
+        nextMessages,
+        QWEN35_CHAT_CONVERSATION_OPTIONS,
+      );
       messages.push(userMessage);
       element<HTMLElement>("[data-context-copy]").textContent = `${formatNumber(state.contextTokens)} context tokens`;
       const assistant = appendMessage("assistant", "");
@@ -662,7 +716,7 @@ export function startQwen35ChatApp(
     setPanel(!panel.hasAttribute("data-open"));
   });
   element<HTMLButtonElement>("[data-settings-close]").addEventListener("click", () => setPanel(false));
-  element<HTMLInputElement>("[data-generation-limit]").addEventListener("change", (event) => {
+  element<HTMLInputElement>("[data-generation-limit]").addEventListener("input", (event) => {
     const value = Number((event.target as HTMLInputElement).value);
     if (Number.isSafeInteger(value) && value >= 1 && value <= 2_048) generationLimit = value;
   });
@@ -726,11 +780,18 @@ export function startQwen35ChatApp(
     statusText("Waiting for load command");
   }
 
-  window.addEventListener("beforeunload", () => {
+  const disposeForPageExit = (): void => {
+    if (pageExitDisposal !== null) return;
     preprocessController?.abort();
     sendController?.abort();
-    void coordinator.dispose();
-  });
+    const pending = coordinator.dispose();
+    pageExitDisposal = pending;
+    // Page teardown may stop this promise. The replacement document relies on
+    // the origin Web Lock, which is the authoritative ownership fence.
+    void pending.catch(() => undefined);
+  };
+  window.addEventListener("beforeunload", disposeForPageExit);
+  window.addEventListener("pagehide", disposeForPageExit);
 
   return Object.freeze({ coordinator });
 }

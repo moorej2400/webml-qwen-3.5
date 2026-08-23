@@ -12,19 +12,22 @@ types from the file directory, excludes the pinned `blk.32.*` MTP block and
 complete `mtp` or `nextn` name segments with a stable policy reason, and
 produces aligned shard segments that contain complete contiguous rows.
 The planner applies the manifest shard, segment, and excluded-tensor ceilings
-before it appends each entry. Language tensors use one of six explicit layouts:
+before it appends each entry. The production package uses six compact,
+u32-aligned layouts:
 
 - F32: native four-byte values;
 - Q8_0: native 34-byte blocks reordered to 36 bytes;
-- Q3_K: native 110-byte blocks reordered to 112 bytes;
-- Q4_K: native, u32-aligned 144-byte blocks;
-- Q5_K: native, u32-aligned 176-byte blocks; and
+- Q3_K: native 110-byte blocks padded to 112 bytes;
+- Q4_K: native 144-byte blocks;
+- Q5_K: native 176-byte blocks; and
 - Q6_K: native 210-byte blocks padded to 212 bytes.
 
-Q8_0 moves its signed quant bytes behind a two-byte pad. Q6_K retains native
-field order and adds trailing zero padding. These layouts keep each adjacent
-block u32-aligned without changing quantized fields. Full tensors are not
-expanded to floating-point storage during conversion or GEMV.
+The compact browser layouts preserve native quantization fields and add only
+the alignment needed for WebGPU storage access. Full tensors are not expanded
+to floating-point storage during conversion or GEMV. Optional experimental
+fused layouts keep their derived quantization factors in FP32 and remain
+outside the production package until physical performance evidence justifies
+their extra residency cost.
 
 Each correctness-first GEMV invocation owns one local row. The shader reads its
 packed block directly, reconstructs scalar values in registers, and writes to
@@ -107,9 +110,12 @@ contract validates `1 <= tokenCount <= position + 1 <= capacity <= 16384`.
 
 Gated DeltaNet keeps convolution and recurrent math in FP32. It shifts raw QKV
 through oldest-to-current convolution taps, applies SiLU, maps each value head
-to Q/K head `h % 16`, computes beta and negative-`ssm_a` decay, and preserves
-the required decay, read, beta-delta, rank-one update, then query order. The
-serial prefill path is the correctness oracle for later bounded parallel scans.
+to Q/K head `h mod 16`, computes beta and negative-`ssm_a` decay, and preserves
+the required decay, read, beta-delta, rank-one update, then query order. Decode
+uses two ascending-key state traversals per value head: decay with memory
+accumulation, then update with output accumulation. Bounded four-token
+layer-major prefill remains a separate implementation path and must match the
+serial reference at its critical state boundaries.
 
 One text token executes the packed embedding, all 32 layers, and, when a token
 is requested, final RMSNorm plus tiled tied logits in one compute batch. The
@@ -119,12 +125,16 @@ planner-assigned buffer and offset; they do not assume that command order and
 uniform allocation order are the same. Text decode uses M-RoPE positions
 `[position, position, position]`.
 
-Correctness-first prefill processes tokens serially and runs logits only for
-the final prompt token. Generation keeps the predicted token separate from the
-last emitted-but-not-yet-ingested token. This permits a later generation call
-to continue without repeating or skipping a token. Cancellation that crosses
-submitted generation state poisons the driver and fails closed. Cancellation
-while paused at a yielded token preserves the pending continuation.
+Correctness-first prefill processes bounded four-token chunks in layer-major
+order and runs logits only for the final prompt token. The serial reference
+remains the parity oracle. Generation keeps the predicted token separate from
+the last emitted-but-not-yet-ingested token. This permits a later generation
+call to continue without repeating or skipping a token. Cancellation that
+crosses submitted generation state poisons the driver and fails closed.
+Cancellation while paused at a yielded token preserves the pending continuation.
+The public chat uses the pinned no-thinking template. Generation closes the
+driver when it predicts `<|im_end|>`; decoding that special token as empty text
+must not permit a synthetic next conversation turn.
 
 The source GGUF advertises a native maximum context of 262,144 tokens. The
 current product contract selects 16,384 tokens and stores the native maximum

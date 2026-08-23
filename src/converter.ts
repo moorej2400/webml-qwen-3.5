@@ -18,6 +18,13 @@ import {
   type VisionProcessorSettings,
 } from "./manifest.js";
 import {
+  repackNativeQ3KBrowser,
+  repackNativeQ3KFusedBrowser,
+  repackNativeQ4KBrowser,
+  repackNativeQ5KBrowser,
+  repackNativeQ6KBrowser,
+} from "./browser-quant.js";
+import {
   repackNativeQ6K,
   repackNativeQ8_0,
 } from "./mixed-quant.js";
@@ -438,8 +445,23 @@ export async function executeConversionPlan(
         case "q3-k-110-to-112":
           output = repackNativeQ3K(source);
           break;
+        case "q3-k-110-to-nibble-148":
+          output = repackNativeQ3KBrowser(source);
+          break;
+        case "q3-k-110-to-fused-f32-192":
+          output = repackNativeQ3KFusedBrowser(source);
+          break;
+        case "q4-k-144-to-fused-f32-192":
+          output = repackNativeQ4KBrowser(source);
+          break;
+        case "q5-k-176-to-fused-f32-224":
+          output = repackNativeQ5KBrowser(source);
+          break;
         case "q6-k-210-to-212":
           output = repackNativeQ6K(source);
+          break;
+        case "q6-k-210-to-fused-f32-256":
+          output = repackNativeQ6KBrowser(source);
           break;
       }
       await writer.write(

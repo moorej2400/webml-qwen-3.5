@@ -339,25 +339,22 @@ const DELTANET_RECURRENT_WGSL = /* wgsl */ `
 
 var<workgroup> query_partials: array<f32, 128>;
 var<workgroup> key_partials: array<f32, 128>;
-var<workgroup> delta_values: array<f32, 128>;
 
-@compute @workgroup_size(128, 2, 1)
+@compute @workgroup_size(128)
 fn main(@builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>) {
   let value_head = group.x;
   if (value_head >= 32u) { return; }
   let value_lane = local.x;
-  let key_group = local.y;
+  // Match GGML repeat semantics: value heads 0..31 map to Q/K heads 0..15 twice.
   let qk_head = value_head % 16u;
-  if (key_group == 0u) {
-    let query_raw = convolved_qkv[qk_head * 128u + value_lane];
-    let key_raw = convolved_qkv[2048u + qk_head * 128u + value_lane];
-    query_partials[value_lane] = query_raw * query_raw;
-    key_partials[value_lane] = key_raw * key_raw;
-  }
+  let query_raw = convolved_qkv[qk_head * 128u + value_lane];
+  let key_raw = convolved_qkv[2048u + qk_head * 128u + value_lane];
+  query_partials[value_lane] = query_raw * query_raw;
+  key_partials[value_lane] = key_raw * key_raw;
   workgroupBarrier();
   for (var stride = 64u; stride > 0u; stride /= 2u) {
-    if (key_group == 0u && value_lane < stride) {
+    if (value_lane < stride) {
       query_partials[value_lane] += query_partials[value_lane + stride];
       key_partials[value_lane] += key_partials[value_lane + stride];
     }
@@ -367,57 +364,33 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>,
     inverseSqrt(query_partials[0] + 0.000001f) * inverseSqrt(128.0f);
   let key_scale = inverseSqrt(key_partials[0] + 0.000001f);
 
-  // Decay and update each independent state cell in parallel. The two
-  // key groups cover disjoint contiguous rows; reductions below stay on the
-  // original key order so recurrent FP32 results match the CPU oracle.
-  for (var key_lane = key_group * 64u;
-       key_lane < key_group * 64u + 64u;
-       key_lane += 1u) {
+  // Each lane owns one value column. Preserve ascending key order while
+  // combining decay+memory and update+output to avoid extra state traversals.
+  var memory = 0.0f;
+  for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
     let state_index =
       value_head * 16384u + key_lane * 128u + value_lane;
     let decayed = state_values[state_index] * decay_values[value_head];
     state_values[state_index] = decayed;
+    let key_value =
+      convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
+    memory += key_value * decayed;
   }
-  workgroupBarrier();
-  var memory = 0.0f;
-  if (key_group == 0u) {
-    for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
-      let state_index =
-        value_head * 16384u + key_lane * 128u + value_lane;
-      let decayed = state_values[state_index];
-      let key_value =
-        convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
-      memory += key_value * decayed;
-    }
-  }
-  if (key_group == 0u) {
-    delta_values[value_lane] = beta_values[value_head] *
-      (convolved_qkv[4096u + value_head * 128u + value_lane] - memory);
-  }
-  workgroupBarrier();
-  let delta = delta_values[value_lane];
-  for (var key_lane = key_group * 64u;
-       key_lane < key_group * 64u + 64u;
-       key_lane += 1u) {
+  let delta = beta_values[value_head] *
+    (convolved_qkv[4096u + value_head * 128u + value_lane] - memory);
+  var head_output = 0.0f;
+  for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
     let state_index =
       value_head * 16384u + key_lane * 128u + value_lane;
     let key_value =
       convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
     let updated = state_values[state_index] + key_value * delta;
     state_values[state_index] = updated;
+    let query_value =
+      convolved_qkv[qk_head * 128u + key_lane] * query_scale;
+    head_output += query_value * updated;
   }
-  workgroupBarrier();
-  if (key_group == 0u) {
-    var head_output = 0.0f;
-    for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
-      let state_index =
-        value_head * 16384u + key_lane * 128u + value_lane;
-      let query_value =
-        convolved_qkv[qk_head * 128u + key_lane] * query_scale;
-      head_output += query_value * state_values[state_index];
-    }
-    output_values[value_head * 128u + value_lane] = head_output;
-  }
+  output_values[value_head * 128u + value_lane] = head_output;
 }`;
 
 const DELTANET_GATED_NORM_WGSL = /* wgsl */ `
@@ -453,6 +426,86 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>,
   output_values[index] =
     recurrent_values[index] * inverse_rms *
     norm_weight_values[lane] * silu(z_values[index]);
+}`;
+
+const DELTANET_RECURRENT_GATED_NORM_WGSL = /* wgsl */ `
+@group(0) @binding(0) var<storage, read> convolved_qkv: array<f32>;
+@group(0) @binding(1) var<storage, read> beta_values: array<f32>;
+@group(0) @binding(2) var<storage, read> decay_values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> state_values: array<f32>;
+@group(0) @binding(4) var<storage, read> z_values: array<f32>;
+@group(0) @binding(5) var<storage, read> norm_weight_values: array<f32>;
+@group(0) @binding(6) var<storage, read_write> output_values: array<f32>;
+
+fn silu(value: f32) -> f32 {
+  return value / (1.0f + exp(-value));
+}
+
+var<workgroup> query_partials: array<f32, 128>;
+var<workgroup> key_partials: array<f32, 128>;
+var<workgroup> norm_partials: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>) {
+  let value_head = group.x;
+  if (value_head >= 32u) { return; }
+  let value_lane = local.x;
+  // GGML repeat maps the 32 value heads onto the 16 Q/K heads by modulo.
+  let qk_head = value_head % 16u;
+  let query_raw = convolved_qkv[qk_head * 128u + value_lane];
+  let key_raw = convolved_qkv[2048u + qk_head * 128u + value_lane];
+  query_partials[value_lane] = query_raw * query_raw;
+  key_partials[value_lane] = key_raw * key_raw;
+  workgroupBarrier();
+  for (var stride = 64u; stride > 0u; stride /= 2u) {
+    if (value_lane < stride) {
+      query_partials[value_lane] += query_partials[value_lane + stride];
+      key_partials[value_lane] += key_partials[value_lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let query_scale =
+    inverseSqrt(query_partials[0] + 0.000001f) * inverseSqrt(128.0f);
+  let key_scale = inverseSqrt(key_partials[0] + 0.000001f);
+
+  var memory = 0.0f;
+  for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
+    let state_index =
+      value_head * 16384u + key_lane * 128u + value_lane;
+    let decayed = state_values[state_index] * decay_values[value_head];
+    state_values[state_index] = decayed;
+    let key_value =
+      convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
+    memory += key_value * decayed;
+  }
+  let delta = beta_values[value_head] *
+    (convolved_qkv[4096u + value_head * 128u + value_lane] - memory);
+  var head_output = 0.0f;
+  for (var key_lane = 0u; key_lane < 128u; key_lane += 1u) {
+    let state_index =
+      value_head * 16384u + key_lane * 128u + value_lane;
+    let key_value =
+      convolved_qkv[2048u + qk_head * 128u + key_lane] * key_scale;
+    let updated = state_values[state_index] + key_value * delta;
+    state_values[state_index] = updated;
+    let query_value =
+      convolved_qkv[qk_head * 128u + key_lane] * query_scale;
+    head_output += query_value * updated;
+  }
+
+  norm_partials[value_lane] = head_output * head_output;
+  workgroupBarrier();
+  for (var stride = 64u; stride > 0u; stride /= 2u) {
+    if (value_lane < stride) {
+      norm_partials[value_lane] += norm_partials[value_lane + stride];
+    }
+    workgroupBarrier();
+  }
+  let inverse_rms = inverseSqrt(norm_partials[0] / 128.0f + 0.000001f);
+  let index = value_head * 128u + value_lane;
+  output_values[index] = head_output * inverse_rms *
+    norm_weight_values[value_lane] * silu(z_values[index]);
 }`;
 
 function definition(
@@ -509,6 +562,11 @@ export const QWEN35_HYBRID_KERNELS: readonly KernelDefinition[] =
       "fp32-recurrent-state",
       DELTANET_GATED_NORM_WGSL,
     ),
+    definition(
+      "deltanet-recurrent-gated-norm",
+      "fp32-recurrent-state",
+      DELTANET_RECURRENT_GATED_NORM_WGSL,
+    ),
   ]);
 
 export function planQwen35FullAttentionKvWrite(
@@ -548,7 +606,8 @@ export type Qwen35HybridOperation =
   | "deltanet-conv"
   | "deltanet-parameters"
   | "deltanet-recurrent"
-  | "deltanet-gated-norm";
+  | "deltanet-gated-norm"
+  | "deltanet-recurrent-gated-norm";
 
 export interface Qwen35HybridDispatchPlan {
   readonly operation: Qwen35HybridOperation;
@@ -620,6 +679,7 @@ export function planQwen35HybridDispatch(input: {
     "deltanet-parameters": 1,
     "deltanet-recurrent": 32,
     "deltanet-gated-norm": 32,
+    "deltanet-recurrent-gated-norm": 32,
   };
   const workgroupCount = workgroupCounts[input.operation];
   if (workgroupCount === undefined) {

@@ -85,6 +85,7 @@ const limits = {
   maxStorageBufferBindingSize: 1 << 30,
   maxUniformBufferBindingSize: 65_536,
   maxComputeWorkgroupsPerDimension: 65_535,
+  supportsSubgroups: true,
 } as const;
 
 function tensor(input: {
@@ -119,6 +120,34 @@ function tensor(input: {
   });
 }
 
+function fusedQ6Tensor(splits: readonly number[]): Qwen35TensorWeightView {
+  const rowBytes = 2_560;
+  let firstRow = 0;
+  let tensorByteOffset = 0;
+  return Object.freeze({
+    name: "token_embd.weight",
+    shape: Object.freeze([2_560, 248_320]),
+    ggmlType: GgmlType.Q6_K,
+    storageType: "q6-k-fused-f32-256",
+    rowBytes,
+    rowCount: 248_320,
+    logicalBytes: BigInt(rowBytes) * 248_320n,
+    physicalRows: Object.freeze(splits.map((rowCount) => {
+      const view = Object.freeze({
+        buffer: {},
+        firstRow,
+        rowCount,
+        tensorByteOffset,
+        bufferByteOffset: 0,
+        byteLength: rowCount * rowBytes,
+      });
+      firstRow += rowCount;
+      tensorByteOffset += rowCount * rowBytes;
+      return view;
+    })),
+  });
+}
+
 function directory(weight: Qwen35TensorWeightView): Qwen35WeightDirectoryView {
   const byName = new Map([[weight.name, weight]] as const);
   return Object.freeze({
@@ -133,9 +162,10 @@ function directory(weight: Qwen35TensorWeightView): Qwen35WeightDirectoryView {
 }
 
 const RESOURCE_SPECS = {
+  "packed-gemv-input-f16": ["f16", 9_216, 0x0088],
   "logits-tile": ["f32", 1_024, 0x0088],
-  "top-k-scores": ["f32", 256, 0x0088],
-  "top-k-indices": ["u32", 256, 0x0088],
+  "top-k-scores": ["f32", 2_048, 0x0088],
+  "top-k-indices": ["u32", 2_048, 0x0088],
   "selected-token": ["u32", 1, 0x008c],
 } as const;
 
@@ -147,7 +177,7 @@ function workspace(overrides: Partial<Record<
   for (const [kind, [scalarType, elementCount, usage]] of Object.entries(
     RESOURCE_SPECS,
   ) as [keyof typeof RESOURCE_SPECS, (typeof RESOURCE_SPECS)[keyof typeof RESOURCE_SPECS]][]) {
-    const byteLength = elementCount * 4;
+    const byteLength = elementCount * (scalarType === "f16" ? 2 : 4);
     resources.set(kind, Object.freeze({
       kind,
       scalarType,
@@ -254,6 +284,55 @@ test("exposes the exact uniform count without caller-owned uniform buffers", () 
   }), 487);
 });
 
+test("fuses resident Q6 vocabulary scoring by physical buffer", () => {
+  const splits = [60_000, 60_000, 60_000, 68_320] as const;
+  const weights = directory(fusedQ6Tensor(splits));
+  assert.equal(planQwen35TiledLogitsUniformCount({ weights, limits }), 5);
+
+  const result = assembleQwen35TiledLogitsCommands({
+    weights,
+    normalizedHidden: { buffer: {}, offset: 0, byteLength: 10_240 },
+    workspace: workspace(),
+    limits,
+    uniforms: Array.from({ length: 5 }, (_, index) => ({
+      buffer: {},
+      offset: index * 256,
+      byteLength: 32,
+    })),
+  });
+
+  assert.equal(result.commands.length, 6);
+  assert.equal(result.candidateCount, 1_939);
+  assert.deepEqual(result.commands.map(({ kind, workgroups, uniformWords }) => ({
+    kind,
+    workgroups,
+    uniformWords,
+  })), [
+    { kind: "pack-logits-activation", workgroups: { x: 5, y: 1, z: 1 }, uniformWords: [] },
+    { kind: "fused-logits-top-1", workgroups: { x: 469, y: 1, z: 1 }, uniformWords: [60_000, 2_560, 10, 0, 0, 0] },
+    { kind: "fused-logits-top-1", workgroups: { x: 469, y: 1, z: 1 }, uniformWords: [60_000, 2_560, 10, 0, 60_000, 469] },
+    { kind: "fused-logits-top-1", workgroups: { x: 469, y: 1, z: 1 }, uniformWords: [60_000, 2_560, 10, 0, 120_000, 938] },
+    { kind: "fused-logits-top-1", workgroups: { x: 532, y: 1, z: 1 }, uniformWords: [68_070, 2_560, 10, 0, 180_000, 1_407] },
+    { kind: "indexed-top-1", workgroups: { x: 1, y: 1, z: 1 }, uniformWords: [1_939, 0, 0, 0] },
+  ]);
+  assert.match(result.commands[0]!.kernel.source, /pack2x16float/);
+  assert.match(result.commands[1]!.kernel.source, /enable subgroups/);
+  assert.match(result.commands[1]!.kernel.source, /@workgroup_size\(256\)/);
+  assert.match(result.commands[1]!.kernel.source, /var row_sums: array<f32, 16>/);
+  assert.match(result.commands[1]!.kernel.source, /subgroupAdd\(row_sums\[slot\]\)/);
+  assert.equal(result.commands.some(({ kind }) => kind === "logits-gemv-piece"), false);
+  assert.equal(result.commands.some(({ kind }) => kind === "logits-tile-top-1"), false);
+});
+
+test("uses exact tiled resident Q6 scoring when subgroups are unavailable", () => {
+  const weights = directory(fusedQ6Tensor([248_320]));
+  const portableLimits = { ...limits, supportsSubgroups: false } as const;
+  assert.equal(
+    planQwen35TiledLogitsUniformCount({ weights, limits: portableLimits }),
+    487,
+  );
+});
+
 test("assembles one staged Q6_K logits tile with score and token readback", async () => {
   const subject = await stagedLogitsSubject();
   assert.equal(
@@ -267,13 +346,13 @@ test("assembles one staged Q6_K logits tile with score and token readback", asyn
   const result = subject.assembleQwen35StagedLogitsTileCommands({
     tile: {
       tensorName: "token_embd.weight",
-      storageType: "q6-k-212",
+      storageType: "q6-k-fused-f32-256",
       firstRow: 247_808,
       rowCount: 262,
-      rowBytes: 2_120,
+      rowBytes: 2_560,
       buffer: packedTile,
       bufferOffset: 0,
-      byteLength: 2_120 * 262,
+      byteLength: 2_560 * 262,
     },
     normalizedHidden: { buffer: {}, offset: 0, byteLength: 10_240 },
     workspace: logitsWorkspace,
@@ -304,7 +383,7 @@ test("assembles one staged Q6_K logits tile with score and token readback", asyn
     kind: "storage",
     buffer: packedTile,
     offset: 0,
-    size: 2_120 * 262,
+    size: 2_560 * 262,
   });
   assert.deepEqual(result.candidateScoreReadback, {
     buffer: candidateOutput,
@@ -327,13 +406,13 @@ test("assembles staged logits into GPU candidate slots without per-tile readback
   const result = subject.assembleQwen35StagedLogitsTileGpuCommands({
     tile: {
       tensorName: "token_embd.weight",
-      storageType: "q6-k-212",
+      storageType: "q6-k-fused-f32-256",
       firstRow: 247_808,
       rowCount: 262,
-      rowBytes: 2_120,
+      rowBytes: 2_560,
       buffer: packedTile,
       bufferOffset: 0,
-      byteLength: 2_120 * 262,
+      byteLength: 2_560 * 262,
     },
     normalizedHidden: { buffer: {}, offset: 0, byteLength: 10_240 },
     workspace: workspace(),
@@ -434,10 +513,10 @@ test("rejects workspace drift and cross-resource write aliases", () => {
       ...base,
       workspace: workspace({
         "top-k-scores": {
-          binding: Object.freeze({ buffer: shared, offset: 0, size: 1_024 }),
+          binding: Object.freeze({ buffer: shared, offset: 0, size: 8_192 }),
         },
         "top-k-indices": {
-          binding: Object.freeze({ buffer: shared, offset: 0, size: 1_024 }),
+          binding: Object.freeze({ buffer: shared, offset: 0, size: 8_192 }),
         },
       }),
     }),
@@ -451,7 +530,7 @@ test("rejects workspace drift and cross-resource write aliases", () => {
       normalizedHidden: { buffer: hiddenBuffer, offset: 0, byteLength: 10_240 },
       workspace: workspace({
         "top-k-scores": {
-          binding: Object.freeze({ buffer: hiddenBuffer, offset: 0, size: 1_024 }),
+          binding: Object.freeze({ buffer: hiddenBuffer, offset: 0, size: 8_192 }),
         },
       }),
     }),
@@ -471,7 +550,7 @@ test("rejects workspace drift and cross-resource write aliases", () => {
           binding: Object.freeze({
             buffer: sharedWeightWorkspace,
             offset: 0,
-            size: 1_024,
+            size: 8_192,
           }),
         },
       }),

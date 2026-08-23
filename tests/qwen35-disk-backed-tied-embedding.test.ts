@@ -28,11 +28,14 @@ import {
 } from "../src/qwen35-weight-upload.js";
 
 const SUBJECT_PATH = "../src/qwen35-disk-backed-tied-embedding.js";
-const ROW_BYTES = 2_120;
+const ROW_BYTES = 2_560;
 const INPUT_CACHE_ROWS = 2;
 const OUTPUT_TILE_ROWS = 2;
-const CACHE_BYTES = ROW_BYTES * (INPUT_CACHE_ROWS + OUTPUT_TILE_ROWS * 2);
-const EXACT_TIED_BYTES = 526_438_400n;
+const OUTPUT_TILE_BUFFER_COUNT = 4;
+const CACHE_BYTES = ROW_BYTES * (
+  INPUT_CACHE_ROWS + OUTPUT_TILE_ROWS * OUTPUT_TILE_BUFFER_COUNT
+);
+const EXACT_TIED_BYTES = 635_699_200n;
 
 interface PackedRangeRead {
   readonly storagePath: string;
@@ -161,11 +164,11 @@ function exactPackageDirectory(): Qwen35PackageDirectory {
     134_213_248,
     134_213_184,
     134_217_632,
-    134_215_776,
-    134_217_200,
-    134_217_200,
-    134_217_200,
-    5_244_880,
+    158_818_816,
+    162_073_600,
+    162_073_600,
+    162_073_600,
+    6_333_440,
   ];
   let packageOffset = 0;
   const shards = shardLengths.map((length, index) => {
@@ -199,37 +202,37 @@ function exactPackageDirectory(): Qwen35PackageDirectory {
         name: "token_embd.weight",
         shape: [2_560, 248_320],
         ggmlType: 14,
-        storageType: "q6-k-212",
+        storageType: "q6-k-fused-f32-256",
         segments: [
           {
             shardIndex: 15,
             shardOffset: "15673856",
             tensorOffset: "0",
-            length: "118541920",
+            length: "143144960",
           },
           {
             shardIndex: 16,
             shardOffset: "0",
-            tensorOffset: "118541920",
-            length: "134217200",
+            tensorOffset: "143144960",
+            length: "162073600",
           },
           {
             shardIndex: 17,
             shardOffset: "0",
-            tensorOffset: "252759120",
-            length: "134217200",
+            tensorOffset: "305218560",
+            length: "162073600",
           },
           {
             shardIndex: 18,
             shardOffset: "0",
-            tensorOffset: "386976320",
-            length: "134217200",
+            tensorOffset: "467292160",
+            length: "162073600",
           },
           {
             shardIndex: 19,
             shardOffset: "0",
-            tensorOffset: "521193520",
-            length: "5244880",
+            tensorOffset: "629365760",
+            length: "6333440",
           },
         ],
       },
@@ -273,7 +276,7 @@ function smallFixture(): SmallFixture {
           name: "token_embd.weight",
           shape: [2_560, scores.length],
           ggmlType: 14,
-          storageType: "q6-k-212",
+          storageType: "q6-k-fused-f32-256",
           segments: [
             { shardIndex: 0, shardOffset: "0", tensorOffset: "0", length: String(first.byteLength) },
             { shardIndex: 1, shardOffset: "0", tensorOffset: String(first.byteLength), length: String(second.byteLength) },
@@ -369,11 +372,13 @@ function gpuFixture(options: { readonly failAllocation?: number } = {}): {
   readonly requests: GpuAllocationRequest[];
   readonly buffers: MemoryGpuBuffer[];
   readonly events: string[];
+  readonly writeSources: ArrayBufferView<ArrayBuffer>[];
 } {
   const ledger = new AllocationLedger(64n * 1024n * 1024n);
   const requests: GpuAllocationRequest[] = [];
   const buffers: MemoryGpuBuffer[] = [];
   const events: string[] = [];
+  const writeSources: ArrayBufferView<ArrayBuffer>[] = [];
   let allocation = 0;
   const arena = new GpuArena({
     limits: {
@@ -394,6 +399,7 @@ function gpuFixture(options: { readonly failAllocation?: number } = {}): {
   }, ledger, { bufferShardCapBytes: 64n * 1024n * 1024n });
   const queue: Qwen35WeightWriteQueue = {
     writeBuffer(buffer, bufferOffset, data, dataOffset = 0, size) {
+      writeSources.push(data);
       const byteLength = size ?? data.byteLength - dataOffset;
       (buffer as MemoryGpuBuffer).bytes.set(
         new Uint8Array(data.buffer, data.byteOffset + dataOffset, byteLength),
@@ -410,7 +416,7 @@ function gpuFixture(options: { readonly failAllocation?: number } = {}): {
     requests.push(request);
     return originalAllocate(request);
   };
-  return { ledger, arena, queue, requests, buffers, events };
+  return { ledger, arena, queue, requests, buffers, events, writeSources };
 }
 
 function rangeReader(
@@ -456,6 +462,7 @@ async function createStore(input: {
   readonly gpu?: ReturnType<typeof gpuFixture>;
   readonly reader?: PackedRangeReader;
   readonly reads?: Array<Omit<PackedRangeRead, "signal">>;
+  readonly outputTileRows?: number;
 } = {}): Promise<{
   readonly store: DiskBackedTiedEmbeddingStore;
   readonly fixture: SmallFixture;
@@ -473,7 +480,7 @@ async function createStore(input: {
     cached: fixture.cached,
     rangeReader: input.reader ?? rangeReader(fixture.bytesByPath, reads),
     inputRowCapacity: INPUT_CACHE_ROWS,
-    outputTileRows: OUTPUT_TILE_ROWS,
+    outputTileRows: input.outputTileRows ?? OUTPUT_TILE_ROWS,
     decodableRows: 6,
   });
   return { store, fixture, gpu, reads };
@@ -512,7 +519,7 @@ test("partitions the exact five-segment tied tensor out of permanent GPU residen
   const plan = module.planQwen35TiedEmbeddingResidency(packageDirectory);
 
   assert.equal(plan.tiedTensor.name, "token_embd.weight");
-  assert.equal(plan.tiedTensor.storageType, "q6-k-212");
+  assert.equal(plan.tiedTensor.storageType, "q6-k-fused-f32-256");
   assert.equal(plan.tiedTensor.segments.length, 5);
   assert.equal(
     plan.tiedTensor.segments.reduce((sum, segment) => sum + BigInt(segment.length), 0n),
@@ -665,8 +672,8 @@ test("matches full-resident stable greedy and top-k while reading bounded output
   await store.dispose();
 });
 
-test("keeps streamed tile winners on GPU until one final selection", async () => {
-  const { store, gpu } = await createStore();
+test("keeps four streamed tile winners on GPU until a buffer must be reused", async () => {
+  const { store, gpu } = await createStore({ outputTileRows: 1 });
   const slots: number[] = [];
   const flushes: number[] = [];
   const selected = await store.selectTopKGpu({
@@ -684,8 +691,8 @@ test("keeps streamed tile winners on GPU until one final selection", async () =>
   });
 
   assert.equal(selected, 4);
-  assert.deepEqual(slots, [0, 1, 2]);
-  assert.deepEqual(flushes, [2, 3]);
+  assert.deepEqual(slots, [0, 1, 2, 3, 4, 5]);
+  assert.deepEqual(flushes, [4, 6]);
   assert.equal(gpu.events.filter((event) => event === "retire").length, 2);
   await store.dispose();
 });
@@ -720,11 +727,35 @@ test("uses one immutable tied source for input rows and output tiles", async () 
   });
 
   assert.equal(store.tensor.name, "token_embd.weight");
-  assert.equal(store.tensor.storageType, "q6-k-212");
+  assert.equal(store.tensor.storageType, "q6-k-fused-f32-256");
   assert.equal(store.permanentGpuBytes, 0n);
   assert.equal(store.cacheGpuBytes, BigInt(CACHE_BYTES));
   assert.deepEqual(packedInput, fixture.tensorBytes.subarray(ROW_BYTES * 4, ROW_BYTES * 5));
   assert.deepEqual(outputRow, packedInput);
+  await store.dispose();
+});
+
+test("uploads a single-segment tied range without copying it into another CPU array", async () => {
+  const fixture = alignedSmallFixture();
+  const gpu = gpuFixture();
+  const returned: Uint8Array<ArrayBuffer>[] = [];
+  const reader: PackedRangeReader = {
+    async read(input) {
+      const source = fixture.bytesByPath[input.storagePath]!;
+      const bytes = source.slice(input.offset, input.offset + input.byteLength);
+      returned.push(bytes);
+      return bytes;
+    },
+  };
+  const { store } = await createStore({ fixture, gpu, reader, outputTileRows: 2 });
+
+  await store.stageInputRow({
+    tokenId: 0,
+    phase: "decode",
+    signal: new AbortController().signal,
+  });
+
+  assert.equal(gpu.writeSources[0], returned[0]);
   await store.dispose();
 });
 
@@ -780,7 +811,7 @@ test("dispose retires queue work, releases ledger ownership, and is idempotent",
   assert.equal(gpu.ledger.snapshot().peakBytes, BigInt(CACHE_BYTES));
   assert.equal(
     gpu.events.filter((event) => event === "destroy").length,
-    1 + 2,
+    1 + OUTPUT_TILE_BUFFER_COUNT,
   );
   assert.notEqual(gpu.events.lastIndexOf("retire"), -1);
   assert.ok(gpu.events.lastIndexOf("retire") < gpu.events.indexOf("destroy"));
@@ -794,6 +825,51 @@ test("dispose retires queue work, releases ledger ownership, and is idempotent",
     }),
     { code: "tied-embedding-disposed" },
   );
+});
+
+test("poisons the tied store after queue retirement fails", async () => {
+  const fixture = smallFixture();
+  const gpu = gpuFixture();
+  const queue: Qwen35WeightWriteQueue = {
+    writeBuffer: (...args) => gpu.queue.writeBuffer(...args),
+    async onSubmittedWorkDone() {
+      throw new Error("private queue retirement detail");
+    },
+  };
+  const module = await subject();
+  const store = await module.createQwen35DiskBackedTiedEmbeddingStore({
+    arena: gpu.arena,
+    queue,
+    packageDirectory: fixture.packageDirectory,
+    cached: fixture.cached,
+    rangeReader: rangeReader(fixture.bytesByPath, []),
+    inputRowCapacity: INPUT_CACHE_ROWS,
+    outputTileRows: OUTPUT_TILE_ROWS,
+    decodableRows: 6,
+  });
+
+  await store.stageInputRow({
+    tokenId: 0,
+    phase: "decode",
+    signal: new AbortController().signal,
+  });
+  await store.stageInputRow({
+    tokenId: 1,
+    phase: "decode",
+    signal: new AbortController().signal,
+  });
+  await assert.rejects(store.stageInputRow({
+    tokenId: 2,
+    phase: "decode",
+    signal: new AbortController().signal,
+  }), { code: "tied-embedding-queue-retirement-failed" });
+  await assert.rejects(store.stageInputRow({
+    tokenId: 3,
+    phase: "decode",
+    signal: new AbortController().signal,
+  }), { code: "tied-embedding-disposed" });
+  await assert.rejects(store.dispose(), { code: "tied-embedding-cleanup-failed" });
+  assert.equal(gpu.ledger.snapshot().currentBytes, 0n);
 });
 
 test("allocation rollback releases the first cache buffer when the second allocation fails", async () => {

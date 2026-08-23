@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { AllocationLedger } from "../src/allocation-ledger.js";
+import { diagnosticError } from "../src/diagnostics.js";
 import {
   GpuArena,
   type GpuBufferLike,
@@ -37,13 +38,13 @@ const SUBJECT_PATH = "../src/qwen35-rolling-layer-weights.js";
 const STREAMED_LAYER_ORDER = Object.freeze(
   Array.from({ length: 32 }, (_, layer) => layer),
 );
-const EXACT_STREAMED_BYTES = 2_028_898_304n;
+const EXACT_STREAMED_BYTES = 2_408_433_664n;
 const EXACT_PERMANENT_BYTES = 10_240n;
-const EXACT_MAX_LAYER_BYTES = 68_473_600n;
-const EXACT_LANGUAGE_BYTES = 2_028_908_544n;
-const EXACT_TIED_CACHE_BYTES = 2_306_560n;
+const EXACT_MAX_LAYER_BYTES = 94_851_840n;
+const EXACT_LANGUAGE_BYTES = 2_408_443_904n;
+const EXACT_TIED_CACHE_BYTES = 2_785_280n;
 const EXACT_CANDIDATE_SCRATCH_BYTES = 8n;
-const EXACT_FULL_16K_LEDGER_BYTES = 661_392_908n;
+const EXACT_FULL_16K_LEDGER_BYTES = 688_282_636n;
 
 interface RollingLayerResidency {
   readonly layer: number;
@@ -98,6 +99,7 @@ interface LayerInvocation {
 interface SubjectModule {
   planQwen35RollingLayerResidency(
     packageDirectory: Qwen35PackageDirectory,
+    streamedLayers?: readonly number[],
   ): RollingLayerResidencyPlan;
   createQwen35RollingLayerStore(input: {
     readonly arena: GpuArena;
@@ -118,6 +120,7 @@ interface SubjectModule {
       readonly invocation: LayerInvocation;
       readonly weights: Qwen35WeightDirectoryView;
       readonly mutation: RollingLayerMutation;
+      readonly transientWeights: boolean;
     }) => Promise<void> | void;
     readonly poison: () => void;
   }): Promise<void>;
@@ -162,23 +165,23 @@ async function subject(): Promise<SubjectModule> {
 }
 
 const LAYER_BYTES = Object.freeze([
-  68_473_600, 68_473_600, 68_473_600, 63_100_928,
-  61_264_640, 61_264_640, 68_473_600, 54_908_928,
-  61_264_640, 61_264_640, 68_473_600, 54_908_928,
-  61_264_640, 61_264_640, 68_473_600, 63_100_928,
-  61_264_640, 61_264_640, 68_473_600, 54_908_928,
-  61_264_640, 61_264_640, 68_473_600, 54_908_928,
-  61_264_640, 61_264_640, 68_473_600, 63_100_928,
-  68_473_600, 68_473_600, 68_473_600, 63_100_928,
+  79_368_960, 79_368_960, 79_368_960, 72_726_528,
+  73_634_560, 73_634_560, 79_368_960, 66_500_608,
+  73_634_560, 73_634_560, 79_368_960, 66_500_608,
+  73_634_560, 73_634_560, 79_368_960, 72_726_528,
+  73_634_560, 73_634_560, 79_368_960, 66_500_608,
+  73_634_560, 73_634_560, 79_368_960, 66_500_608,
+  73_634_560, 73_634_560, 79_368_960, 72_726_528,
+  79_368_960, 79_368_960, 79_368_960, 72_726_528,
 ]);
 
 const DELTA_LAYER_ZERO_TENSORS = Object.freeze([
-  ["attn_gate.weight", 4_587_520, "q3-k-112", 11, [2_560, 4_096]],
+  ["attn_gate.weight", 7_864_320, "q3-k-fused-f32-192", 11, [2_560, 4_096]],
   ["attn_norm.weight", 10_240, "f32", 0, [2_560]],
-  ["attn_qkv.weight", 14_417_920, "q5-k-176", 13, [2_560, 8_192]],
-  ["ffn_down.weight", 16_220_160, "q5-k-176", 13, [9_216, 2_560]],
-  ["ffn_gate.weight", 10_321_920, "q3-k-112", 11, [2_560, 9_216]],
-  ["ffn_up.weight", 10_321_920, "q3-k-112", 11, [2_560, 9_216]],
+  ["attn_qkv.weight", 18_350_080, "q5-k-fused-f32-224", 13, [2_560, 8_192]],
+  ["ffn_down.weight", 20_643_840, "q5-k-fused-f32-224", 13, [9_216, 2_560]],
+  ["ffn_gate.weight", 17_694_720, "q3-k-fused-f32-192", 11, [2_560, 9_216]],
+  ["ffn_up.weight", 17_694_720, "q3-k-fused-f32-192", 11, [2_560, 9_216]],
   ["post_attention_norm.weight", 10_240, "f32", 0, [2_560]],
   ["ssm_a", 128, "f32", 0, [32]],
   ["ssm_alpha.weight", 327_680, "f32", 0, [2_560, 32]],
@@ -474,15 +477,43 @@ test("plans every transformer layer for streaming with only the output norm perm
   );
 });
 
+test("keeps a leading layer subset resident while streaming only the requested suffix", async () => {
+  const module = await subject();
+  const source = exactLanguageDirectory();
+  const streamedLayers = STREAMED_LAYER_ORDER.slice(24);
+
+  const plan = module.planQwen35RollingLayerResidency(source, streamedLayers);
+
+  const expectedStreamedBytes = LAYER_BYTES
+    .slice(24)
+    .reduce((sum, bytes) => sum + BigInt(bytes), 0n);
+  assert.deepEqual(plan.streamedLayers, streamedLayers);
+  assert.deepEqual(plan.layers.map(({ layer }) => layer), streamedLayers);
+  assert.equal(plan.streamedBytes, expectedStreamedBytes);
+  assert.equal(plan.permanentBytes, EXACT_LANGUAGE_BYTES - expectedStreamedBytes);
+  assert.equal(
+    qwen35AllocatedWeightBytes(source, "hybrid", 24),
+    EXACT_LANGUAGE_BYTES - expectedStreamedBytes,
+  );
+  assert.equal(
+    plan.permanentDirectory.tensors.some(({ name }) => name.startsWith("blk.23.")),
+    true,
+  );
+  assert.equal(
+    plan.permanentDirectory.tensors.some(({ name }) => name.startsWith("blk.24.")),
+    false,
+  );
+});
+
 test("composes all-layer streaming after the tied Q6_K table and preserves 16K vision contracts", async () => {
   const module = await subject();
   const language = exactLanguageDirectory();
-  const tiedBytes = 526_438_400;
+  const tiedBytes = 635_699_200;
   const tied: Qwen35PackageTensor = {
     name: "token_embd.weight",
     shape: [2_560, 248_320],
     ggmlType: 14,
-    storageType: "q6-k-212",
+    storageType: "q6-k-fused-f32-256",
     segments: [{
       shardIndex: language.shards.length,
       shardOffset: "0",
@@ -506,8 +537,8 @@ test("composes all-layer streaming after the tied Q6_K table and preserves 16K v
     tiedPlan.permanentDirectory,
   );
 
-  assert.equal(tiedPlan.streamedBytes, 526_438_400n);
-  assert.equal(tiedPlan.tiedTensor.storageType, "q6-k-212");
+  assert.equal(tiedPlan.streamedBytes, 635_699_200n);
+  assert.equal(tiedPlan.tiedTensor.storageType, "q6-k-fused-f32-256");
   assert.equal(tiedPlan.tiedTensor.ggmlType, 14);
   assert.equal(rollingPlan.streamedBytes, EXACT_STREAMED_BYTES);
   assert.equal(rollingPlan.permanentBytes, EXACT_PERMANENT_BYTES);
@@ -515,6 +546,14 @@ test("composes all-layer streaming after the tied Q6_K table and preserves 16K v
   assert.equal(
     qwen35AllocatedWeightBytes(packageDirectory, "resident"),
     EXACT_LANGUAGE_BYTES + BigInt(tiedBytes),
+  );
+  const hybridStreamedBytes = LAYER_BYTES
+    .slice(24)
+    .reduce((sum, bytes) => sum + BigInt(bytes), 0n);
+  assert.equal(
+    qwen35AllocatedWeightBytes(packageDirectory, "hybrid", 24),
+    EXACT_LANGUAGE_BYTES - hybridStreamedBytes + BigInt(tiedBytes),
+    "hybrid residency must keep the tied output table on the GPU",
   );
   assert.deepEqual(
     rollingPlan.permanentDirectory.tensors.map(({ name }) => name),
@@ -529,9 +568,9 @@ test("composes all-layer streaming after the tied Q6_K table and preserves 16K v
   const hybridStateBytes = planQwen35HybridState(QWEN35_PRODUCT_CONTEXT_CAP).totalBytes;
   const workspaceBytes = planQwen35ActivationWorkspace().totalBytes;
   assert.equal(hybridStateBytes, 590_348_288n);
-  assert.equal(workspaceBytes, 254_212n);
+  assert.equal(workspaceBytes, 286_980n);
   assert.equal(
-    2_120n * BigInt(64 + 1_024),
+    2_560n * BigInt(64 + 1_024),
     EXACT_TIED_CACHE_BYTES,
     "64 input rows plus one 1,024-row Q6_K output tile stay bounded",
   );
@@ -625,7 +664,39 @@ test("resident policy keeps transformer layers in the uploaded directory", async
   assert.equal(gpu.ledger.snapshot().currentBytes, 0n);
 });
 
-test("uses bounded authenticated reads and retires before execute and destroy", async () => {
+test("hybrid policy keeps the requested leading layers resident and streams the suffix", async () => {
+  const fixture = smallDirectory();
+  const gpu = gpuFixture();
+  let callbackDirectory: Qwen35WeightDirectoryView | undefined;
+  let callbackStore: RollingLayerStore | undefined;
+  const initialized = await initializeQwen35WeightExecution({
+    arena: gpu.arena,
+    packageDirectory: fixture.packageDirectory,
+    storage: storage(fixture),
+    cached: fixture.cached,
+    queue: gpu.queue,
+    uploadLaneBytes: 8,
+    residencyPolicy: "hybrid",
+    residentLayerCount: 24,
+    signal: new AbortController().signal,
+    async createDriver(directory, rollingStore) {
+      callbackDirectory = directory;
+      callbackStore = rollingStore;
+      return Object.freeze({ ready: true });
+    },
+  });
+
+  assert.equal(callbackDirectory, initialized.directory.view);
+  assert.equal(callbackStore, initialized.rollingStore);
+  assert.deepEqual(initialized.rollingStore?.streamedLayers, STREAMED_LAYER_ORDER.slice(24));
+  assert.equal(initialized.directory.tensors.some(({ name }) => name.startsWith("blk.23.")), true);
+  assert.equal(initialized.directory.tensors.some(({ name }) => name.startsWith("blk.24.")), false);
+  await initialized.rollingStore?.dispose();
+  initialized.directory.destroy();
+  assert.equal(gpu.ledger.snapshot().currentBytes, 0n);
+});
+
+test("uses bounded authenticated reads and retires once before destroy", async () => {
   const module = await subject();
   const fixture = smallDirectory({ exactDeltaTails: true });
   const gpu = gpuFixture();
@@ -668,8 +739,13 @@ test("uses bounded authenticated reads and retires before execute and destroy", 
     .map((event, index) => event.startsWith("destroy:") ? index : -1)
     .filter((index) => index >= 0);
   assert.ok(Math.max(...writes) < execute);
-  assert.ok(retires.some((index) => index > Math.max(...writes) && index < execute));
+  assert.equal(
+    retires.some((index) => index < execute),
+    true,
+    "rolling uploads must retire a full copy window before accepting more bytes",
+  );
   assert.ok(retires.some((index) => index > execute && index < Math.min(...destroys)));
+  assert.ok(retires.length > 1);
   assert.ok(Math.min(...destroys) > execute);
   assert.equal(gpu.live.size, 0);
   assert.equal(gpu.ledger.snapshot().currentBytes, 0n);
@@ -729,6 +805,89 @@ test("uploads a complete single-segment read without a second CPU staging copy",
     reads[0],
     "queue.writeBuffer must receive the bounded OPFS range directly",
   );
+  await store.dispose();
+});
+
+test("paces rolling writes so queued upload bytes stay within the upload lane", async () => {
+  const module = await subject();
+  const fixture = smallDirectory();
+  const gpu = gpuFixture();
+  let outstandingBytes = 0;
+  let maxOutstandingBytes = 0;
+  let retirements = 0;
+  const queue: Qwen35WeightWriteQueue = {
+    writeBuffer(buffer, bufferOffset, data, dataOffset = 0, size = data.byteLength - dataOffset) {
+      gpu.queue.writeBuffer(buffer, bufferOffset, data, dataOffset, size);
+      outstandingBytes += size;
+      maxOutstandingBytes = Math.max(maxOutstandingBytes, outstandingBytes);
+    },
+    async onSubmittedWorkDone() {
+      retirements += 1;
+      outstandingBytes = 0;
+      await gpu.queue.onSubmittedWorkDone();
+    },
+  };
+  const store = await module.createQwen35RollingLayerStore({
+    arena: gpu.arena,
+    queue,
+    packageDirectory: fixture.packageDirectory,
+    cached: fixture.cached,
+    rangeReader: rangeReader(fixture, gpu.events),
+    uploadLaneBytes: 8,
+    readChunkBytes: 64,
+  });
+
+  await store.withLayer({
+    layer: 0,
+    phase: "decode",
+    signal: new AbortController().signal,
+    execute() {},
+  });
+
+  assert.ok(maxOutstandingBytes <= 8);
+  assert.ok(retirements >= 2, "a multi-write layer must retire intermediate upload windows");
+  await store.dispose();
+});
+
+test("allows a wider upload window without increasing authenticated read size", async () => {
+  const module = await subject();
+  const fixture = smallDirectory();
+  const gpu = gpuFixture();
+  let outstandingBytes = 0;
+  let maxOutstandingBytes = 0;
+  let retirements = 0;
+  const queue: Qwen35WeightWriteQueue = {
+    writeBuffer(buffer, bufferOffset, data, dataOffset = 0, size = data.byteLength - dataOffset) {
+      gpu.queue.writeBuffer(buffer, bufferOffset, data, dataOffset, size);
+      outstandingBytes += size;
+      maxOutstandingBytes = Math.max(maxOutstandingBytes, outstandingBytes);
+    },
+    async onSubmittedWorkDone() {
+      retirements += 1;
+      outstandingBytes = 0;
+      await gpu.queue.onSubmittedWorkDone();
+    },
+  };
+  const store = await module.createQwen35RollingLayerStore({
+    arena: gpu.arena,
+    queue,
+    packageDirectory: fixture.packageDirectory,
+    cached: fixture.cached,
+    rangeReader: rangeReader(fixture, gpu.events),
+    uploadLaneBytes: 64 * 1024 * 1024,
+    readChunkBytes: 8,
+  });
+
+  await store.withLayer({
+    layer: 0,
+    phase: "decode",
+    signal: new AbortController().signal,
+    execute() {},
+  });
+
+  assert.equal(store.getMetrics().maxDiskReadBytes, 8);
+  assert.equal(maxOutstandingBytes, 16);
+  assert.equal(retirements, 1, "the two read chunks should share one upload window");
   await store.dispose();
 });
 
@@ -810,6 +969,41 @@ test("streams all 32 layers once in static order through one bounded arena and m
   gpu.ledger.assertAllReleased();
 });
 
+test("marks only the streamed suffix as transient in hybrid execution", async () => {
+  const module = await subject();
+  const fixture = smallDirectory();
+  const gpu = gpuFixture();
+  const streamedLayers = STREAMED_LAYER_ORDER.slice(24);
+  const store = await module.createQwen35RollingLayerStore({
+    arena: gpu.arena,
+    queue: gpu.queue,
+    packageDirectory: fixture.packageDirectory,
+    cached: fixture.cached,
+    rangeReader: rangeReader(fixture, gpu.events),
+    uploadLaneBytes: 64,
+    readChunkBytes: 64,
+    streamedLayers,
+  });
+  const transient: number[] = [];
+  const permanent: number[] = [];
+
+  await module.executeQwen35RollingLayerSequence({
+    invocations: invocations(),
+    permanentWeights: emptyPermanentWeights(),
+    rollingStore: store,
+    phase: "decode",
+    signal: new AbortController().signal,
+    poison: () => assert.fail("valid hybrid execution must not poison state"),
+    execute({ invocation, transientWeights }) {
+      (transientWeights ? transient : permanent).push(invocation.layer);
+    },
+  });
+
+  assert.deepEqual(permanent, STREAMED_LAYER_ORDER.slice(0, 24));
+  assert.deepEqual(transient, streamedLayers);
+  await store.dispose();
+});
+
 test("does not retry after mutation failure and permits cancellation before mutation", async () => {
   const module = await subject();
   const fixture = smallDirectory();
@@ -882,6 +1076,31 @@ test("does not retry after mutation failure and permits cancellation before muta
   });
   assert.equal(cancellable.getMetrics().completedLayers, 1);
   await cancellable.dispose();
+});
+
+test("preserves runtime-owned execution diagnostics without exposing arbitrary errors", async () => {
+  const module = await subject();
+  const fixture = smallDirectory();
+  const gpu = gpuFixture();
+  const store = await module.createQwen35RollingLayerStore({
+    arena: gpu.arena,
+    queue: gpu.queue,
+    packageDirectory: fixture.packageDirectory,
+    cached: fixture.cached,
+    rangeReader: rangeReader(fixture, gpu.events),
+    uploadLaneBytes: 8,
+    readChunkBytes: 8,
+  });
+
+  await assert.rejects(store.withLayer({
+    layer: 0,
+    phase: "decode",
+    signal: new AbortController().signal,
+    execute() {
+      throw diagnosticError("webgpu-compile-portable", "Kernel compilation failed");
+    },
+  }), { code: "webgpu-compile-portable" });
+  await store.dispose();
 });
 
 test("preserves a safe GPU allocation diagnostic from the rolling arena", async () => {
@@ -1045,20 +1264,22 @@ test("poisons the store when accepted upload work cannot retire", async () => {
     packageDirectory: fixture.packageDirectory,
     cached: fixture.cached,
     rangeReader: rangeReader(fixture, gpu.events),
-    uploadLaneBytes: 8,
-    readChunkBytes: 8,
+    uploadLaneBytes: 16,
+    readChunkBytes: 16,
   });
+  let executed = false;
 
   await assert.rejects(store.withLayer({
     layer: 0,
     phase: "decode",
     signal: new AbortController().signal,
-    execute() { assert.fail("unretired upload work must not execute"); },
+    execute() { executed = true; },
   }), (error: unknown) => {
-    assert.equal((error as { readonly code?: unknown }).code, "rolling-layer-upload-failed");
+    assert.equal((error as { readonly code?: unknown }).code, "rolling-layer-retirement-failed");
     assert.doesNotMatch((error as Error).message, /sensitive-queue-marker/);
     return true;
   });
+  assert.equal(executed, true, "queue retirement follows the submitted layer execution");
   assert.equal(
     store.poisoned,
     true,

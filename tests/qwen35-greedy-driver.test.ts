@@ -3,10 +3,14 @@ import test from "node:test";
 
 import {
   createQwen35GreedyTextDriver,
+  createQwen35ResidentLayerBatcher,
   disposeQwen35GreedyOwnedResources,
   ensureQwen35GreedyTokenState,
   executeQwen35GreedyGpuBatch,
   executeQwen35GreedyRollingLayerDispatch,
+  executeQwen35GreedyStagedFinalToken,
+  rollingFullAttentionUniformCount,
+  snapshotQwen35ForwardDeviceLimits,
   uploadQwen35GreedyUniformCommands,
   type Qwen35GreedyTokenEngine,
   type Qwen35GreedyTokenStep,
@@ -71,6 +75,60 @@ async function diskBackedGreedySubject(): Promise<DiskBackedGreedySubject> {
 }
 
 const request = Object.freeze({}) as Qwen35DispatchRequest;
+
+test("snapshots non-enumerable WebIDL device limits by name", () => {
+  const values = {
+    minStorageBufferOffsetAlignment: 256,
+    minUniformBufferOffsetAlignment: 256,
+    maxStorageBufferBindingSize: 1_073_741_824,
+    maxUniformBufferBindingSize: 65_536,
+    maxComputeWorkgroupsPerDimension: 65_535,
+  } as const;
+  const prototype = Object.create(null) as Record<string, unknown>;
+  for (const [name, value] of Object.entries(values)) {
+    Object.defineProperty(prototype, name, {
+      configurable: true,
+      enumerable: false,
+      get: () => value,
+    });
+  }
+  const webIdlLimits = Object.create(prototype) as typeof values;
+  assert.deepEqual({ ...webIdlLimits }, {});
+
+  assert.deepEqual(
+    snapshotQwen35ForwardDeviceLimits({
+      limits: webIdlLimits,
+      features: new Set<string>(),
+    }),
+    { ...values, supportsSubgroups: false },
+  );
+
+  assert.equal(snapshotQwen35ForwardDeviceLimits({
+    limits: { ...values, minSubgroupSize: 32, maxSubgroupSize: 32 },
+    features: new Set(["subgroups"]),
+  }).supportsSubgroups, true);
+  assert.equal(snapshotQwen35ForwardDeviceLimits({
+    limits: values,
+    features: new Set(["subgroups"]),
+  }).supportsSubgroups, true);
+  assert.equal(snapshotQwen35ForwardDeviceLimits({
+    limits: { ...values, minSubgroupSize: 16, maxSubgroupSize: 32 },
+    features: new Set(["subgroups"]),
+  }).supportsSubgroups, false);
+});
+
+test("reserves the exact rolling full-attention count for each package ABI", () => {
+  const program = (storageType: string) => ({
+    tensorBindings: new Map([["token_embd.weight", { tensor: { storageType } }]]),
+  }) as never;
+
+  assert.equal(rollingFullAttentionUniformCount(program("q6-k-fused-f32-256")), 75);
+  assert.equal(rollingFullAttentionUniformCount(program("q6-k-212")), 77);
+  assert.throws(
+    () => rollingFullAttentionUniformCount(program("q6-k-unknown")),
+    { code: "greedy-program-invalid" },
+  );
+});
 
 class FakeTokenEngine implements Qwen35GreedyTokenEngine {
   readonly capacity = 16_384;
@@ -264,13 +322,13 @@ test("stages text rows from disk while visual rows bypass the tied store", async
   }> = [];
   const staged: Qwen35StagedPackedRows = Object.freeze({
     tensorName: "token_embd.weight",
-    storageType: "q6-k-212",
+    storageType: "q6-k-fused-f32-256",
     firstRow: 17,
     rowCount: 1,
-    rowBytes: 2_120,
+    rowBytes: 2_560,
     buffer: {},
-    bufferOffset: 2_120,
-    byteLength: 2_120,
+    bufferOffset: 2_560,
+    byteLength: 2_560,
   });
   const tiedEmbedding = {
     async stageInputRow(input: typeof calls[number]) {
@@ -338,13 +396,13 @@ test("selects one tied token through the disk-backed output boundary", async () 
   const signal = new AbortController().signal;
   const tile: Qwen35StagedPackedRows = Object.freeze({
     tensorName: "token_embd.weight",
-    storageType: "q6-k-212",
+    storageType: "q6-k-fused-f32-256",
     firstRow: 40,
     rowCount: 2,
-    rowBytes: 2_120,
+    rowBytes: 2_560,
     buffer: {},
     bufferOffset: 0,
-    byteLength: 4_240,
+    byteLength: 4_480,
   });
   const scorer = async (received: Qwen35StagedPackedRows) => {
     assert.equal(received, tile);
@@ -389,13 +447,13 @@ test("executes a staged logits tile without advancing recurrent state", async ()
   const scoreBits = new Uint32Array(new Float32Array([3.5]).buffer)[0]!;
   const tile: Qwen35StagedPackedRows = {
     tensorName: "token_embd.weight",
-    storageType: "q6-k-212",
+    storageType: "q6-k-fused-f32-256",
     firstRow: 1_024,
     rowCount: 1_024,
-    rowBytes: 2_120,
+    rowBytes: 2_560,
     buffer: {},
     bufferOffset: 0,
-    byteLength: 2_120 * 1_024,
+    byteLength: 2_560 * 1_024,
   };
   const candidates = await subject.executeQwen35GreedyTiedTileScore({
     commands: [command],
@@ -681,7 +739,7 @@ test("dispose aborts active work and is idempotent", async () => {
   );
 });
 
-test("GPU batch submits, retires, advances, then reads only one selected u32", async () => {
+test("GPU batch uses mapped readback as its retirement proof before state advance", async () => {
   const events: string[] = [];
   let poisoned = false;
   const selectedBuffer = {};
@@ -692,7 +750,7 @@ test("GPU batch submits, retires, advances, then reads only one selected u32", a
         assert.deepEqual(commands, [request]);
         events.push("submit");
       },
-      async submittedWorkDone() { events.push("retire"); },
+      async submittedWorkDone() { assert.fail("selected readback already retires queued work"); },
       async readU32(buffer, offset) {
         assert.equal(buffer, selectedBuffer);
         assert.equal(offset, 12);
@@ -717,7 +775,32 @@ test("GPU batch submits, retires, advances, then reads only one selected u32", a
   });
   assert.equal(result, 77);
   assert.equal(poisoned, false);
-  assert.deepEqual(events, ["submit", "retire", "advance", "read-u32"]);
+  assert.deepEqual(events, ["submit", "read-u32", "advance"]);
+});
+
+test("staged final selection combines reduction, copy, and mapped readback", async () => {
+  const events: string[] = [];
+  const selectedBuffer = {};
+  const token = await executeQwen35GreedyStagedFinalToken({
+    commands: [request],
+    executor: {
+      async dispatchBatch() { assert.fail("combined readback must submit the final commands"); },
+      async submittedWorkDone() { assert.fail("mapped readback is the retirement proof"); },
+      async readU32() { assert.fail("combined readback owns the scalar copy"); },
+      async dispatchBatchAndReadU32(commands, buffer, offset) {
+        assert.deepEqual(commands, [request]);
+        assert.equal(buffer, selectedBuffer);
+        assert.equal(offset, 12);
+        events.push("combined");
+        return 77;
+      },
+    } as never,
+    selectedTokenReadback: { buffer: selectedBuffer, offset: 12 },
+    signal: new AbortController().signal,
+  });
+
+  assert.equal(token, 77);
+  assert.deepEqual(events, ["combined"]);
 });
 
 test("rolling layer dispatch marks persistent mutation before submission and retires", async () => {
@@ -769,7 +852,26 @@ test("rolling layer dispatch marks persistent mutation before submission and ret
   }), (error: unknown) => error instanceof DOMException && error.name === "AbortError");
 });
 
-test("rolling full-attention uploads its 14 used uniforms inside 77 reserved slots", async () => {
+test("submits adjacent resident layers as one GPU batch", async () => {
+  const submissions: readonly Qwen35DispatchRequest[][] = [];
+  const mutable = submissions as Qwen35DispatchRequest[][];
+  const batcher = createQwen35ResidentLayerBatcher({
+    async dispatchBatch(commands) {
+      mutable.push([...commands]);
+    },
+  });
+  const first = Object.freeze({}) as Qwen35DispatchRequest;
+  const second = Object.freeze({}) as Qwen35DispatchRequest;
+
+  batcher.enqueue([first]);
+  batcher.enqueue([second]);
+  await batcher.flush();
+  await batcher.flush();
+
+  assert.deepEqual(submissions, [[first, second]]);
+});
+
+test("rolling full-attention uploads used uniforms inside ABI v2 reserved slots", async () => {
   const subject = await diskBackedGreedySubject();
   assert.equal(
     typeof subject.uploadQwen35GreedyRollingPlanUniforms,
@@ -777,7 +879,7 @@ test("rolling full-attention uploads its 14 used uniforms inside 77 reserved slo
     "rolling uniform capacity must be distinct from actual page usage",
   );
   const buffer = {};
-  const updates: number[][] = Array.from({ length: 77 }, () => []);
+  const updates: number[][] = Array.from({ length: 75 }, () => []);
   const slots = updates.map((values, index) => ({
     binding: { buffer, offset: index * 256, byteLength: 32 },
     update(words: Uint32Array<ArrayBuffer>) { values.push(...words); },
@@ -797,17 +899,17 @@ test("rolling full-attention uploads its 14 used uniforms inside 77 reserved slo
 
   subject.uploadQwen35GreedyRollingPlanUniforms({
     planUniformCount: 14,
-    reservedUniformCount: 77,
+    reservedUniformCount: 75,
     commands,
     slots,
   });
   assert.deepEqual(
     updates.map((words) => words[0] ?? 0),
-    [...Array.from({ length: 14 }, (_, index) => index + 1), ...Array(63).fill(0)],
+    [...Array.from({ length: 14 }, (_, index) => index + 1), ...Array(61).fill(0)],
   );
   assert.throws(() => subject.uploadQwen35GreedyRollingPlanUniforms({
-    planUniformCount: 78,
-    reservedUniformCount: 77,
+    planUniformCount: 76,
+    reservedUniformCount: 75,
     commands,
     slots,
   }), { code: "greedy-uniform-schedule-invalid" });
@@ -883,7 +985,7 @@ test("GPU batch sanitizes every ambiguous post-submit failure and poisons", asyn
           if (failure === "advance") throw new Error(privateMarker);
         },
       },
-      selected: { buffer: {}, offset: 0 },
+      selected: failure === "retire" ? null : { buffer: {}, offset: 0 },
       step: {
         tokenId: 1,
         predict: true,

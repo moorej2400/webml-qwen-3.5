@@ -30,7 +30,7 @@ import {
   type ImmutableArtifactIdentity,
 } from "../src/manifest.js";
 
-const RUNTIME_ABI = "qwen35-webgpu-v1";
+const RUNTIME_ABI = "qwen35-webgpu-v2";
 const DEFAULT_MAX_SHARD_BYTES = 128n * 1024n * 1024n;
 const DEFAULT_TENSOR_ALIGNMENT = 256;
 

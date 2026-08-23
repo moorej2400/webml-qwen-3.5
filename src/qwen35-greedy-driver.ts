@@ -20,10 +20,11 @@ import {
   type Qwen35ForwardBufferSlice,
   type Qwen35ForwardDeviceLimits,
 } from "./qwen35-forward-dispatch.js";
-import type {
-  Qwen35DiskBackedTiedEmbeddingStore,
-  Qwen35LogitCandidate,
-  Qwen35StagedPackedRows,
+import {
+  QWEN35_STAGED_LOGITS_TILE_BUFFER_COUNT,
+  type Qwen35DiskBackedTiedEmbeddingStore,
+  type Qwen35LogitCandidate,
+  type Qwen35StagedPackedRows,
 } from "./qwen35-disk-backed-tied-embedding.js";
 import {
   planQwen35FullAttentionLayerDispatch,
@@ -70,14 +71,41 @@ const DECODABLE_TOKEN_COUNT = 248_070;
 const MASKED_MODEL_ROWS = 250;
 const MAX_UNIFORM_WORDS = 8;
 const STAGED_LOGITS_UNIFORM_COUNT = 2;
-const STAGED_LOGITS_BATCH_SIZE = 2;
+// The shared tied-store capacity makes every batch own a distinct staging
+// buffer. The per-tile Q6_K kernel and candidate record ABI stay unchanged.
+const STAGED_LOGITS_BATCH_SIZE = QWEN35_STAGED_LOGITS_TILE_BUFFER_COUNT;
 const STAGED_LOGITS_TILE_UNIFORM_COUNT =
   STAGED_LOGITS_UNIFORM_COUNT * STAGED_LOGITS_BATCH_SIZE;
 const STAGED_LOGITS_TOTAL_UNIFORM_COUNT =
   STAGED_LOGITS_TILE_UNIFORM_COUNT + STAGED_LOGITS_UNIFORM_COUNT;
 const GPU_STORAGE_AND_COPY_SRC = 0x0080 | 0x0004;
-const ROLLING_DELTANET_UNIFORM_COUNT = 13;
-const ROLLING_FULL_ATTENTION_UNIFORM_COUNT = 77;
+
+export function rollingFullAttentionUniformCount(
+  program: Qwen35Program,
+): 75 | 77 {
+  const tiedLayout = program.tensorBindings.get("token_embd.weight")?.tensor.storageType;
+  // ABI v2 fuses the streamed Q3 gate/up pair into one command. Each command
+  // owns one uniform slot, so reserving the ABI v1 count makes the exact v2
+  // full-attention planner reject the layer before dispatch.
+  if (tiedLayout === "q6-k-fused-f32-256") return 75;
+  if (tiedLayout === "q6-k-212") return 77;
+  throw diagnosticError(
+    "greedy-program-invalid",
+    "Qwen3.5 rolling uniform geometry requires a supported package ABI",
+  );
+}
+
+function rollingDeltaNetUniformCount(program: Qwen35Program): 10 | 12 {
+  const tiedLayout = program.tensorBindings.get("token_embd.weight")?.tensor.storageType;
+  // The package ABI determines the fused projection schedule for every streamed
+  // layer, even when the tied tensor itself is owned outside the rolling store.
+  if (tiedLayout === "q6-k-fused-f32-256") return 10;
+  if (tiedLayout === "q6-k-212") return 12;
+  throw diagnosticError(
+    "greedy-program-invalid",
+    "Qwen3.5 rolling uniform geometry requires a supported package ABI",
+  );
+}
 const PREFILL_CHUNK_SIZE = 4;
 
 type AttentionInvocation = Extract<
@@ -168,8 +196,8 @@ export function planQwen35GreedyUniformGeometry(input: {
     // policy, so its per-tensor allocation contributes one physical GEMV piece.
     const uniformCount = rollingLayers.has(invocation.layer)
       ? invocation.kind === "gated-deltanet"
-        ? ROLLING_DELTANET_UNIFORM_COUNT
-        : ROLLING_FULL_ATTENTION_UNIFORM_COUNT
+        ? rollingDeltaNetUniformCount(input.program)
+        : rollingFullAttentionUniformCount(input.program)
       : invocation.kind === "gated-deltanet"
         ? planQwen35DeltaNetLayerGeometry({
             program: input.program,
@@ -330,11 +358,32 @@ interface Qwen35StagedLogitsBatcher {
   flush(): Promise<void>;
 }
 
+export interface Qwen35ResidentLayerBatcher {
+  enqueue(commands: readonly Qwen35DispatchRequest[]): void;
+  flush(): Promise<void>;
+}
+
+/** Keeps adjacent resident layers in one command encoder and queue submission. */
+export function createQwen35ResidentLayerBatcher(
+  executor: Pick<Qwen35WebGpuExecutor, "dispatchBatch">,
+): Qwen35ResidentLayerBatcher {
+  const pending: Qwen35DispatchRequest[] = [];
+  return Object.freeze({
+    enqueue(commands: readonly Qwen35DispatchRequest[]): void {
+      pending.push(...commands);
+    },
+    async flush(): Promise<void> {
+      if (pending.length === 0) return;
+      await executor.dispatchBatch(Object.freeze(pending.splice(0)));
+    },
+  });
+}
+
 /** Batches tile kernels until the tied store must recycle an output buffer. */
 function createQwen35StagedLogitsBatcher(
   executor: Pick<
     Qwen35WebGpuExecutor,
-    "dispatchBatch" | "releaseBindGroups"
+    "dispatchBatch"
   >,
 ): Qwen35StagedLogitsBatcher {
   const pending: Qwen35DispatchRequest[] = [];
@@ -346,7 +395,6 @@ function createQwen35StagedLogitsBatcher(
       if (pending.length === 0) return;
       const commands = Object.freeze(pending.splice(0));
       await executor.dispatchBatch(commands);
-      executor.releaseBindGroups();
     },
   });
 }
@@ -840,6 +888,10 @@ export function uploadQwen35GreedyUniformCommands(input: {
     slotsByBuffer.set(slot.binding.buffer, byOffset);
   }
   const used = new Set<number>();
+  // The slot copies a successful upload when it needs persistence. Reuse one
+  // staging vector here instead of allocating one short typed array per GPU
+  // command on every generated token.
+  const words = new Uint32Array(MAX_UNIFORM_WORDS);
   for (const command of input.commands) {
     if (command.uniformWords.length === 0) continue;
     const bindings = command.bindings.filter(
@@ -869,7 +921,7 @@ export function uploadQwen35GreedyUniformCommands(input: {
         "A Qwen3.5 command references an invalid uniform slot",
       );
     }
-    const words = new Uint32Array(MAX_UNIFORM_WORDS);
+    words.fill(0);
     words.set(command.uniformWords);
     slot.update(words);
     used.add(slotIndex);
@@ -917,6 +969,11 @@ export function uploadQwen35GreedyRollingPlanUniforms(input: {
 
 export interface Qwen35GreedyGpuBatchExecutor {
   dispatchBatch(requests: readonly Qwen35DispatchRequest[]): Promise<void>;
+  dispatchBatchAndReadU32?(
+    requests: readonly Qwen35DispatchRequest[],
+    source: object,
+    byteOffset: number,
+  ): Promise<number>;
   submittedWorkDone(): Promise<void>;
   readU32(source: object, byteOffset: number): Promise<number>;
 }
@@ -984,26 +1041,45 @@ export async function executeQwen35GreedyGpuBatch(input: {
   let readbackCompleted = false;
   try {
     submissionAttempted = true;
-    await input.executor.dispatchBatch(input.commands);
-    await input.executor.submittedWorkDone();
-    retired = true;
+    let token: number | null = null;
+    if (
+      input.selected !== null &&
+      input.executor.dispatchBatchAndReadU32 !== undefined
+    ) {
+      readbackStarted = true;
+      token = await input.executor.dispatchBatchAndReadU32(
+        input.commands,
+        input.selected.buffer,
+        input.selected.offset,
+      );
+      readbackCompleted = true;
+      retired = true;
+    } else {
+      await input.executor.dispatchBatch(input.commands);
+    }
+    if (input.selected === null) {
+      await input.executor.submittedWorkDone();
+      retired = true;
+    } else if (!retired) {
+      // Mapping the queued scalar copy resolves only after this dispatch and
+      // every earlier queue operation complete. It is therefore the same
+      // ownership proof as a separate submittedWorkDone fence, without the
+      // extra wait-before-copy bubble.
+      readbackStarted = true;
+      token = await input.executor.readU32(
+        input.selected.buffer,
+        input.selected.offset,
+      );
+      readbackCompleted = true;
+      retired = true;
+    }
     input.state.advance(1);
     advanced = true;
     if (input.step.signal.aborted) {
       if (input.step.phase === "generation") input.poison();
       throw abortError();
     }
-    if (input.selected === null) return null;
-    readbackStarted = true;
-    const token = await input.executor.readU32(
-      input.selected.buffer,
-      input.selected.offset,
-    );
-    readbackCompleted = true;
-    if (input.step.signal.aborted) {
-      if (input.step.phase === "generation") input.poison();
-      throw abortError();
-    }
+    if (token === null) return null;
     if (
       token === QWEN35_NO_SELECTED_TOKEN ||
       token < 0 ||
@@ -1119,19 +1195,32 @@ export async function executeQwen35GreedyStagedFinalToken(input: {
     dispatchBatch(commands: readonly Qwen35DispatchRequest[]): Promise<void>;
     submittedWorkDone(): Promise<void>;
     readU32(buffer: object, byteOffset: number): Promise<number>;
+    dispatchBatchAndReadU32?(
+      commands: readonly Qwen35DispatchRequest[],
+      buffer: object,
+      byteOffset: number,
+    ): Promise<number>;
   };
   readonly selectedTokenReadback: { readonly buffer: object; readonly offset: number };
   readonly signal: AbortSignal;
 }): Promise<number> {
   input.signal.throwIfAborted();
   try {
-    await input.executor.dispatchBatch(input.commands);
-    await input.executor.submittedWorkDone();
-    input.signal.throwIfAborted();
-    const tokenId = await input.executor.readU32(
-      input.selectedTokenReadback.buffer,
-      input.selectedTokenReadback.offset,
-    );
+    const tokenId = input.executor.dispatchBatchAndReadU32 === undefined
+      ? await (async () => {
+          await input.executor.dispatchBatch(input.commands);
+          await input.executor.submittedWorkDone();
+          input.signal.throwIfAborted();
+          return input.executor.readU32(
+            input.selectedTokenReadback.buffer,
+            input.selectedTokenReadback.offset,
+          );
+        })()
+      : await input.executor.dispatchBatchAndReadU32(
+          input.commands,
+          input.selectedTokenReadback.buffer,
+          input.selectedTokenReadback.offset,
+        );
     input.signal.throwIfAborted();
     if (
       tokenId === QWEN35_NO_SELECTED_TOKEN ||
@@ -1209,6 +1298,14 @@ function workspaceSlice(
   });
 }
 
+function weightBuffers(weights: Qwen35WeightDirectoryView): readonly object[] {
+  const buffers = new Set<object>();
+  for (const [, tensor] of weights) {
+    for (const row of tensor.physicalRows) buffers.add(row.buffer as object);
+  }
+  return Object.freeze([...buffers]);
+}
+
 function candidateScratchSlice(
   allocation: GpuAllocation,
 ): Qwen35ForwardBufferSlice {
@@ -1277,7 +1374,7 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
     this.#uniformArena = input.uniformArena;
     this.#geometry = input.geometry;
     this.#executor = input.executor;
-    this.#limits = input.device.limits;
+    this.#limits = snapshotQwen35ForwardDeviceLimits(input.device);
     this.#layers = attentionInvocations(input.program);
     this.#final = finalInvocation(input.program);
     this.#tiedEmbedding = input.tiedEmbedding ?? null;
@@ -1369,6 +1466,12 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
     };
 
     try {
+      const residentBatcher = createQwen35ResidentLayerBatcher({
+        dispatchBatch: (commands) => {
+          persistentSubmission = true;
+          return this.#executor.dispatchBatch(commands);
+        },
+      });
       const embeddingCommands: UniformCommand[] = [];
       for (const [index, step] of input.steps.entries()) {
         const workspace = this.#prefillWorkspaces[index];
@@ -1424,29 +1527,16 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
         }));
       }
 
-      let embeddingSubmissionAttempted = false;
-      let embeddingRetired = false;
-      try {
-        input.signal.throwIfAborted();
-        embeddingSubmissionAttempted = true;
-        await this.#executor.dispatchBatch(embeddingCommands);
-        await this.#executor.submittedWorkDone();
-        embeddingRetired = true;
-        input.signal.throwIfAborted();
-        this.#executor.releaseBindGroups();
-      } catch (error) {
-        if (embeddingSubmissionAttempted && !embeddingRetired) {
-          this.#poisoned = true;
-        }
-        throw error;
-      }
+      residentBatcher.enqueue(embeddingCommands);
 
       const executeLayer = async (layerInput: {
         readonly invocation: AttentionInvocation;
         readonly weights: Qwen35WeightDirectoryView;
         readonly mutation: Qwen35RollingLayerMutation;
+        readonly transientWeights?: boolean;
       }): Promise<void> => {
         const { invocation, weights, mutation } = layerInput;
+        const transientWeights = layerInput.transientWeights ?? false;
         const geometry = this.#geometry.layers[invocation.layer];
         if (
           geometry === undefined ||
@@ -1507,23 +1597,25 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
           });
           layerCommands.push(...plan.commands);
         }
-        persistentSubmission = true;
-        if (this.#rollingLayers === null) {
+        if (!transientWeights) {
           mutation.markStateMutation();
-          await this.#executor.dispatchBatch(layerCommands);
-          this.#executor.releaseBindGroups();
+          residentBatcher.enqueue(layerCommands);
           return;
         }
+        await residentBatcher.flush();
+        persistentSubmission = true;
         await executeQwen35GreedyRollingLayerDispatch({
           commands: layerCommands,
           executor: this.#executor,
           mutation,
           signal: input.signal,
-          waitForRetirement: !(
-            this.#rollingLayers?.streamedLayers.includes(invocation.layer) ?? false
-          ),
+          // The rolling owner supplies the only per-layer fence. Permanent
+          // layers remain ordered on the queue and retire with the final batch.
+          waitForRetirement: false,
         });
-        this.#executor.releaseBindGroups();
+        if (transientWeights) {
+          this.#executor.releaseBindGroupsForBuffers(weightBuffers(weights));
+        }
       };
 
       if (this.#rollingLayers === null) {
@@ -1545,6 +1637,7 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
           execute: executeLayer,
         });
       }
+      await residentBatcher.flush();
 
       const lastStep = input.steps.at(-1)!;
       input.signal.throwIfAborted();
@@ -2081,31 +2174,8 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
       slots: [this.#uniformSlots[this.#geometry.embeddingUniform]!],
       expectedSlotCount: 1,
     });
-
-    let embeddingSubmissionAttempted = false;
-    let embeddingRetired = false;
-    try {
-      step.signal.throwIfAborted();
-      embeddingSubmissionAttempted = true;
-      await this.#executor.dispatchBatch([embedding]);
-      await this.#executor.submittedWorkDone();
-      embeddingRetired = true;
-      step.signal.throwIfAborted();
-    } catch (error) {
-      // A retired embedding writes only disposable activation state. An
-      // unretired submission can still own that workspace and must fail closed.
-      if (embeddingSubmissionAttempted && !embeddingRetired) this.#poisoned = true;
-      if (
-        step.signal.aborted ||
-        (error instanceof DOMException && error.name === "AbortError")
-      ) {
-        throw abortError();
-      }
-      throw diagnosticError(
-        "greedy-rolling-embedding-failed",
-        "Qwen3.5 rolling input embedding failed",
-      );
-    }
+    const residentBatcher = createQwen35ResidentLayerBatcher(this.#executor);
+    residentBatcher.enqueue([embedding]);
 
     await executeQwen35RollingLayerSequence({
       invocations: this.#layers,
@@ -2114,7 +2184,7 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
       phase: step.phase === "generation" ? "decode" : "prefill",
       signal: step.signal,
       poison: () => { this.#poisoned = true; },
-      execute: async ({ invocation, weights, mutation }) => {
+      execute: async ({ invocation, weights, mutation, transientWeights }) => {
         const geometry = this.#geometry.layers[invocation.layer];
         if (
           geometry === undefined ||
@@ -2160,20 +2230,29 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
           commands: plan.commands,
           slots,
         });
+        if (!transientWeights) {
+          mutation.markStateMutation();
+          residentBatcher.enqueue(plan.commands);
+          return;
+        }
+        await residentBatcher.flush();
         await executeQwen35GreedyRollingLayerDispatch({
           commands: plan.commands,
           executor: this.#executor,
           mutation,
           signal: step.signal,
-          waitForRetirement: !this.#rollingLayers!.streamedLayers.includes(
-            invocation.layer,
-          ),
+          // The rolling store fences transient buffers before destruction. A
+          // later token fence retires permanent-layer work in queue order.
+          waitForRetirement: false,
         });
-        // Each bind group references this layer's temporary buffers. Release
-        // the cache before the rolling store's single ownership fence.
-        this.#executor.releaseBindGroups();
+        if (transientWeights) {
+          // Temporary layer buffers must not remain strongly held after their
+          // owner destroys them; resident-layer groups remain reusable.
+          this.#executor.releaseBindGroupsForBuffers(weightBuffers(weights));
+        }
       },
     });
+    await residentBatcher.flush();
 
     if (!step.predict) {
       try {
@@ -2418,6 +2497,37 @@ class Qwen35GpuTokenEngine implements Qwen35GreedyTokenEngine {
   }
 }
 
+/**
+ * Copies the limit fields by name because WebIDL objects may expose them as
+ * prototype getters. Object spread drops those fields in Safari and leaves the
+ * execution planner without its required device limits.
+ */
+export function snapshotQwen35ForwardDeviceLimits(
+  device: Pick<Qwen35WebGpuDevice, "limits" | "features">,
+): Qwen35ForwardDeviceLimits {
+  const subgroupFeature = device.features !== undefined &&
+    Array.from(device.features).includes("subgroups");
+  const subgroupLimitsAbsent = device.limits.minSubgroupSize === undefined &&
+    device.limits.maxSubgroupSize === undefined;
+  const subgroupLimitsAre32 = device.limits.minSubgroupSize === 32 &&
+    device.limits.maxSubgroupSize === 32;
+  return Object.freeze({
+    minStorageBufferOffsetAlignment:
+      device.limits.minStorageBufferOffsetAlignment,
+    minUniformBufferOffsetAlignment:
+      device.limits.minUniformBufferOffsetAlignment,
+    maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
+    maxUniformBufferBindingSize: device.limits.maxUniformBufferBindingSize,
+    maxComputeWorkgroupsPerDimension:
+      device.limits.maxComputeWorkgroupsPerDimension,
+    // Current Chrome exposes the subgroup feature but omits the provisional
+    // size-limit fields. Its optimized kernels are covered by the physical GPU
+    // parity harness. If a browser does expose size limits, require SIMD32.
+    supportsSubgroups: subgroupFeature &&
+      (subgroupLimitsAbsent || subgroupLimitsAre32),
+  });
+}
+
 // Kept as one immutable shared object so every layer validates the same ranges.
 const WORKSPACE_LIVENESS = planQwen35ActivationWorkspace().deltanetParameterLiveness;
 
@@ -2425,7 +2535,10 @@ async function createGpuDriver(
   context: Qwen35DriverFactoryContext,
 ): Promise<Qwen35ExecutionDriver> {
   requireRunnableProgram(context.program);
-  const limits = context.device.limits;
+  // Geometry and execution must use the same capability snapshot. Passing the
+  // raw WebIDL limits here made Chrome reserve portable logits uniforms while
+  // the engine selected subgroup kernels from device feature evidence.
+  const limits = snapshotQwen35ForwardDeviceLimits(context.device);
   const geometry = planQwen35GreedyUniformGeometry({
     program: context.program,
     weights: context.weightDirectory,

@@ -143,6 +143,25 @@ test("accepts a caller-owned allocation id for a second live arena", async () =>
   await uniforms.dispose();
 });
 
+test("does not upload a uniform slot when all words are unchanged", async () => {
+  const fake = harness();
+  const uniforms = await createQwen35UniformArena({
+    arena: fake.arena,
+    queue: fake.queue,
+    slotCount: 1,
+    slotWordCapacity: 4,
+    minUniformBufferOffsetAlignment: 256,
+    maxUniformBufferBindingSize: 16,
+  });
+  const slot = uniforms.slot(0, 4);
+  slot.update(Uint32Array.of(1, 2, 3, 4));
+  slot.update(Uint32Array.of(1, 2, 3, 4));
+  assert.equal(fake.writes.length, 1);
+  slot.update(Uint32Array.of(1, 2, 3, 5));
+  assert.equal(fake.writes.length, 2);
+  await uniforms.dispose();
+});
+
 test("rejects invalid plans and sanitizes allocation failure", async () => {
   const fake = harness();
   const base = {

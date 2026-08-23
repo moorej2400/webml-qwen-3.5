@@ -1,5 +1,7 @@
+import { diagnosticError } from "./diagnostics.js";
+
 export const DEFAULT_BUFFER_SHARD_CAP_BYTES = 256 * 1024 * 1024;
-export const DEFAULT_UPLOAD_LANE_BYTES = 32 * 1024 * 1024;
+export const DEFAULT_UPLOAD_LANE_BYTES = 64 * 1024 * 1024;
 
 export type BufferShardPolicy = "default" | "evidence-128" | "evidence-64";
 
@@ -37,6 +39,8 @@ export interface WebGpuProbeSurface {
 
 export interface DeviceProfileOptions {
   readonly requiredFeatures?: readonly string[];
+  /** Supported entries are enabled, but absence never rejects the adapter. */
+  readonly optionalFeatures?: readonly string[];
   readonly requiredLimits?: Readonly<Record<string, number>>;
   readonly bufferShardPolicy?: BufferShardPolicy;
   /** Releases a device when validation after requestDevice fails. */
@@ -136,29 +140,49 @@ export async function probeDeviceProfile(
   options: DeviceProfileOptions = {},
 ): Promise<DeviceProfile> {
   if (surface.gpu === undefined) {
-    throw new Error("WebGPU is unavailable");
+    throw diagnosticError("webgpu-unavailable", "WebGPU is unavailable");
   }
   const adapter = await surface.gpu.requestAdapter();
   if (adapter === null) {
-    throw new Error("WebGPU adapter is unavailable");
+    throw diagnosticError("webgpu-adapter-unavailable", "WebGPU adapter is unavailable");
   }
 
   const availableFeatures = new Set(adapter.features);
   const requiredFeatures = [...(options.requiredFeatures ?? [])];
   for (const feature of requiredFeatures) {
     if (!availableFeatures.has(feature)) {
-      throw new Error("Required WebGPU feature is unavailable");
+      const code = feature === "shader-f16"
+        ? "webgpu-shader-f16-unavailable"
+        : feature === "subgroups"
+          ? "webgpu-subgroups-unavailable"
+          : "webgpu-feature-unavailable";
+      throw diagnosticError(
+        code,
+        "Required WebGPU feature is unavailable",
+      );
     }
   }
+  const requestedFeatures = [...new Set([
+    ...requiredFeatures,
+    ...(options.optionalFeatures ?? []).filter((feature) =>
+      availableFeatures.has(feature)
+    ),
+  ])];
 
   const requiredLimits = { ...(options.requiredLimits ?? {}) };
   for (const [name, required] of Object.entries(requiredLimits)) {
     if (!Number.isSafeInteger(required) || required <= 0) {
-      throw new Error("Required WebGPU limit must be a positive safe integer");
+      throw diagnosticError(
+        "webgpu-limit-invalid",
+        "Required WebGPU limit must be a positive safe integer",
+      );
     }
     const available = requireLimitValue(adapter.limits, name);
     if (!supportsRequiredLimit(available, required, name)) {
-      throw new Error("Required WebGPU limit is unavailable");
+      throw diagnosticError(
+        "webgpu-limit-unavailable",
+        "Required WebGPU limit is unavailable",
+      );
     }
   }
 
@@ -166,8 +190,8 @@ export async function probeDeviceProfile(
     requiredFeatures?: readonly string[];
     requiredLimits?: Readonly<Record<string, number>>;
   } = {};
-  if (requiredFeatures.length > 0) {
-    descriptor.requiredFeatures = requiredFeatures;
+  if (requestedFeatures.length > 0) {
+    descriptor.requiredFeatures = requestedFeatures;
   }
   if (Object.keys(requiredLimits).length > 0) {
     descriptor.requiredLimits = requiredLimits;

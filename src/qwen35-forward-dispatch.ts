@@ -1,4 +1,5 @@
 import { diagnosticError } from "./diagnostics.js";
+import { GgmlType } from "./gguf.js";
 import {
   LANGUAGE_GEMV_KERNELS,
   planGemvDispatch,
@@ -28,6 +29,8 @@ export type Qwen35ForwardDeviceLimits = Readonly<{
   maxStorageBufferBindingSize: number;
   maxUniformBufferBindingSize: number;
   maxComputeWorkgroupsPerDimension: number;
+  /** False selects WGSL that does not require the optional WebGPU feature. */
+  supportsSubgroups?: boolean;
 }>;
 
 export interface Qwen35ForwardBufferSlice {
@@ -54,6 +57,12 @@ export interface Qwen35TiedLogitsDispatchPlan
   readonly completesTile: boolean;
 }
 
+export interface Qwen35FusedTiedLogitsDispatchPlan
+  extends Qwen35ForwardDispatchPlan {
+  readonly candidateStart: number;
+  readonly candidateCount: number;
+}
+
 export interface Qwen35TiedLogitsGeometry {
   readonly modelRows: 248_320;
   readonly decodableRows: 248_070;
@@ -66,12 +75,169 @@ export interface Qwen35TiedLogitsGeometry {
 }
 
 const MAX_LOGITS_TILE_ROWS = 1_024;
+// Resident logits use smaller row ranges than the staged path. This exposes
+// enough independent workgroups to saturate a mobile GPU without expanding
+// the packed vocabulary matrix.
+const FUSED_LOGITS_ROWS_PER_WORKGROUP = 128;
 const QWEN35_HIDDEN_SIZE = 2_560;
 const QWEN35_VOCABULARY_SIZE = 248_320;
 const QWEN35_DECODABLE_LOGIT_ROWS = 248_070;
 const QWEN35_MATHEMATICAL_LOGITS_TILES = 243;
 const QWEN35_FINAL_LOGITS_TILE_ROWS = 262;
 const QWEN35_LOGITS_REDUCTION_DISPATCHES = 244;
+const QWEN35_TOP_K_CANDIDATE_CAPACITY = 2_048;
+
+/**
+ * Resident Q6 logits must not materialize and reduce 243 separate 1K tiles.
+ * One workgroup owns one 128-row range, eight 32-lane subgroups score rows in
+ * parallel, and each physical weight buffer emits only its local winners.
+ */
+const FUSED_Q6_TIED_LOGITS_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "q6-k-fused-f32-256-tied-top1-mobile-f16-subgroup",
+  entryPoint: "main",
+  source: /* wgsl */ `
+enable f16;
+enable subgroups;
+struct Params {
+  local_rows: u32,
+  columns: u32,
+  blocks_per_row: u32,
+  weight_word_offset: u32,
+  first_vocabulary_row: u32,
+  candidate_start: u32,
+}
+@group(0) @binding(0) var<storage, read> packed_weights: array<u32>;
+@group(0) @binding(1) var<storage, read> activation: array<u32>;
+@group(0) @binding(2) var<storage, read_write> candidate_scores: array<f32>;
+@group(0) @binding(3) var<storage, read_write> candidate_token_ids: array<u32>;
+@group(0) @binding(4) var<uniform> params: Params;
+var<workgroup> group_scores: array<f32, 8>;
+var<workgroup> group_tokens: array<u32, 8>;
+var<workgroup> group_found: array<u32, 8>;
+
+fn packed_byte(word_base: u32, byte_offset: u32) -> u32 {
+  let word = packed_weights[word_base + byte_offset / 4u];
+  return (word >> ((byte_offset % 4u) * 8u)) & 255u;
+}
+fn nibbles4(word: u32, shift: u32) -> vec4<f16> {
+  return vec4<f16>(
+    f16((word >> shift) & 15u),
+    f16((word >> (shift + 4u)) & 15u),
+    f16((word >> (shift + 8u)) & 15u),
+    f16((word >> (shift + 12u)) & 15u),
+  );
+}
+fn high4(high: u32, first: u32) -> vec4<f16> {
+  return vec4<f16>(
+    f16((high >> (first * 2u)) & 3u),
+    f16((high >> ((first + 1u) * 2u)) & 3u),
+    f16((high >> ((first + 2u) * 2u)) & 3u),
+    f16((high >> ((first + 3u) * 2u)) & 3u),
+  );
+}
+fn half4(first: u32, second: u32) -> vec4<f16> {
+  let a = unpack2x16float(first);
+  let b = unpack2x16float(second);
+  return vec4<f16>(f16(a.x), f16(a.y), f16(b.x), f16(b.y));
+}
+fn activation4(block: u32, lane: u32, first_group: u32) -> vec4<f16> {
+  let base = block * 128u + (first_group / 2u) * 32u + lane;
+  let first = unpack2x16float(activation[base]);
+  let second = unpack2x16float(activation[base + 32u]);
+  return vec4<f16>(f16(first.x), f16(first.y), f16(second.x), f16(second.y));
+}
+@compute @workgroup_size(256)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(subgroup_invocation_id) lane: u32,
+  @builtin(subgroup_id) subgroup: u32,
+) {
+  let range_start = group.x * 128u;
+  let range_end = min(range_start + 128u, params.local_rows);
+  var found = false;
+  var best_score = 0.0f;
+  var best_token = 0xffffffffu;
+  var row_sums: array<f32, 16>;
+  for (var slot = 0u; slot < 16u; slot += 1u) {
+    row_sums[slot] = 0.0f;
+  }
+  // All eight rows owned by a subgroup use the same activation. Keeping blocks
+  // outside rows avoids decoding and loading that activation eight times.
+  for (var block = 0u; block < params.blocks_per_row; block += 1u) {
+    let activation0 = activation4(block, lane, 0u);
+    let activation1 = activation4(block, lane, 4u);
+    for (var slot = 0u; slot < 16u; slot += 1u) {
+      let row = range_start + subgroup + slot * 8u;
+      if (row >= range_end) { continue; }
+      let row_base = params.weight_word_offset + row * params.blocks_per_row * 64u;
+      let base = row_base + block * 64u;
+      let lows = packed_weights[base + 16u + lane];
+      let high = packed_byte(base, 192u + lane * 2u) |
+        (packed_byte(base, 193u + lane * 2u) << 8u);
+      let q0 = nibbles4(lows, 0u) + high4(high, 0u) * vec4<f16>(16.0h) - vec4<f16>(32.0h);
+      let q1 = nibbles4(lows, 16u) + high4(high, 4u) * vec4<f16>(16.0h) - vec4<f16>(32.0h);
+      let scale_base = select(0u, 8u, lane >= 16u);
+      let weights0 = vec4<f16>(
+        f16(bitcast<f32>(packed_weights[base + scale_base])),
+        f16(bitcast<f32>(packed_weights[base + scale_base + 1u])),
+        f16(bitcast<f32>(packed_weights[base + scale_base + 2u])),
+        f16(bitcast<f32>(packed_weights[base + scale_base + 3u]))
+      ) * q0;
+      let weights1 = vec4<f16>(
+        f16(bitcast<f32>(packed_weights[base + scale_base + 4u])),
+        f16(bitcast<f32>(packed_weights[base + scale_base + 5u])),
+        f16(bitcast<f32>(packed_weights[base + scale_base + 6u])),
+        f16(bitcast<f32>(packed_weights[base + scale_base + 7u]))
+      ) * q1;
+      row_sums[slot] += f32(
+        dot(weights0, activation0) +
+        dot(weights1, activation1)
+      );
+    }
+  }
+  for (var slot = 0u; slot < 16u; slot += 1u) {
+    let row = range_start + subgroup + slot * 8u;
+    if (row >= range_end) { continue; }
+    let score = subgroupAdd(row_sums[slot]);
+    if (lane == 0u) {
+      let token = params.first_vocabulary_row + row;
+      let exponent = bitcast<u32>(score) & 0x7f800000u;
+      if (token < 248070u && exponent != 0x7f800000u &&
+          (!found || score > best_score ||
+           (score == best_score && token < best_token))) {
+        found = true;
+        best_score = score;
+        best_token = token;
+      }
+    }
+  }
+  if (lane == 0u) {
+    group_scores[subgroup] = best_score;
+    group_tokens[subgroup] = best_token;
+    group_found[subgroup] = select(0u, 1u, found);
+  }
+  workgroupBarrier();
+  for (var stride = 4u; stride > 0u; stride /= 2u) {
+    if (local.x < stride && group_found[local.x + stride] != 0u) {
+      let other_score = group_scores[local.x + stride];
+      let other_token = group_tokens[local.x + stride];
+      if (group_found[local.x] == 0u || other_score > group_scores[local.x] ||
+          (other_score == group_scores[local.x] && other_token < group_tokens[local.x])) {
+        group_scores[local.x] = other_score;
+        group_tokens[local.x] = other_token;
+        group_found[local.x] = 1u;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) {
+    let slot = params.candidate_start + group.x;
+    candidate_scores[slot] = group_scores[0];
+    candidate_token_ids[slot] = group_tokens[0];
+  }
+}`,
+});
 
 const VISUAL_EMBEDDING_KERNEL: Qwen35KernelSource = Object.freeze({
   id: "qwen35-visual-embedding-f32",
@@ -86,6 +252,265 @@ struct Params { output_elements: u32, pad0: u32, pad1: u32, pad2: u32 }
 }`,
 });
 
+const PACK_F16_ACTIVATION_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "qwen35-pack-f16-activation",
+  entryPoint: "main",
+  source: /* wgsl */ `
+enable f16;
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> packed: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let element = id.x * 2u;
+  packed[id.x] = pack2x16float(vec2<f32>(source[element], source[element + 1u]));
+}`,
+});
+
+/** Packs F32 activations into the lane-major FP16 order used by Q5 GEMV. */
+const PACK_LANE_F16_ACTIVATION_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "qwen35-pack-lane-f16-activation",
+  entryPoint: "main",
+  source: /* wgsl */ `
+enable f16;
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> packed: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let block = id.x / 128u;
+  let within = id.x % 128u;
+  let pair = within / 32u;
+  let lane = within % 32u;
+  let first = block * 256u + pair * 64u + lane;
+  packed[id.x] = pack2x16float(vec2<f32>(source[first], source[first + 32u]));
+}`,
+});
+
+const PACK_TIED_LOGITS_ACTIVATION_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "qwen35-pack-tied-logits-activation-f16",
+  entryPoint: "main",
+  source: /* wgsl */ `
+enable f16;
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> packed: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= 1280u) { return; }
+  let block = id.x / 128u;
+  let within = id.x % 128u;
+  let pair = within / 32u;
+  let lane = within % 32u;
+  let first = block * 256u + pair * 64u + lane;
+  packed[id.x] = pack2x16float(vec2<f32>(source[first], source[first + 32u]));
+}`,
+});
+
+/** Alpha and beta are small F32 matrices with the same normalized input. */
+const TWIN_F32_GEMV_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "f32-twin-gemv-portable",
+  entryPoint: "main",
+  source: /* wgsl */ `
+struct Params { rows: u32, columns: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(0) var<storage, read> first_weights: array<f32>;
+@group(0) @binding(1) var<storage, read> second_weights: array<f32>;
+@group(0) @binding(2) var<storage, read> activation: array<f32>;
+@group(0) @binding(3) var<storage, read_write> first_output: array<f32>;
+@group(0) @binding(4) var<storage, read_write> second_output: array<f32>;
+@group(0) @binding(5) var<uniform> params: Params;
+// Safari exposes shader-f16 without WebGPU subgroups. Keep this small shared
+// projection portable so the compact model ABI does not compile a v2 feature.
+var<workgroup> first_partials: array<f32, 32>;
+var<workgroup> second_partials: array<f32, 32>;
+@compute @workgroup_size(32)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let row = group.x;
+  if (row >= params.rows) { return; }
+  let row_base = row * params.columns;
+  var first_sum = 0.0f;
+  var second_sum = 0.0f;
+  for (var column = local.x; column < params.columns; column += 32u) {
+    let value = activation[column];
+    first_sum += first_weights[row_base + column] * value;
+    second_sum += second_weights[row_base + column] * value;
+  }
+  first_partials[local.x] = first_sum;
+  second_partials[local.x] = second_sum;
+  workgroupBarrier();
+  for (var stride = 16u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) {
+      first_partials[local.x] += first_partials[local.x + stride];
+      second_partials[local.x] += second_partials[local.x + stride];
+    }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) {
+    first_output[row] = first_partials[0];
+    second_output[row] = second_partials[0];
+  }
+}`,
+});
+
+/**
+ * Gate and up consume the same normalized vector and have equal Q3 geometry.
+ * One combined grid gives the GPU enough rows to reach bandwidth while one
+ * packed activation replaces the two conversions used by separate GEMVs.
+ */
+const TWIN_Q3_GEMV_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "q3-k-fused-f32-192-swiglu-gemv-mobile-f16-subgroup",
+  entryPoint: "main",
+  source: /* wgsl */ `
+enable f16;
+enable subgroups;
+struct Params {
+  rows: u32,
+  columns: u32,
+  blocks_per_row: u32,
+  pad0: u32,
+  pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> first_weights: array<u32>;
+@group(0) @binding(1) var<storage, read> second_weights: array<u32>;
+@group(0) @binding(2) var<storage, read> activation: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+fn signed_byte(raw: u32) -> i32 {
+  return select(i32(raw), i32(raw) - 256, raw >= 128u);
+}
+fn nibbles4(word: u32, shift: u32) -> vec4<f16> {
+  return vec4<f16>(
+    f16((word >> shift) & 15u),
+    f16((word >> (shift + 4u)) & 15u),
+    f16((word >> (shift + 8u)) & 15u),
+    f16((word >> (shift + 12u)) & 15u),
+  );
+}
+@compute @workgroup_size(64)
+fn main(
+  @builtin(local_invocation_id) local_id: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(num_workgroups) grid: vec3<u32>,
+) {
+  if (group.y > (0xffffffffu - group.x) / grid.x) { return; }
+  let workgroup_row = group.y * grid.x + group.x;
+  if (workgroup_row > 0xffffffffu / 4u) { return; }
+  let subgroup = local_id.x / 32u;
+  let lane = local_id.x % 32u;
+  var row_sums: array<vec2<f32>, 2>;
+  row_sums[0] = vec2<f32>(0.0f);
+  row_sums[1] = vec2<f32>(0.0f);
+  for (var block = 0u; block < params.blocks_per_row; block += 1u) {
+    let input_base = block * 256u + lane * 8u;
+    let first = vec4<f16>(
+      f16(activation[input_base]), f16(activation[input_base + 1u]),
+      f16(activation[input_base + 2u]), f16(activation[input_base + 3u])
+    );
+    let last = vec4<f16>(
+      f16(activation[input_base + 4u]), f16(activation[input_base + 5u]),
+      f16(activation[input_base + 6u]), f16(activation[input_base + 7u])
+    );
+    for (var slot = 0u; slot < 2u; slot += 1u) {
+      let logical_row = workgroup_row * 4u + subgroup + slot * 2u;
+      let row = min(logical_row, params.rows - 1u);
+      let base = row * params.blocks_per_row * 48u + block * 48u;
+      let first_quant = first_weights[base + 16u + lane];
+      let second_quant = second_weights[base + 16u + lane];
+      let first_scale = f16(bitcast<f32>(first_weights[base + lane / 2u]));
+      let second_scale = f16(bitcast<f32>(second_weights[base + lane / 2u]));
+      row_sums[slot] += vec2<f32>(
+        f32(first_scale * (
+          dot(nibbles4(first_quant, 0u) - vec4<f16>(4.0h), first) +
+          dot(nibbles4(first_quant, 16u) - vec4<f16>(4.0h), last)
+        )),
+        f32(second_scale * (
+          dot(nibbles4(second_quant, 0u) - vec4<f16>(4.0h), first) +
+          dot(nibbles4(second_quant, 16u) - vec4<f16>(4.0h), last)
+        )),
+      );
+    }
+  }
+  for (var slot = 0u; slot < 2u; slot += 1u) {
+    let logical_row = workgroup_row * 4u + subgroup + slot * 2u;
+    let gate = subgroupAdd(row_sums[slot].x);
+    let up = subgroupAdd(row_sums[slot].y);
+    if (lane == 0u && logical_row < params.rows) {
+      output[logical_row] = (gate / (1.0f + exp(-gate))) * up;
+    }
+  }
+}`,
+});
+
+/** Value-equivalent fused Q3 SwiGLU path for browsers without subgroups. */
+const TWIN_Q3_PORTABLE_GEMV_KERNEL: Qwen35KernelSource = Object.freeze({
+  id: "q3-k-fused-f32-192-swiglu-gemv-portable-f32",
+  entryPoint: "main",
+  source: /* wgsl */ `
+struct Params {
+  rows: u32,
+  columns: u32,
+  blocks_per_row: u32,
+  pad0: u32,
+  pad1: u32,
+}
+@group(0) @binding(0) var<storage, read> first_weights: array<u32>;
+@group(0) @binding(1) var<storage, read> second_weights: array<u32>;
+@group(0) @binding(2) var<storage, read> activation: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+var<workgroup> first_partials: array<f32, 64>;
+var<workgroup> second_partials: array<f32, 64>;
+fn packed_byte(values: ptr<storage, array<u32>, read>, base: u32, offset: u32) -> u32 {
+  return ((*values)[base + offset / 4u] >> ((offset % 4u) * 8u)) & 255u;
+}
+fn weight_value(
+  values: ptr<storage, array<u32>, read>,
+  block_word: u32,
+  element: u32,
+) -> f32 {
+  let scale_index = element / 16u;
+  let factor = bitcast<f32>((*values)[block_word + scale_index]);
+  let packed = packed_byte(values, block_word, 64u + element / 2u);
+  let quant = i32((packed >> ((element & 1u) * 4u)) & 15u) - 4;
+  return factor * f32(quant);
+}
+@compute @workgroup_size(64)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+  @builtin(num_workgroups) grid: vec3<u32>,
+) {
+  if (group.y > (0xffffffffu - group.x) / grid.x) { return; }
+  let row = group.y * grid.x + group.x;
+  if (row >= params.rows) { return; }
+  var first_sum = 0.0f;
+  var second_sum = 0.0f;
+  for (var column = local.x; column < params.columns; column += 64u) {
+    let block = column / 256u;
+    let element = column % 256u;
+    let block_word = (row * params.blocks_per_row + block) * 48u;
+    let value = activation[column];
+    first_sum += weight_value(&first_weights, block_word, element) * value;
+    second_sum += weight_value(&second_weights, block_word, element) * value;
+  }
+  first_partials[local.x] = first_sum;
+  second_partials[local.x] = second_sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) {
+      first_partials[local.x] += first_partials[local.x + stride];
+      second_partials[local.x] += second_partials[local.x + stride];
+    }
+    workgroupBarrier();
+  }
+  if (local.x == 0u) {
+    let gate = first_partials[0];
+    output[row] = (gate / (1.0f + exp(-gate))) * second_partials[0];
+  }
+}`,
+});
+
+/** DeltaNet gate and QKV share one input but use different packed formats. */
 const EMBEDDING_KERNEL_SOURCES = new Map<GemvLayout, Qwen35KernelSource>(
   PACKED_EMBEDDING_KERNELS.map((kernel) => [
     kernel.storageType,
@@ -93,17 +518,6 @@ const EMBEDDING_KERNEL_SOURCES = new Map<GemvLayout, Qwen35KernelSource>(
       id: kernel.id,
       source: kernel.source,
       entryPoint: "main",
-    }),
-  ]),
-);
-
-const GEMV_KERNEL_SOURCES = new Map<GemvLayout, Qwen35KernelSource>(
-  LANGUAGE_GEMV_KERNELS.map((kernel) => [
-    kernel.layout,
-    Object.freeze({
-      id: kernel.id,
-      source: kernel.source,
-      entryPoint: "packed_gemv",
     }),
   ]),
 );
@@ -642,17 +1056,17 @@ export function planQwen35StagedPackedEmbeddingDispatch(input: {
   readonly limits: Qwen35ForwardDeviceLimits;
 }): Qwen35ForwardDispatchPlan {
   const selected = PACKED_EMBEDDING_KERNELS.find(
-    (candidate) => candidate.storageType === "q6-k-212",
+    (candidate) => candidate.storageType === "q6-k-fused-f32-256",
   );
-  const source = EMBEDDING_KERNEL_SOURCES.get("q6-k-212");
+  const source = EMBEDDING_KERNEL_SOURCES.get("q6-k-fused-f32-256");
   if (
     selected === undefined ||
     source === undefined ||
     input.rows.tensorName !== "token_embd.weight" ||
-    input.rows.storageType !== "q6-k-212" ||
+    input.rows.storageType !== "q6-k-fused-f32-256" ||
     input.rows.rowCount !== 1 ||
-    input.rows.rowBytes !== 2_120 ||
-    input.rows.byteLength !== 2_120 ||
+    input.rows.rowBytes !== 2_560 ||
+    input.rows.byteLength !== 2_560 ||
     !Number.isSafeInteger(input.rows.firstRow) ||
     input.rows.firstRow < 0 ||
     input.rows.firstRow >= QWEN35_VOCABULARY_SIZE ||
@@ -740,21 +1154,37 @@ export function planQwen35StagedPackedEmbeddingDispatch(input: {
   });
 }
 
-function gemvKernel(
-  tensor: Qwen35TensorWeightView,
+function gemvKernelForLayout(
+  layout: GemvLayout,
+  limits: Qwen35ForwardDeviceLimits,
 ): { readonly layout: GemvLayout; readonly kernel: LanguageGemvKernel; readonly source: Qwen35KernelSource } {
-  const layout = layoutOf(tensor);
+  const preferredProfile = limits.supportsSubgroups === true
+    ? "mobile-f16-subgroup"
+    : "portable-f32";
   const kernel = LANGUAGE_GEMV_KERNELS.find(
-    (candidate) => candidate.layout === layout,
+    (candidate) => candidate.layout === layout && candidate.profile === preferredProfile,
+  ) ?? LANGUAGE_GEMV_KERNELS.find(
+    (candidate) => candidate.layout === layout && candidate.profile === "portable-f32",
   );
-  const source = GEMV_KERNEL_SOURCES.get(layout);
-  if (kernel === undefined || source === undefined) {
+  if (kernel === undefined) {
     throw diagnosticError(
       "forward-weight-layout-invalid",
       "Qwen3.5 packed GEMV kernel is unavailable",
     );
   }
+  const source = Object.freeze({
+    id: kernel.id,
+    source: kernel.source,
+    entryPoint: "packed_gemv",
+  });
   return { layout, kernel, source };
+}
+
+function gemvKernel(
+  tensor: Qwen35TensorWeightView,
+  limits: Qwen35ForwardDeviceLimits,
+): ReturnType<typeof gemvKernelForLayout> {
+  return gemvKernelForLayout(layoutOf(tensor), limits);
 }
 
 /** Copies one projected visual token into the language hidden workspace. */
@@ -789,7 +1219,7 @@ function tiedLogitsGeometryData(input: {
   const tensor = requireTensor(input.weights, "token_embd.weight");
   const shape = matrixShape(tensor);
   requireTiedEmbeddingShape(shape);
-  const selected = gemvKernel(tensor);
+  const selected = gemvKernel(tensor, input.limits);
   const rowBytes = expectedRowBytes(tensor, shape.columns);
   const views = physicalRows(tensor, shape.rows, rowBytes);
   const pieces = logitsPieces(
@@ -819,11 +1249,313 @@ export function planQwen35TiedLogitsGeometry(input: {
   });
 }
 
+function fusedQ6TiedLogitsViews(input: {
+  readonly weights: Qwen35WeightDirectoryView;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): {
+  readonly tensor: Qwen35TensorWeightView;
+  readonly views: readonly { readonly view: Qwen35PhysicalRowView; readonly rowCount: number }[];
+  readonly candidateCount: number;
+} | null {
+  const tensor = requireTensor(input.weights, "token_embd.weight");
+  const shape = matrixShape(tensor);
+  requireTiedEmbeddingShape(shape);
+  // The specialized top-1 shader uses subgroups. Portable devices retain the
+  // exact tiled logits path over the same packed Q6 values.
+  if (
+    input.limits.supportsSubgroups !== true ||
+    layoutOf(tensor) !== "q6-k-fused-f32-256"
+  ) return null;
+  const rowBytes = expectedRowBytes(tensor, shape.columns);
+  const views = physicalRows(tensor, shape.rows, rowBytes)
+    .map((view) => Object.freeze({
+      view,
+      rowCount: Math.max(
+        0,
+        Math.min(view.rowCount, QWEN35_DECODABLE_LOGIT_ROWS - view.firstRow),
+      ),
+    }))
+    .filter(({ rowCount }) => rowCount > 0);
+  const candidateCount = views.reduce(
+    (sum, { rowCount }) => sum + Math.ceil(rowCount / FUSED_LOGITS_ROWS_PER_WORKGROUP),
+    0,
+  );
+  if (
+    views.length === 0 ||
+    candidateCount < QWEN35_MATHEMATICAL_LOGITS_TILES ||
+    candidateCount > QWEN35_TOP_K_CANDIDATE_CAPACITY
+  ) {
+    throw diagnosticError(
+      "forward-tied-logits-geometry-invalid",
+      "The resident Qwen3.5 tied-logits geometry is invalid",
+    );
+  }
+  return Object.freeze({ tensor, views: Object.freeze(views), candidateCount });
+}
+
+export function planQwen35FusedTiedLogitsGeometry(input: {
+  readonly weights: Qwen35WeightDirectoryView;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): Readonly<{
+  readonly physicalPieceCount: number;
+  readonly candidateCount: number;
+  readonly uniformCount: number;
+}> | null {
+  const data = fusedQ6TiedLogitsViews(input);
+  if (data === null) return null;
+  return Object.freeze({
+    physicalPieceCount: data.views.length,
+    candidateCount: data.candidateCount,
+    uniformCount: data.views.length + 1,
+  });
+}
+
+/** Packs the final normalized hidden vector into the Q6 lane-major read order. */
+export function planQwen35PackTiedLogitsActivationDispatch(input: {
+  readonly activation: Qwen35ForwardBufferSlice;
+  readonly packedActivation: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): Qwen35ForwardDispatchPlan {
+  const source = binding(
+    0, "storage", input.activation, QWEN35_HIDDEN_SIZE * 4, input.limits,
+  );
+  const packed = binding(
+    1, "storage", input.packedActivation, QWEN35_HIDDEN_SIZE * 2, input.limits,
+  );
+  requireWritableOutputDisjoint(packed, [source]);
+  return dispatchPlan({
+    kernel: PACK_TIED_LOGITS_ACTIVATION_KERNEL,
+    bindings: [source, packed],
+    uniformWords: [],
+    workgroups: { x: QWEN35_HIDDEN_SIZE / 512, y: 1, z: 1 },
+  });
+}
+
+/** Plans one fused top-1 dispatch per resident Q6 physical buffer. */
+export function planQwen35FusedTiedLogitsDispatches(input: {
+  readonly weights: Qwen35WeightDirectoryView;
+  readonly activation: Qwen35ForwardBufferSlice;
+  readonly candidateScores: Qwen35ForwardBufferSlice;
+  readonly candidateTokenIds: Qwen35ForwardBufferSlice;
+  readonly uniforms: readonly Qwen35ForwardBufferSlice[];
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): readonly Qwen35FusedTiedLogitsDispatchPlan[] | null {
+  const data = fusedQ6TiedLogitsViews(input);
+  if (data === null) return null;
+  if (input.uniforms.length !== data.views.length) {
+    throw diagnosticError(
+      "forward-uniform-count-invalid",
+      "Qwen3.5 fused tied logits require one uniform slot per physical buffer",
+    );
+  }
+  const activation = binding(1, "storage", input.activation, QWEN35_HIDDEN_SIZE * 2, input.limits);
+  const scores = binding(
+    2,
+    "storage",
+    input.candidateScores,
+    QWEN35_TOP_K_CANDIDATE_CAPACITY * 4,
+    input.limits,
+  );
+  const tokenIds = binding(
+    3,
+    "storage",
+    input.candidateTokenIds,
+    QWEN35_TOP_K_CANDIDATE_CAPACITY * 4,
+    input.limits,
+  );
+  const uniforms = input.uniforms.map((uniform) =>
+    binding(4, "uniform", uniform, 24, input.limits)
+  );
+  requireDistinctUniformRanges(uniforms);
+  requireWritableOutputDisjoint(scores, [activation, tokenIds, ...uniforms]);
+  requireWritableOutputDisjoint(tokenIds, [activation, scores, ...uniforms]);
+
+  let candidateStart = 0;
+  const plans = data.views.map(({ view, rowCount }, index) => {
+    const packedRange = physicalPackedRangeBinding(
+      0,
+      view,
+      0,
+      rowCount * data.tensor.rowBytes,
+      input.limits,
+    );
+    const candidateCount = Math.ceil(rowCount / FUSED_LOGITS_ROWS_PER_WORKGROUP);
+    const start = candidateStart;
+    candidateStart += candidateCount;
+    requireWritableOutputDisjoint(scores, [packedRange.binding]);
+    requireWritableOutputDisjoint(tokenIds, [packedRange.binding]);
+    return Object.freeze({
+      ...dispatchPlan({
+        kernel: FUSED_Q6_TIED_LOGITS_KERNEL,
+        bindings: [packedRange.binding, activation, scores, tokenIds, uniforms[index]!],
+        uniformWords: [
+          rowCount,
+          QWEN35_HIDDEN_SIZE,
+          QWEN35_HIDDEN_SIZE / 256,
+          packedRange.wordOffset,
+          view.firstRow,
+          start,
+        ],
+        workgroups: { x: candidateCount, y: 1, z: 1 },
+      }),
+      candidateStart: start,
+      candidateCount,
+    });
+  });
+  if (candidateStart !== data.candidateCount) {
+    throw diagnosticError(
+      "forward-tied-logits-geometry-invalid",
+      "The resident Qwen3.5 tied-logits candidate coverage is invalid",
+    );
+  }
+  return Object.freeze(plans);
+}
+
+/** Fuses the two F32 DeltaNet parameter projections over one activation read. */
+export function planQwen35TwinF32GemvDispatch(input: {
+  readonly weights: Qwen35WeightDirectoryView;
+  readonly firstTensorName: string;
+  readonly secondTensorName: string;
+  readonly activation: Qwen35ForwardBufferSlice;
+  readonly firstOutput: Qwen35ForwardBufferSlice;
+  readonly secondOutput: Qwen35ForwardBufferSlice;
+  readonly uniform: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): Qwen35ForwardDispatchPlan | null {
+  const firstTensor = requireTensor(input.weights, input.firstTensorName);
+  const secondTensor = requireTensor(input.weights, input.secondTensorName);
+  const firstShape = matrixShape(firstTensor);
+  const secondShape = matrixShape(secondTensor);
+  const firstViews = physicalRows(
+    firstTensor,
+    firstShape.rows,
+    expectedRowBytes(firstTensor, firstShape.columns),
+  );
+  const secondViews = physicalRows(
+    secondTensor,
+    secondShape.rows,
+    expectedRowBytes(secondTensor, secondShape.columns),
+  );
+  if (
+    firstTensor.ggmlType !== GgmlType.F32 ||
+    secondTensor.ggmlType !== GgmlType.F32 ||
+    firstTensor.storageType !== "f32" ||
+    secondTensor.storageType !== "f32" ||
+    firstShape.columns !== secondShape.columns ||
+    firstShape.rows !== secondShape.rows ||
+    firstShape.columns % 32 !== 0 ||
+    firstShape.rows > input.limits.maxComputeWorkgroupsPerDimension ||
+    firstViews.length !== 1 ||
+    secondViews.length !== 1
+  ) {
+    return null;
+  }
+  const firstWeight = physicalBinding(0, firstViews[0]!, input.limits);
+  const secondWeight = physicalBinding(1, secondViews[0]!, input.limits);
+  const activation = binding(
+    2, "storage", input.activation, firstShape.columns * 4, input.limits,
+  );
+  const firstOutput = binding(
+    3, "storage", input.firstOutput, firstShape.rows * 4, input.limits,
+  );
+  const secondOutput = binding(
+    4, "storage", input.secondOutput, secondShape.rows * 4, input.limits,
+  );
+  const uniform = binding(5, "uniform", input.uniform, 16, input.limits);
+  requireWritableOutputDisjoint(firstOutput, [
+    firstWeight, secondWeight, activation, secondOutput, uniform,
+  ]);
+  requireWritableOutputDisjoint(secondOutput, [
+    firstWeight, secondWeight, activation, firstOutput, uniform,
+  ]);
+  return dispatchPlan({
+    kernel: TWIN_F32_GEMV_KERNEL,
+    bindings: [firstWeight, secondWeight, activation, firstOutput, secondOutput, uniform],
+    uniformWords: [firstShape.rows, firstShape.columns, 0, 0],
+    workgroups: { x: firstShape.rows, y: 1, z: 1 },
+  });
+}
+
 /** Plans one packed GEMV request for each row-sharded physical weight buffer. */
+export function planQwen35TwinQ3GemvDispatches(input: {
+  readonly weights: Qwen35WeightDirectoryView;
+  readonly firstTensorName: string;
+  readonly secondTensorName: string;
+  readonly activation: Qwen35ForwardBufferSlice;
+  readonly packedActivation: Qwen35ForwardBufferSlice;
+  readonly output: Qwen35ForwardBufferSlice;
+  readonly uniform: Qwen35ForwardBufferSlice;
+  readonly limits: Qwen35ForwardDeviceLimits;
+}): readonly Qwen35ForwardDispatchPlan[] | null {
+  const firstTensor = requireTensor(input.weights, input.firstTensorName);
+  const secondTensor = requireTensor(input.weights, input.secondTensorName);
+  const firstShape = matrixShape(firstTensor);
+  const secondShape = matrixShape(secondTensor);
+  const firstRowBytes = expectedRowBytes(firstTensor, firstShape.columns);
+  const secondRowBytes = expectedRowBytes(secondTensor, secondShape.columns);
+  const firstViews = physicalRows(firstTensor, firstShape.rows, firstRowBytes);
+  const secondViews = physicalRows(secondTensor, secondShape.rows, secondRowBytes);
+  if (
+    firstTensor.storageType !== "q3-k-fused-f32-192" ||
+    secondTensor.storageType !== "q3-k-fused-f32-192" ||
+    firstTensor.ggmlType !== secondTensor.ggmlType ||
+    firstShape.columns !== secondShape.columns ||
+    firstShape.rows !== secondShape.rows ||
+    firstRowBytes !== secondRowBytes ||
+    firstShape.columns % 512 !== 0 ||
+    firstViews.length !== 1 ||
+    secondViews.length !== 1
+  ) {
+    return null;
+  }
+  const maximum = input.limits.maxComputeWorkgroupsPerDimension;
+  if (!Number.isSafeInteger(firstShape.rows) || !positiveLimit(maximum)) {
+    return null;
+  }
+  const portable = input.limits.supportsSubgroups !== true;
+  const workgroups = Math.ceil(firstShape.rows / (portable ? 1 : 4));
+  const x = Math.min(workgroups, maximum);
+  const y = Math.ceil(workgroups / x);
+  if (y > maximum) return null;
+  const sourceActivation = binding(
+    0, "storage", input.activation, firstShape.columns * 4, input.limits,
+  );
+  const packedActivation = binding(
+    2,
+    "storage",
+    input.activation,
+    firstShape.columns * 4,
+    input.limits,
+  );
+  const firstWeight = physicalBinding(0, firstViews[0]!, input.limits);
+  const secondWeight = physicalBinding(1, secondViews[0]!, input.limits);
+  const output = binding(
+    3, "storage", input.output, firstShape.rows * 4, input.limits,
+  );
+  const uniform = binding(4, "uniform", input.uniform, 20, input.limits);
+  requireWritableOutputDisjoint(output, [
+    firstWeight, secondWeight, packedActivation, uniform,
+  ]);
+  const fused = dispatchPlan({
+    kernel: portable ? TWIN_Q3_PORTABLE_GEMV_KERNEL : TWIN_Q3_GEMV_KERNEL,
+    bindings: [firstWeight, secondWeight, packedActivation, output, uniform],
+    uniformWords: [
+      firstShape.rows,
+      firstShape.columns,
+      firstShape.columns / 256,
+      0,
+      0,
+    ],
+    workgroups: { x, y, z: 1 },
+  });
+  return Object.freeze([fused]);
+}
+
 export function planQwen35PackedGemvDispatches(input: {
   readonly weights: Qwen35WeightDirectoryView;
   readonly tensorName: string;
   readonly activation: Qwen35ForwardBufferSlice;
+  readonly packedActivation?: Qwen35ForwardBufferSlice;
   readonly output: Qwen35ForwardBufferSlice;
   readonly uniforms: readonly Qwen35ForwardBufferSlice[];
   readonly limits: Qwen35ForwardDeviceLimits;
@@ -836,7 +1568,7 @@ export function planQwen35PackedGemvDispatches(input: {
   }
   const tensor = requireTensor(input.weights, input.tensorName);
   const shape = matrixShape(tensor);
-  const selected = gemvKernel(tensor);
+  const selected = gemvKernel(tensor, input.limits);
   const rowBytes = expectedRowBytes(tensor, shape.columns);
   const views = physicalRows(tensor, shape.rows, rowBytes);
   if (input.uniforms.length !== views.length) {
@@ -853,11 +1585,39 @@ export function planQwen35PackedGemvDispatches(input: {
     input.limits,
   ));
   requireDistinctUniformRanges(uniformBindings);
-  const activationBinding = binding(
-    selected.kernel.abi.bindings.activation,
+  const usesPackedActivation = selected.kernel.profile === "mobile-f16-subgroup" && (
+    selected.layout === "q3-k-112" ||
+    selected.layout === "q3-k-nibble-148" ||
+    selected.layout === "q4-k-144" ||
+    selected.layout === "q5-k-176" ||
+    selected.layout === "q6-k-212" ||
+    selected.layout === "q5-k-fused-f32-224"
+  );
+  if (usesPackedActivation && shape.columns % 512 !== 0) {
+    throw diagnosticError(
+      "forward-gemv-packed-activation-invalid",
+      "Qwen3.5 packed activation width must be a complete conversion workgroup",
+    );
+  }
+  const sourceActivationBinding = binding(
+    0,
     "storage",
     input.activation,
     shape.columns * 4,
+    input.limits,
+  );
+  const activationBinding = binding(
+    selected.kernel.abi.bindings.activation,
+    "storage",
+    usesPackedActivation
+      ? input.packedActivation ?? (() => {
+          throw diagnosticError(
+            "forward-gemv-packed-activation-missing",
+            "Qwen3.5 browser Q3 GEMV requires its bounded FP16 activation scratch",
+          );
+        })()
+      : input.activation,
+    shape.columns * (usesPackedActivation ? 2 : 4),
     input.limits,
   );
   const outputBinding = binding(
@@ -872,6 +1632,7 @@ export function planQwen35PackedGemvDispatches(input: {
     try {
       logical = planGemvDispatch({
         layout: selected.layout,
+        profile: selected.kernel.profile,
         ggmlType: selected.kernel.ggmlType,
         localRows: view.rowCount,
         columns: shape.columns,
@@ -914,7 +1675,24 @@ export function planQwen35PackedGemvDispatches(input: {
       workgroups: logical.workgroups,
     });
   });
-  return Object.freeze(plans);
+  if (!usesPackedActivation) return Object.freeze(plans);
+  const packedOutputBinding = binding(
+    1,
+    "storage",
+    input.packedActivation!,
+    shape.columns * 2,
+    input.limits,
+  );
+  requireWritableOutputDisjoint(packedOutputBinding, [sourceActivationBinding]);
+  const conversion = dispatchPlan({
+    kernel: selected.layout === "q5-k-fused-f32-224"
+      ? PACK_LANE_F16_ACTIVATION_KERNEL
+      : PACK_F16_ACTIVATION_KERNEL,
+    bindings: [sourceActivationBinding, packedOutputBinding],
+    uniformWords: [],
+    workgroups: { x: shape.columns / 512, y: 1, z: 1 },
+  });
+  return Object.freeze([conversion, ...plans]);
 }
 
 /** Logits reuse token_embd.weight; the package has no second output matrix. */
@@ -949,6 +1727,7 @@ export function planQwen35TiedLogitsDispatches(input: Omit<
     try {
       logical = planGemvDispatch({
         layout: selected.layout,
+        profile: selected.kernel.profile,
         ggmlType: selected.kernel.ggmlType,
         localRows: piece.rowCount,
         columns: shape.columns,
@@ -1021,21 +1800,18 @@ export function planQwen35StagedTiedLogitsDispatch(input: {
   readonly uniform: Qwen35ForwardBufferSlice;
   readonly limits: Qwen35ForwardDeviceLimits;
 }): Qwen35TiedLogitsDispatchPlan {
-  const selected = LANGUAGE_GEMV_KERNELS.find(
-    (candidate) => candidate.layout === "q6-k-212",
-  );
-  const source = GEMV_KERNEL_SOURCES.get("q6-k-212");
+  const selection = gemvKernelForLayout("q6-k-fused-f32-256", input.limits);
+  const selected = selection.kernel;
+  const source = selection.source;
   const tileIndex = input.tile.firstRow / MAX_LOGITS_TILE_ROWS;
   const expectedRows = Math.min(
     MAX_LOGITS_TILE_ROWS,
     QWEN35_DECODABLE_LOGIT_ROWS - input.tile.firstRow,
   );
   if (
-    selected === undefined ||
-    source === undefined ||
     input.tile.tensorName !== "token_embd.weight" ||
-    input.tile.storageType !== "q6-k-212" ||
-    input.tile.rowBytes !== 2_120 ||
+    input.tile.storageType !== "q6-k-fused-f32-256" ||
+    input.tile.rowBytes !== 2_560 ||
     !Number.isSafeInteger(input.tile.firstRow) ||
     input.tile.firstRow < 0 ||
     input.tile.firstRow >= QWEN35_DECODABLE_LOGIT_ROWS ||
@@ -1057,6 +1833,7 @@ export function planQwen35StagedTiedLogitsDispatch(input: {
   try {
     logical = planGemvDispatch({
       layout: selected.layout,
+      profile: selected.profile,
       ggmlType: selected.ggmlType,
       localRows: input.tile.rowCount,
       columns: QWEN35_HIDDEN_SIZE,

@@ -33,6 +33,8 @@ test("public build contains no local control agent or private connection materia
     "allocation-ledger.d.ts",
     "allocation-ledger.js",
     "app.css",
+    "browser-quant.d.ts",
+    "browser-quant.js",
     "browser.d.ts",
     "browser.js",
     "byte-level.d.ts",

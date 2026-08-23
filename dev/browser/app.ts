@@ -15,6 +15,8 @@ interface LocalRuntimeConfiguration {
   readonly uploadDiagnostics?: true;
   readonly uploadLaneBytes?: number;
   readonly retireUploadAfterEachWrite?: boolean;
+  readonly residencyPolicy?: "auto" | "resident" | "rolling" | "hybrid";
+  readonly residentLayerCount?: number;
 }
 
 interface LocalRuntimeWindow extends Window {
@@ -91,35 +93,14 @@ const application = startQwen35ChatApp(root, {
             : "window" as const,
       }),
 });
-let operatorOutput: HTMLElement | null = null;
-const appendOperatorMessage = (
-  role: "user" | "assistant",
-  text: string,
-): HTMLElement => {
-  const item = document.createElement("article");
-  item.className = `message message--${role}`;
-  const label = document.createElement("p");
-  label.className = "message__role";
-  label.textContent = role === "user" ? "Operator" : "Qwen";
-  const content = document.createElement("p");
-  content.className = "message__text";
-  content.textContent = text;
-  item.append(label, content);
-  document.querySelector<HTMLElement>("[data-messages]")?.append(item);
-  item.scrollIntoView({ block: "end", behavior: "smooth" });
-  return content;
-};
 const controller = createTextRuntimeController({
   coordinator: application.coordinator,
-  onPromptStart(prompt) {
-    appendOperatorMessage("user", prompt);
-    operatorOutput = appendOperatorMessage("assistant", "");
-  },
-  onText(text) {
-    if (operatorOutput === null) {
-      operatorOutput = appendOperatorMessage("assistant", "");
-    }
-    operatorOutput.textContent += text;
+  onRunMetrics(metrics) {
+    // The injected local agent applies a second allowlist before transport.
+    // This event intentionally contains only numeric command measurements.
+    dispatchEvent(new CustomEvent("qwen-local-runtime-metrics", {
+      detail: metrics,
+    }));
   },
 });
 globalThis.__QWEN_LOCAL_CONTROL__ = Object.freeze({

@@ -3,6 +3,7 @@ import {
   QWEN35_PRODUCT_CONTEXT_TOKENS,
   assembleQwen35Conversation,
   type Qwen35ChatMessage,
+  type Qwen35ConversationOptions,
 } from "./qwen-chat-template.js";
 import {
   OriginModelLock,
@@ -491,7 +492,10 @@ export class Qwen35Session {
     }
   }
 
-  async prefill(input: TextOrImageConversation): Promise<SequenceState> {
+  async prefill(
+    input: TextOrImageConversation,
+    options: Pick<Qwen35ConversationOptions, "enableThinking"> = {},
+  ): Promise<SequenceState> {
     this.#requireReady();
     if (this.#sequenceTokenIds !== null) {
       throw diagnosticError(
@@ -516,7 +520,9 @@ export class Qwen35Session {
     const assembled = assembleQwen35Conversation(
       resources.tokenizer,
       input,
-      visualTokensPerImage === undefined ? {} : { visualTokensPerImage },
+      visualTokensPerImage === undefined
+        ? options
+        : { ...options, visualTokensPerImage },
     );
     if (!assembled.ok) {
       throw diagnosticError(
@@ -824,12 +830,19 @@ export class Qwen35Session {
     const decoder = resources.tokenizer.createStreamingDecoder({
       skipSpecialTokens: true,
     });
+    const endTokenId = resources.tokenizer.addedTokenId("<|im_end|>");
     const started = this.#now();
     let completed = false;
     let generationFailed = false;
     let generated = 0;
     let lastTokenId: number | null = null;
     try {
+      if (endTokenId === undefined) {
+        throw diagnosticError(
+          "tokenizer-eos-missing",
+          "The Qwen3.5 tokenizer does not define its required end token",
+        );
+      }
       const tokens = resources.driver.generate({
         maxNewTokens,
         signal: controller.signal,
@@ -868,7 +881,15 @@ export class Qwen35Session {
         if (this.#ttft === null) {
           this.#ttft = Math.max(0, this.#now() - started);
         }
-        yield Object.freeze({ id, text, index: generated - 1 });
+        if (text.length > 0) {
+          yield Object.freeze({ id, text, index: generated - 1 });
+        }
+        if (id === endTokenId) {
+          // The driver pauses after each yielded prediction. Close it here so
+          // EOS cannot become a pending token that starts a synthetic next turn.
+          await iterator.return?.();
+          break;
+        }
       }
       const suffix = decoder.finish();
       if (suffix.length > 0 && lastTokenId !== null) {

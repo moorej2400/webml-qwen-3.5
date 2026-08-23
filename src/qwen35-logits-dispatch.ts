@@ -4,6 +4,9 @@ import type {
   Qwen35ActivationResourceView,
 } from "./qwen35-activation-workspace.js";
 import {
+  planQwen35FusedTiedLogitsDispatches,
+  planQwen35FusedTiedLogitsGeometry,
+  planQwen35PackTiedLogitsActivationDispatch,
   planQwen35StagedTiedLogitsDispatch,
   planQwen35TiedLogitsGeometry,
   planQwen35TiedLogitsDispatches,
@@ -15,6 +18,7 @@ import type { Qwen35StagedPackedRows } from "./qwen35-disk-backed-tied-embedding
 import {
   QWEN35_LOGITS_REDUCTION_KERNELS,
   planQwen35FinalTokenSelection,
+  planQwen35PhysicalCandidateSelection,
   planQwen35LogitsTileWinner,
   type Qwen35LogitsReductionOperation,
 } from "./qwen35-logits-reduction.js";
@@ -30,7 +34,8 @@ const QWEN35_LOGITS_TILE_ROWS = 1_024;
 const QWEN35_DECODABLE_ROWS = 248_070;
 const QWEN35_MATHEMATICAL_TILE_COUNT = 243;
 const QWEN35_REDUCTION_COMMAND_COUNT = QWEN35_MATHEMATICAL_TILE_COUNT + 1;
-const QWEN35_CANDIDATE_CAPACITY = 256;
+const QWEN35_RESIDENT_CANDIDATE_CAPACITY = 2_048;
+const QWEN35_STAGED_CANDIDATE_CAPACITY = 256;
 const GPU_BUFFER_USAGE_COPY_SRC = 0x0004;
 const GPU_BUFFER_USAGE_STORAGE = 0x0080;
 
@@ -41,6 +46,8 @@ export interface Qwen35LogitsWorkspaceViews {
 export interface Qwen35LogitsDispatchCommand extends Qwen35DispatchRequest {
   readonly kind:
     | "logits-gemv-piece"
+    | "pack-logits-activation"
+    | "fused-logits-top-1"
     | "logits-tile-top-1"
     | "indexed-top-1";
   readonly tileIndex: number | null;
@@ -56,7 +63,7 @@ export interface Qwen35SelectedTokenReadback {
 
 export interface Qwen35TiledLogitsCommands {
   readonly commands: readonly Qwen35LogitsDispatchCommand[];
-  readonly candidateCount: 243;
+  readonly candidateCount: number;
   readonly uniformCount: number;
   readonly selectedTokenReadback: Qwen35SelectedTokenReadback;
 }
@@ -346,8 +353,13 @@ function bindSlice(
 
 function requireWorkspaceResource(
   workspace: Qwen35LogitsWorkspaceViews,
-  kind: "logits-tile" | "top-k-scores" | "top-k-indices" | "selected-token",
-  scalarType: "f32" | "u32",
+  kind:
+    | "packed-gemv-input-f16"
+    | "logits-tile"
+    | "top-k-scores"
+    | "top-k-indices"
+    | "selected-token",
+  scalarType: "f16" | "f32" | "u32",
   elementCount: number,
   requiredUsage: number,
   limits: Qwen35ForwardDeviceLimits,
@@ -361,7 +373,7 @@ function requireWorkspaceResource(
       "The Qwen3.5 logits workspace is incomplete",
     );
   }
-  const bytes = elementCount * 4;
+  const bytes = elementCount * (scalarType === "f16" ? 2 : 4);
   if (
     view.kind !== kind ||
     view.scalarType !== scalarType ||
@@ -499,7 +511,8 @@ export function planQwen35TiledLogitsUniformCount(input: {
   readonly weights: Qwen35WeightDirectoryView;
   readonly limits: Qwen35ForwardDeviceLimits;
 }): number {
-  return planQwen35TiedLogitsGeometry(input).uniformCount;
+  return planQwen35FusedTiedLogitsGeometry(input)?.uniformCount ??
+    planQwen35TiedLogitsGeometry(input).uniformCount;
 }
 
 /** Assembles the complete GPU-only greedy logits tail for one decode token. */
@@ -522,7 +535,7 @@ export function assembleQwen35TiledLogitsCommands(input: {
     input.workspace,
     "top-k-scores",
     "f32",
-    QWEN35_CANDIDATE_CAPACITY,
+    QWEN35_RESIDENT_CANDIDATE_CAPACITY,
     GPU_BUFFER_USAGE_STORAGE,
     input.limits,
   );
@@ -530,7 +543,7 @@ export function assembleQwen35TiledLogitsCommands(input: {
     input.workspace,
     "top-k-indices",
     "u32",
-    QWEN35_CANDIDATE_CAPACITY,
+    QWEN35_RESIDENT_CANDIDATE_CAPACITY,
     GPU_BUFFER_USAGE_STORAGE,
     input.limits,
   );
@@ -550,6 +563,113 @@ export function assembleQwen35TiledLogitsCommands(input: {
     input.limits,
     "logits-dispatch-hidden-invalid",
   );
+
+  const fusedGeometry = planQwen35FusedTiedLogitsGeometry({
+    weights: input.weights,
+    limits: input.limits,
+  });
+  if (fusedGeometry !== null) {
+    if (input.uniforms.length !== fusedGeometry.uniformCount) {
+      throw diagnosticError(
+        "logits-dispatch-uniform-count-invalid",
+        "Qwen3.5 fused logits command uniform count is invalid",
+      );
+    }
+    const packedActivation = requireWorkspaceResource(
+      input.workspace,
+      "packed-gemv-input-f16",
+      "f16",
+      9_216,
+      GPU_BUFFER_USAGE_STORAGE,
+      input.limits,
+    );
+    const pack = planQwen35PackTiedLogitsActivationDispatch({
+      activation: input.normalizedHidden,
+      packedActivation: {
+        buffer: packedActivation.binding.buffer,
+        offset: packedActivation.binding.offset,
+        byteLength: packedActivation.binding.size,
+      },
+      limits: input.limits,
+    });
+    const fused = planQwen35FusedTiedLogitsDispatches({
+      weights: input.weights,
+      activation: {
+        buffer: packedActivation.binding.buffer,
+        offset: packedActivation.binding.offset,
+        byteLength: packedActivation.binding.size,
+      },
+      candidateScores: {
+        buffer: candidateScores.binding.buffer,
+        offset: candidateScores.binding.offset,
+        byteLength: candidateScores.binding.size,
+      },
+      candidateTokenIds: {
+        buffer: candidateIndices.binding.buffer,
+        offset: candidateIndices.binding.offset,
+        byteLength: candidateIndices.binding.size,
+      },
+      uniforms: input.uniforms.slice(0, fusedGeometry.physicalPieceCount),
+      limits: input.limits,
+    });
+    if (fused === null || fused.length !== fusedGeometry.physicalPieceCount) {
+      throw diagnosticError(
+        "logits-dispatch-group-invalid",
+        "Qwen3.5 fused logits physical coverage is invalid",
+      );
+    }
+    const finalUniform = bindSlice(
+      3,
+      "uniform",
+      input.uniforms[fusedGeometry.physicalPieceCount]!,
+      16,
+      input.limits,
+      "logits-dispatch-uniform-invalid",
+    );
+    const allUniforms = [
+      ...fused.map((plan) => plan.bindings[4]!),
+      finalUniform,
+    ];
+    requireDistinctUniforms(allUniforms);
+    const finalPlan = planQwen35PhysicalCandidateSelection({
+      candidateCount: fusedGeometry.candidateCount,
+    });
+    const commands: Qwen35LogitsDispatchCommand[] = [Object.freeze({
+      ...pack,
+      kind: "pack-logits-activation" as const,
+      tileIndex: null,
+    }), ...fused.map((plan) =>
+      Object.freeze({
+        ...plan,
+        kind: "fused-logits-top-1" as const,
+        tileIndex: null,
+      })
+    )];
+    commands.push(command({
+      kind: "indexed-top-1",
+      tileIndex: null,
+      kernel: reductionKernel(finalPlan.operation),
+      bindings: [
+        Object.freeze({ ...candidateScores.binding, binding: 0 }),
+        Object.freeze({ ...candidateIndices.binding, binding: 1 }),
+        Object.freeze({ ...selectedToken.binding, binding: 2 }),
+        finalUniform,
+      ],
+      uniformWords: finalPlan.uniformWords,
+      workgroups: finalPlan.workgroups,
+    }));
+    return Object.freeze({
+      commands: Object.freeze(commands),
+      candidateCount: fusedGeometry.candidateCount,
+      uniformCount: fusedGeometry.uniformCount,
+      selectedTokenReadback: Object.freeze({
+        buffer: selectedToken.binding.buffer,
+        offset: selectedToken.binding.offset,
+        byteLength: 4,
+        scalarType: "u32",
+      }),
+    });
+  }
 
   const geometry = planQwen35TiedLogitsGeometry({
     weights: input.weights,
@@ -828,7 +948,7 @@ export function assembleQwen35StagedLogitsTileGpuCommands(input: {
     1,
     "storage",
     input.candidateOutput,
-    QWEN35_CANDIDATE_CAPACITY * 8,
+    QWEN35_STAGED_CANDIDATE_CAPACITY * 8,
     input.limits,
     "logits-staged-candidate-invalid",
   );
@@ -906,7 +1026,7 @@ export function assembleQwen35StagedFinalTokenCommand(input: {
     0,
     "storage",
     input.candidateOutput,
-    QWEN35_CANDIDATE_CAPACITY * 8,
+    QWEN35_STAGED_CANDIDATE_CAPACITY * 8,
     input.limits,
     "logits-staged-candidate-invalid",
   );

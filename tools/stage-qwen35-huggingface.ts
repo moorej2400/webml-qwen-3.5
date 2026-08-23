@@ -302,7 +302,7 @@ async function authenticateConvertedPackage(
   const manifest = validateModelPackageManifest(parsed as ModelPackageManifest);
   if (
     manifest.packageKind !== "language" ||
-    manifest.runtime.abi !== "qwen35-webgpu-v1" ||
+    manifest.runtime.abi !== "qwen35-webgpu-v2" ||
     !sameIdentity(manifest.source, contract.source) ||
     !sameIdentity(manifest.tokenizer, contract.tokenizer)
   ) {

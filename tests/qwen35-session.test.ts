@@ -493,6 +493,29 @@ test("streams split UTF-8 and masks every tokenizer-unmapped logit row", async (
   await session.dispose();
 });
 
+test("stops at the Qwen end token without consuming a synthetic next turn", async () => {
+  const fake = driver([97, 257, 98]);
+  const session = new Qwen35Session(runtime(fake.driver));
+  await session.load({});
+  await session.prefill([{ role: "user", content: "hello" }], {
+    enableThinking: false,
+  });
+
+  const output: string[] = [];
+  for await (const token of session.generate({ maxNewTokens: 3 })) {
+    output.push(token.text);
+  }
+
+  assert.equal(output.join(""), "a");
+  assert.deepEqual(
+    fake.events.filter((event) => event.startsWith("token:")),
+    ["token:97", "token:257"],
+  );
+  assert.equal(session.getMetrics().generatedTokens, 2);
+  assert.equal(session.state, "ready");
+  await session.dispose();
+});
+
 test("validates driver token ids before decode", async () => {
   const fake = driver([248_319]);
   const session = new Qwen35Session(runtime(fake.driver));

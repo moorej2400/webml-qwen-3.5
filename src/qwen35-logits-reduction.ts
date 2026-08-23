@@ -4,7 +4,7 @@ const QWEN35_LOGITS_TILE_ROWS = 1_024;
 const QWEN35_MATHEMATICAL_TILE_COUNT = Math.ceil(
   QWEN35_DECODABLE_TOKEN_COUNT / QWEN35_LOGITS_TILE_ROWS,
 );
-const QWEN35_TOP_K_CAPACITY = 256;
+const QWEN35_TOP_K_CAPACITY = 2_048;
 
 export const QWEN35_NO_SELECTED_TOKEN = 0xffff_ffff;
 
@@ -175,7 +175,7 @@ var<workgroup> best_found: array<u32, 64>;
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) local: vec3<u32>) {
   let lane = local.x;
-  if (lane == 0u) selected_token[0] = 0xffffffffu;
+  if (lane == 0u) { selected_token[0] = 0xffffffffu; }
   var found = false;
   var best_score = 0.0f;
   var best_token = 0xffffffffu;
@@ -209,7 +209,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>) {
     }
     workgroupBarrier();
   }
-  if (lane == 0u) selected_token[0] = best_tokens[0];
+  if (lane == 0u) { selected_token[0] = best_tokens[0]; }
 }`;
 
 function kernel(
@@ -286,6 +286,24 @@ export function planQwen35FinalTokenSelection(input: {
     input.candidateCount !== QWEN35_MATHEMATICAL_TILE_COUNT
   ) {
     throw new Error("Qwen3.5 logits candidate count is invalid");
+  }
+  return Object.freeze({
+    operation: "indexed-top-1",
+    uniformWords: Object.freeze([input.candidateCount, 0, 0, 0] as const),
+    workgroups: ONE_WORKGROUP,
+  });
+}
+
+/** Final reduction for physical-buffer winners emitted by fused resident logits. */
+export function planQwen35PhysicalCandidateSelection(input: {
+  readonly candidateCount: number;
+}): Qwen35LogitsReductionPlan {
+  if (
+    !Number.isSafeInteger(input.candidateCount) ||
+    input.candidateCount < QWEN35_MATHEMATICAL_TILE_COUNT ||
+    input.candidateCount > QWEN35_TOP_K_CAPACITY
+  ) {
+    throw new Error("Qwen3.5 physical logits candidate count is invalid");
   }
   return Object.freeze({
     operation: "indexed-top-1",

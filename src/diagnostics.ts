@@ -57,6 +57,13 @@ export function diagnosticError(
   return new RuntimeDiagnosticError(code, message);
 }
 
+/**
+ * Shared public boundary for stable machine codes; free-form error text is excluded.
+ * Runtime APIs already expose both kebab-case and SCREAMING_SNAKE_CASE codes.
+ */
+export const SAFE_DIAGNOSTIC_CODE_PATTERN =
+  "^(?:[a-z][a-z0-9-]{0,63}|[A-Z][A-Z0-9_]{0,63})$";
+
 export function isSafeDiagnosticCode(value: string): boolean {
-  return /^[a-z][a-z0-9-]{0,63}$/.test(value);
+  return new RegExp(SAFE_DIAGNOSTIC_CODE_PATTERN).test(value);
 }

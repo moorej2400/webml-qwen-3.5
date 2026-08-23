@@ -215,7 +215,7 @@ test("publishes shards and deterministic metadata by one atomic directory rename
   assert.equal(checksums.includes(sourcePath), false);
   const provenance = await readFile(join(outputDirectory, "source-provenance.json"), "utf8");
   assert.equal(provenance.includes(sourcePath), false);
-  assert.match(provenance, /"runtimeAbi": "qwen35-webgpu-v1"/u);
+  assert.match(provenance, /"runtimeAbi": "qwen35-webgpu-v2"/u);
   const licenses = await readFile(join(outputDirectory, "LICENSES.json"), "utf8");
   assert.match(licenses, /"spdx": "Apache-2.0"/u);
 });

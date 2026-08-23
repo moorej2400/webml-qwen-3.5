@@ -21,6 +21,7 @@ function fakeDevice(options: {
   readonly shaderModuleError?: boolean;
   readonly validationError?: boolean;
   readonly pipelineGate?: Promise<void>;
+  readonly queueRetirementError?: boolean;
   readonly validationGate?: Promise<void>;
   readonly writeError?: boolean;
 } = {}): {
@@ -60,6 +61,9 @@ function fakeDevice(options: {
       },
       async onSubmittedWorkDone() {
         events.push("done");
+        if (options.queueRetirementError === true) {
+          throw new Error("private queue retirement detail");
+        }
       },
     },
     createShaderModule() {
@@ -242,6 +246,57 @@ test("releases transient bind groups without recompiling pipelines", async () =>
 
   assert.equal(events.filter((event) => event === "pipeline").length, 1);
   assert.equal(events.filter((event) => event === "bind:1").length, 2);
+});
+
+test("releases only bind groups that reference transient layer buffers", async () => {
+  const { device, events } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const resident = { destroy() {} };
+  const transient = { destroy() {} };
+  const request = (buffer: object) => ({
+    kernel: {
+      id: "qwen35-selective-bind-release",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [{ binding: 0, kind: "storage" as const, buffer, offset: 0, size: 16 }],
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+
+  await executor.dispatchBatch([request(resident), request(transient)]);
+  executor.releaseBindGroupsForBuffers([transient]);
+  await executor.dispatchBatch([request(resident), request(transient)]);
+
+  assert.equal(events.filter((event) => event === "bind:1").length, 3);
+  assert.equal(events.filter((event) => event === "pipeline").length, 1);
+});
+
+test("bounds page-sensitive bind-group retention with deterministic eviction", async () => {
+  const { device, events } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const request = (buffer: object) => ({
+    kernel: {
+      id: "qwen35-bind-group-capacity",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [{ binding: 0, kind: "storage" as const, buffer, offset: 0, size: 16 }],
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+  const first = { destroy() {} };
+
+  await executor.dispatch(request(first));
+  for (let index = 0; index < 4_096; index += 1) {
+    await executor.dispatch(request({ destroy() {} }));
+  }
+  await executor.dispatch(request(first));
+
+  assert.equal(
+    events.filter((event) => event === "bind:1").length,
+    4_098,
+    "the oldest page binding must be evicted after the fixed cache fills",
+  );
+  await executor.dispose();
 });
 
 test("bounds the fixed-program kernel cache at exactly 39 lifetime entries", async () => {
@@ -460,6 +515,26 @@ test("fails closed on asynchronous WebGPU validation errors", async () => {
   assert.equal(events.filter((event) => event === "done").length, 2);
 });
 
+test("poisons the executor when queue retirement fails", async () => {
+  const { device } = fakeDevice({ queueRetirementError: true });
+  const executor = new Qwen35WebGpuExecutor(device);
+
+  await assert.rejects(executor.submittedWorkDone(), {
+    code: "webgpu-queue-retirement-failed",
+    message: "Qwen3.5 WebGPU queue retirement failed",
+  });
+  await assert.rejects(executor.dispatch({
+    kernel: {
+      id: "qwen35-retirement-poisoned",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [],
+    workgroups: { x: 1, y: 1, z: 1 },
+  }), { code: "webgpu-executor-poisoned" });
+  await assert.rejects(executor.dispose(), { code: "webgpu-cleanup-failed" });
+});
+
 test("sanitizes dispatch error-scope setup throws", async () => {
   const { device, events } = fakeDevice({ pushErrorScopeError: true });
   const executor = new Qwen35WebGpuExecutor(device);
@@ -634,7 +709,7 @@ test("disposal waits for an in-flight dispatch validation scope", async () => {
   assert.equal(disposed, true);
 });
 
-test("reads back only the selected u32 and destroys its temporary buffer", async () => {
+test("reads back only the selected u32 and retains the reusable buffer until disposal", async () => {
   const { device, events, buffers } = fakeDevice();
   const executor = new Qwen35WebGpuExecutor(device);
   const source = device.createBuffer({ label: "source", size: 16, usage: 0 });
@@ -652,6 +727,49 @@ test("reads back only the selected u32 and destroys its temporary buffer", async
   assert.equal(events.includes("copy:4"), true);
   assert.equal(events.includes("map"), true);
   assert.equal(events.includes("unmap"), true);
+  assert.equal(buffers.at(-1)?.destroyed, false);
+  await executor.dispose();
+  assert.equal(buffers.at(-1)?.destroyed, true);
+});
+
+test("reuses an unmapped scalar readback buffer across serialized selections", async () => {
+  const { device, buffers } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const source = device.createBuffer({ label: "source", size: 16, usage: 0 });
+  device.queue.writeBuffer(source, 0, Uint32Array.of(7).buffer, 0, 4);
+
+  assert.equal(await executor.readU32(source, 0), 7);
+  assert.equal(await executor.readU32(source, 0), 7);
+  assert.equal(buffers.length, 2, "one source and one reusable scalar readback buffer");
+  assert.equal(buffers[1]?.destroyed, false);
+
+  await executor.dispose();
+  assert.equal(buffers[1]?.destroyed, true);
+});
+
+test("submits compute and selected-token readback in one command buffer", async () => {
+  const { device, events, buffers } = fakeDevice();
+  const executor = new Qwen35WebGpuExecutor(device);
+  const source = device.createBuffer({ label: "source", size: 16, usage: 0 });
+  device.queue.writeBuffer(source, 4, Uint32Array.of(42).buffer, 0, 4);
+  const request = {
+    kernel: {
+      id: "qwen35-combined-readback-test",
+      source: "@compute @workgroup_size(1) fn main() {}",
+      entryPoint: "main",
+    },
+    bindings: [],
+    workgroups: { x: 1, y: 1, z: 1 },
+  } as const;
+
+  const value = await executor.dispatchBatchAndReadU32([request], source, 4);
+
+  assert.equal(value, 42);
+  assert.equal(events.filter((event) => event === "submit").length, 1);
+  assert.ok(events.indexOf("end-pass") < events.indexOf("copy:4"));
+  assert.ok(events.indexOf("copy:4") < events.indexOf("finish"));
+  assert.equal(buffers.at(-1)?.destroyed, false);
+  await executor.dispose();
   assert.equal(buffers.at(-1)?.destroyed, true);
 });
 
@@ -677,15 +795,12 @@ test("sanitizes readback error-scope setup throws", async () => {
   await executor.dispose();
 });
 
-test("does not report a selected token when readback cleanup fails", async () => {
+test("reports a token before reusable readback cleanup and fails closed on disposal", async () => {
   const { device } = fakeDevice({ destroyError: true });
   const executor = new Qwen35WebGpuExecutor(device);
   const source = device.createBuffer({ label: "source", size: 4, usage: 0 });
 
-  await assert.rejects(executor.readU32(source, 0), {
-    code: "webgpu-readback-cleanup-failed",
-    message: "Qwen3.5 WebGPU readback cleanup failed",
-  });
+  assert.equal(await executor.readU32(source, 0), 0);
   await assert.rejects(executor.dispose(), {
     code: "webgpu-cleanup-failed",
   });
@@ -705,7 +820,7 @@ test("sanitizes shader compiler failures and permanently blocks submissions afte
   } as const;
 
   await assert.rejects(executor.dispatch(request), {
-    code: "webgpu-kernel-compile-failed",
+    code: "webgpu-compile-qwen35-test-kernel",
     message: "Qwen3.5 WebGPU kernel compilation failed",
   });
   assert.equal(events.includes("pipeline"), false);
@@ -735,7 +850,7 @@ test("sanitizes synchronous shader-module creation throws", async () => {
     assert.equal((error as Error).name, "RuntimeDiagnosticError");
     assert.equal(
       (error as Error & { code?: string }).code,
-      "webgpu-kernel-compile-failed",
+      "webgpu-compile-qwen35-private-module-kernel",
     );
     assert.equal(
       (error as Error).message,

@@ -61,14 +61,14 @@ test("moves an impulse from convolution tap 3 through tap 0", async () => {
   );
 });
 
-test("maps tiled value heads to Q/K heads with h modulo 16", async () => {
+test("repeats the Q/K head sequence across both value-head halves", async () => {
   const module = await loadDeltaNetModule();
   assert.equal(typeof module.qwen35DeltaNetQkHead, "function");
   const map = module.qwen35DeltaNetQkHead as (head: number) => number;
 
   assert.deepEqual(
     Array.from({ length: 32 }, (_, head) => map(head)),
-    [...Array.from({ length: 16 }, (_, head) => head), ...Array.from({ length: 16 }, (_, head) => head)],
+    Array.from({ length: 32 }, (_, head) => head % 16),
   );
   assert.throws(() => map(32), /value head/i);
 });

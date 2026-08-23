@@ -6,6 +6,7 @@ import {
   planQwen35PackedEmbeddingDispatch,
   planQwen35VisualEmbeddingDispatch,
   planQwen35PackedGemvDispatches,
+  planQwen35TwinQ3GemvDispatches,
   planQwen35TiedLogitsGeometry,
   planQwen35TiedLogitsDispatches,
   type Qwen35ForwardDeviceLimits,
@@ -36,6 +37,7 @@ const limits: Qwen35ForwardDeviceLimits = {
   maxStorageBufferBindingSize: 1 << 30,
   maxUniformBufferBindingSize: 65_536,
   maxComputeWorkgroupsPerDimension: 65_535,
+  supportsSubgroups: true,
 };
 
 test("plans a projected visual-token row into the language hidden workspace", () => {
@@ -111,6 +113,94 @@ function slice(buffer: object, byteLength: number, offset = 0) {
 function consumeRequest(request: Qwen35DispatchRequest): Qwen35DispatchRequest {
   return request;
 }
+
+test("fuses equal Q3 projections that share one activation", () => {
+  const firstWeights = {};
+  const secondWeights = {};
+  const activation = {};
+  const packedActivation = {};
+  const output = {};
+  const uniform = {};
+  const first = tensor({
+    name: "blk.0.ffn_gate.weight",
+    shape: [2_560, 9_216],
+    ggmlType: GgmlType.Q3_K,
+    storageType: "q3-k-fused-f32-192",
+    rowBytes: 1_920,
+    splits: [9_216],
+    buffers: [firstWeights],
+  });
+  const second = tensor({
+    name: "blk.0.ffn_up.weight",
+    shape: [2_560, 9_216],
+    ggmlType: GgmlType.Q3_K,
+    storageType: "q3-k-fused-f32-192",
+    rowBytes: 1_920,
+    splits: [9_216],
+    buffers: [secondWeights],
+  });
+
+  const plans = planQwen35TwinQ3GemvDispatches({
+    weights: directory([first, second]),
+    firstTensorName: first.name,
+    secondTensorName: second.name,
+    activation: slice(activation, 2_560 * 4),
+    packedActivation: slice(packedActivation, 2_560 * 2),
+    output: slice(output, 9_216 * 4),
+    uniform: slice(uniform, 20),
+    limits,
+  });
+
+  assert.ok(plans !== null);
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0]!.kernel.id, "q3-k-fused-f32-192-swiglu-gemv-mobile-f16-subgroup");
+  assert.match(plans[0]!.kernel.source, /row_sums/);
+  assert.deepEqual(plans[0]!.workgroups, { x: 2_304, y: 1, z: 1 });
+  assert.deepEqual(plans[0]!.uniformWords, [9_216, 2_560, 10, 0, 0]);
+  assert.equal(plans[0]!.bindings[0]!.buffer, firstWeights);
+  assert.equal(plans[0]!.bindings[1]!.buffer, secondWeights);
+  assert.equal(plans[0]!.bindings[2]!.buffer, activation);
+  assert.equal(plans[0]!.bindings[3]!.buffer, output);
+  assert.equal(plans[0]!.bindings[4]!.buffer, uniform);
+  assert.match(plans[0]!.kernel.source, /output\[logical_row\].*exp\(-gate\).*up/);
+});
+
+test("uses a portable fused Q3 SwiGLU path without subgroup feature evidence", () => {
+  const first = tensor({
+    name: "blk.0.ffn_gate.weight",
+    shape: [2_560, 9_216],
+    ggmlType: GgmlType.Q3_K,
+    storageType: "q3-k-fused-f32-192",
+    rowBytes: 1_920,
+    splits: [9_216],
+  });
+  const second = tensor({
+    name: "blk.0.ffn_up.weight",
+    shape: [2_560, 9_216],
+    ggmlType: GgmlType.Q3_K,
+    storageType: "q3-k-fused-f32-192",
+    rowBytes: 1_920,
+    splits: [9_216],
+  });
+  const activation = {};
+  const plans = planQwen35TwinQ3GemvDispatches({
+    weights: directory([first, second]),
+    firstTensorName: first.name,
+    secondTensorName: second.name,
+    activation: slice(activation, 2_560 * 4),
+    packedActivation: slice({}, 2_560 * 2),
+    output: slice({}, 9_216 * 4),
+    uniform: slice({}, 20),
+    limits: { ...limits, supportsSubgroups: false },
+  });
+
+  assert.ok(plans !== null);
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0]!.kernel.id, "q3-k-fused-f32-192-swiglu-gemv-portable-f32");
+  assert.equal(plans[0]!.bindings[2]!.buffer, activation);
+  assert.deepEqual(plans[0]!.workgroups, { x: 9_216, y: 1, z: 1 });
+  assert.doesNotMatch(plans[0]!.kernel.source, /enable subgroups|subgroupAdd/);
+});
 
 test("locates one packed embedding row inside its physical buffer", () => {
   const first = {};
@@ -188,26 +278,26 @@ test("aligns a staged Q6_K cache row before binding its packed prefix", async ()
   const plan = subject.planQwen35StagedPackedEmbeddingDispatch({
     rows: {
       tensorName: "token_embd.weight",
-      storageType: "q6-k-212",
+      storageType: "q6-k-fused-f32-256",
       firstRow: 17,
       rowCount: 1,
-      rowBytes: 2_120,
+      rowBytes: 2_560,
       buffer: packedCache,
-      bufferOffset: 2_120,
-      byteLength: 2_120,
+      bufferOffset: 2_240,
+      byteLength: 2_560,
     },
     output: slice(output, 10_240),
     uniform: slice(uniform, 16),
     limits,
   });
 
-  assert.equal(plan.kernel.id, "q6-k-212-embedding-row-shared-portable-f32");
+  assert.equal(plan.kernel.id, "q6-k-fused-f32-256-embedding-row-shared-portable-f32");
   assert.deepEqual(plan.bindings, [
-    { binding: 0, kind: "storage", buffer: packedCache, offset: 2_048, size: 2_192 },
+    { binding: 0, kind: "storage", buffer: packedCache, offset: 2_048, size: 2_752 },
     { binding: 1, kind: "storage", buffer: output, offset: 0, size: 10_240 },
     { binding: 2, kind: "uniform", buffer: uniform, offset: 0, size: 16 },
   ]);
-  assert.deepEqual(plan.uniformWords, [18, 2_560, 10, 0]);
+  assert.deepEqual(plan.uniformWords, [48, 2_560, 10, 0]);
   assert.deepEqual(plan.workgroups, { x: 10, y: 1, z: 1 });
 });
 
@@ -222,8 +312,9 @@ test("plans every physical matrix row range for all six packed layouts", () => {
   ] as const;
 
   for (const [ggmlType, storageType, valuesPerBlock, bytesPerBlock] of layouts) {
-    const columns = valuesPerBlock * 2;
-    const rowBytes = bytesPerBlock * 2;
+    const columns = storageType === "q8-0-36" ? 512 : valuesPerBlock * 2;
+    const blocksPerRow = columns / valuesPerBlock;
+    const rowBytes = bytesPerBlock * blocksPerRow;
     const weightBuffers = [{}, {}];
     const activation = {};
     const output = {};
@@ -240,24 +331,148 @@ test("plans every physical matrix row range for all six packed layouts", () => {
       })]),
       tensorName: "blk.0.ffn_down.weight",
       activation: slice(activation, columns * 4),
+      ...(storageType !== "f32"
+        ? { packedActivation: slice({}, columns * 2) }
+        : {}),
       output: slice(output, 12),
       uniforms: uniforms.map((buffer) => slice(buffer, 20)),
       limits,
     });
 
-    assert.equal(plans.length, 2, storageType);
-    assert.equal(plans[0]?.kernel.id, `${storageType}-gemv-shared-portable-f32`);
-    assert.equal(plans[0]?.kernel.entryPoint, "packed_gemv");
-    assert.deepEqual(plans.map((plan) => plan.uniformWords), [
-      [1, columns, 2, 0, 0],
-      [2, columns, 2, 0, 1],
+    const usesFastKernel = storageType !== "f32";
+    const usesSeparatePack = usesFastKernel && storageType !== "q8-0-36";
+    assert.equal(plans.length, usesSeparatePack ? 3 : 2, storageType);
+    const matrixPlans = usesSeparatePack ? plans.slice(1) : plans;
+    const profile = usesFastKernel
+      ? "mobile-f16-subgroup"
+      : "portable-f32";
+    assert.equal(matrixPlans[0]?.kernel.id, `${storageType}-gemv-shared-${profile}`);
+    assert.equal(matrixPlans[0]?.kernel.entryPoint, "packed_gemv");
+    assert.deepEqual(matrixPlans.map((plan) => plan.uniformWords), [
+      [1, columns, blocksPerRow, 0, 0],
+      [2, columns, blocksPerRow, 0, 1],
     ]);
-    assert.deepEqual(plans.map((plan) => plan.workgroups), [
+    assert.deepEqual(matrixPlans.map((plan) => plan.workgroups), [
       { x: 1, y: 1, z: 1 },
-      { x: 2, y: 1, z: 1 },
+      { x: usesFastKernel ? 1 : 2, y: 1, z: 1 },
     ]);
-    assert.deepEqual(plans.map((plan) => plan.bindings[0]?.buffer), weightBuffers);
-    assert.equal(consumeRequest(plans[0]!), plans[0]);
+    assert.deepEqual(matrixPlans.map((plan) => plan.bindings[0]?.buffer), weightBuffers);
+    assert.equal(consumeRequest(matrixPlans[0]!), matrixPlans[0]);
+  }
+});
+
+test("selects the portable Q8 GEMV when the device has no subgroups", () => {
+  const columns = 512;
+  const weights = directory([tensor({
+    name: "blk.0.ffn_down.weight",
+    shape: [columns, 1],
+    ggmlType: GgmlType.Q8_0,
+    storageType: "q8-0-36",
+    rowBytes: 576,
+    splits: [1],
+    buffers: [{}],
+  })]);
+  const plans = planQwen35PackedGemvDispatches({
+    weights,
+    tensorName: "blk.0.ffn_down.weight",
+    activation: slice({}, columns * 4),
+    output: slice({}, 4),
+    uniforms: [slice({}, 20)],
+    limits: { ...limits, supportsSubgroups: false },
+  });
+
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0]!.kernel.id, "q8-0-36-gemv-shared-portable-f32");
+  assert.doesNotMatch(plans[0]!.kernel.source, /enable subgroups/);
+});
+
+test("converts F32 activation inside a browser fused Q3 GEMV", () => {
+  const weightBuffer = {};
+  const activation = {};
+  const packedActivation = {};
+  const output = {};
+  const uniform = {};
+  const plans = planQwen35PackedGemvDispatches({
+    weights: directory([tensor({
+      name: "blk.0.ffn_gate.weight",
+      shape: [2_560, 2],
+      ggmlType: GgmlType.Q3_K,
+      storageType: "q3-k-fused-f32-192",
+      rowBytes: 1_920,
+      splits: [2],
+      buffers: [weightBuffer],
+    })]),
+    tensorName: "blk.0.ffn_gate.weight",
+    activation: slice(activation, 10_240),
+    packedActivation: slice(packedActivation, 5_120),
+    output: slice(output, 8),
+    uniforms: [slice(uniform, 20)],
+    limits,
+  });
+
+  assert.equal(plans.length, 1);
+  assert.equal(
+    plans[0]?.kernel.id,
+    "q3-k-fused-f32-192-gemv-shared-mobile-f16-subgroup",
+  );
+  assert.equal(plans[0]?.bindings[1]?.buffer, activation);
+  assert.equal(plans[0]?.bindings[1]?.size, 10_240);
+  assert.match(plans[0]?.kernel.source ?? "", /activation: array<f32>/);
+});
+
+test("converts F32 activation inside a browser Q8 GEMV", () => {
+  const packedActivation = {};
+  const plans = planQwen35PackedGemvDispatches({
+    weights: directory([tensor({
+      name: "blk.0.ssm_out.weight",
+      shape: [4_096, 2_560],
+      ggmlType: GgmlType.Q8_0,
+      storageType: "q8-0-36",
+      rowBytes: 4_608,
+      splits: [2_560],
+      buffers: [{}],
+    })]),
+    tensorName: "blk.0.ssm_out.weight",
+    activation: slice({}, 4_096 * 4),
+    packedActivation: slice(packedActivation, 4_096 * 2),
+    output: slice({}, 2_560 * 4),
+    uniforms: [slice({}, 20)],
+    limits,
+  });
+  assert.equal(plans.length, 1);
+  assert.equal(plans[0]?.bindings[1]?.size, 4_096 * 4);
+  assert.match(plans[0]?.kernel.source ?? "", /activation: array<f32>/);
+});
+
+test("packs one lane-major FP16 activation before a browser fused Q5 GEMV", () => {
+  for (const [ggmlType, storageType, rowBytes] of [
+    [GgmlType.Q5_K, "q5-k-fused-f32-224", 8_064],
+  ] as const) {
+    const packedActivation = {};
+    const plans = planQwen35PackedGemvDispatches({
+      weights: directory([tensor({
+        name: "blk.0.ffn_down.weight",
+        shape: [9_216, 2_560],
+        ggmlType,
+        storageType,
+        rowBytes,
+        splits: [2_560],
+        buffers: [{}],
+      })]),
+      tensorName: "blk.0.ffn_down.weight",
+      activation: slice({}, 9_216 * 4),
+      packedActivation: slice(packedActivation, 9_216 * 2),
+      output: slice({}, 2_560 * 4),
+      uniforms: [slice({}, 20)],
+      limits,
+    });
+
+    assert.equal(plans.length, 2);
+    assert.equal(plans[0]?.kernel.id, "qwen35-pack-lane-f16-activation");
+    assert.deepEqual(plans[0]?.workgroups, { x: 18, y: 1, z: 1 });
+    assert.equal(plans[1]?.kernel.id, `${storageType}-gemv-shared-mobile-f16-subgroup`);
+    assert.equal(plans[1]?.bindings[1]?.buffer, packedActivation);
+    assert.match(plans[1]?.kernel.source ?? "", /activation: array<u32>/);
   }
 });
 

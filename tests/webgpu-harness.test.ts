@@ -32,6 +32,8 @@ test("ships a deterministic browser execution and CPU parity harness", async () 
   assert.match(html, /Executes all pinned language kernels/);
   assert.doesNotMatch(html, /Compiles all pinned language/);
   assert.match(script, /LANGUAGE_GEMV_KERNELS/);
+  assert.match(script, /repackNativeQ3KFusedBrowser/);
+  assert.match(script, /q6-k-fused-f32-256/);
   assert.match(script, /QWEN_PRIMITIVE_KERNELS/);
   assert.match(script, /PACKED_EMBEDDING_KERNELS/);
   assert.match(script, /QWEN35_VISION_FOUNDATION_KERNELS/);

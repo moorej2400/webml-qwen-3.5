@@ -8,6 +8,7 @@ import {
   type Qwen35BrowserLoadOptions,
 } from "../../src/qwen35-model-loader.js";
 import type { BufferShardPolicy } from "../../src/device-profile.js";
+import type { Qwen35WeightResidencyPolicy } from "../../src/qwen35-weight-upload.js";
 
 export type BrowserRuntimeConfiguration = Readonly<
   Pick<
@@ -19,6 +20,8 @@ export type BrowserRuntimeConfiguration = Readonly<
     | "compiledTokenizerUrl"
     | "bufferShardPolicy"
     | "uploadLaneBytes"
+    | "residencyPolicy"
+    | "residentLayerCount"
   >
   & {
     readonly uploadDiagnostics?: true;
@@ -35,6 +38,10 @@ export interface BrowserRuntimeEnvironment {
   readonly uploadDiagnostics?: true;
   readonly uploadLaneBytes?: number;
   readonly retireUploadAfterEachWrite?: boolean;
+  /** Local-only experiment selector; product defaults remain model-loader owned. */
+  readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
+  /** Required only for the local hybrid resident-prefix experiment. */
+  readonly residentLayerCount?: number;
 }
 
 const MIB = 1024 * 1024;
@@ -54,6 +61,11 @@ const UPLOAD_PROBE_TRIALS = Object.freeze({
   "lane-16": Object.freeze({
     bufferShardPolicy: "evidence-128",
     uploadLaneBytes: 16 * MIB,
+    retireUploadAfterEachWrite: false,
+  }),
+  "lane-64": Object.freeze({
+    bufferShardPolicy: "evidence-128",
+    uploadLaneBytes: 64 * MIB,
     retireUploadAfterEachWrite: false,
   }),
   "lane-8": Object.freeze({
@@ -107,6 +119,29 @@ const parseBufferShardPolicy = (value: string | undefined): BufferShardPolicy =>
   if (value === undefined || value === "") return "default";
   if (value === "evidence-128" || value === "evidence-64") return value;
   throw new Error("Runtime buffer shard policy is invalid");
+};
+
+const parseResidencyPolicy = (
+  value: string | undefined,
+): Qwen35WeightResidencyPolicy | undefined => {
+  if (value === undefined || value === "") return undefined;
+  if (value === "auto" || value === "resident" || value === "rolling" || value === "hybrid") return value;
+  throw new Error("Runtime residency policy is invalid");
+};
+
+/** The fixed Qwen3.5 program has 32 layers; hybrid must leave a streamed suffix. */
+const parseResidentLayerCount = (
+  policy: Qwen35WeightResidencyPolicy | undefined,
+  value: string | undefined,
+): number | undefined => {
+  if (policy !== "hybrid") {
+    if (value === undefined || value === "") return undefined;
+    throw new Error("Runtime resident layer count requires hybrid residency");
+  }
+  if (value === undefined || !/^(?:[1-9]|[12][0-9]|3[01])$/.test(value)) {
+    throw new Error("Runtime hybrid resident layer count must be between 1 and 31");
+  }
+  return Number(value);
 };
 
 const requireValue = (
@@ -171,6 +206,13 @@ export const loadBrowserRuntimeEnvironment = (
     throw new Error("Runtime manifest SHA-256 must be an exact lowercase digest");
   }
   const uploadProbe = parseUploadProbeTrial(environment);
+  const residencyPolicy = parseResidencyPolicy(
+    environment.QWEN_RUNTIME_RESIDENCY_POLICY,
+  );
+  const residentLayerCount = parseResidentLayerCount(
+    residencyPolicy,
+    environment.QWEN_RUNTIME_RESIDENT_LAYER_COUNT,
+  );
   return Object.freeze({
     manifestPath: validateLocalPath(
       requireValue(environment, "QWEN_RUNTIME_MANIFEST", "Runtime manifest path"),
@@ -195,6 +237,8 @@ export const loadBrowserRuntimeEnvironment = (
       "file",
     ),
     ...uploadProbe,
+    ...(residencyPolicy === undefined ? {} : { residencyPolicy }),
+    ...(residentLayerCount === undefined ? {} : { residentLayerCount }),
   });
 };
 
@@ -265,6 +309,12 @@ export const loadBrowserRuntimeConfiguration = async (options: {
     ...trust,
     compiledTokenizerUrl: options.environment.compiledTokenizerUrl,
     bufferShardPolicy: options.environment.bufferShardPolicy,
+    ...(options.environment.residencyPolicy === undefined
+      ? {}
+      : { residencyPolicy: options.environment.residencyPolicy }),
+    ...(options.environment.residentLayerCount === undefined
+      ? {}
+      : { residentLayerCount: options.environment.residentLayerCount }),
     ...(options.environment.uploadDiagnostics === true
       ? {
           uploadDiagnostics: true as const,

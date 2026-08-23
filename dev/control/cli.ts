@@ -16,6 +16,7 @@ import {
 } from "../../src/qwen35-model-loader.js";
 import { modelCacheKey } from "../../src/opfs-model-cache.js";
 import { RunJournal } from "./run-journal.js";
+import { assertLocalPackageShards } from "./local-package.js";
 import {
   createDevelopmentServer,
   createOperatorServer,
@@ -52,6 +53,10 @@ const localRuntimeConfiguration =
           })),
         });
         assertQwen35PackageIdentity(manifest);
+        await assertLocalPackageShards({
+          directory: localPackageDirectory,
+          shards: packageManifest.shards.map(({ url, length, sha256 }) => ({ url, length, sha256 })),
+        });
         const visionPackagePins = localVisionPackageDirectory === undefined
           ? undefined
           : await (async () => {

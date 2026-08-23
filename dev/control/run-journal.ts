@@ -1,6 +1,10 @@
 import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
+import {
+  ALLOCATION_DIAGNOSTIC_CODES,
+  isSafeDiagnosticCode,
+} from "../../src/diagnostics.js";
 import type { CoarseOsFamily } from "./device-correlation.js";
 import { validateProtocolId } from "./protocol.js";
 
@@ -56,14 +60,7 @@ const UPLOAD_EVENT_NAMES = new Set([
   "after_write",
   "after_retire",
 ]);
-const ALLOCATION_DIAGNOSTIC_CODES = new Set([
-  "gpu_out_of_memory",
-  "gpu_validation",
-  "buffer_creation",
-  "error_scope",
-  "allocation_conflict",
-  "unknown",
-]);
+const ALLOCATION_DIAGNOSTIC_CODE_SET = new Set<string>(ALLOCATION_DIAGNOSTIC_CODES);
 const NUMERIC_METRIC_KEYS = new Set([
   "durationMs",
   "bytes",
@@ -79,7 +76,11 @@ const NUMERIC_METRIC_KEYS = new Set([
   "tokensPerSecond",
   "allocationBytes",
   "peakBytes",
+  "contextTokens",
   "count",
+  "targetStepCount",
+  "targetStepDurationMs",
+  "emittedTokensPerSecond",
   "expected",
   "observed",
   "sequence",
@@ -91,6 +92,21 @@ const LOAD_PROGRESS_METRIC_KEYS = new Set([
   "shardCount",
   "currentGpuBytes",
   "peakGpuBytes",
+]);
+const PERFORMANCE_METRIC_KEYS = new Set([
+  "decodedTextCodeUnits",
+  "referenceTokenCount",
+  "referenceTokenMismatchCount",
+  "referenceFirstMismatchIndex",
+  "referenceExpectedTokenId",
+  "referenceObservedTokenId",
+  "performanceSnapshotCount",
+  "diskReadBytes",
+  "gpuUploadBytes",
+  "dispatchCount",
+  "queueSubmissionCount",
+  "queueRetirementCount",
+  "gpuReadbackCount",
 ]);
 const BOOLEAN_METRIC_KEYS = new Set(["cacheHit", "deviceLost"]);
 const STRING_METRIC_VALUES: Readonly<Record<string, ReadonlySet<string>>> = {
@@ -163,6 +179,14 @@ const sanitizeMetrics = (value: unknown): Record<string, unknown> => {
   const result: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
     if (
+      PERFORMANCE_METRIC_KEYS.has(key) &&
+      Number.isSafeInteger(entry) &&
+      (entry as number) >= 0
+    ) {
+      result[key] = entry;
+      continue;
+    }
+    if (
       LOAD_PROGRESS_METRIC_KEYS.has(key) &&
       Number.isSafeInteger(entry) &&
       (entry as number) >= 0
@@ -217,7 +241,8 @@ const sanitizeRuntimeErrorMetrics = (value: unknown): Record<string, unknown> =>
   const result: Record<string, unknown> = {};
   if (Object.hasOwn(input, "code")) {
     result.code =
-      typeof input.code === "string" && ALLOCATION_DIAGNOSTIC_CODES.has(input.code)
+      typeof input.code === "string" &&
+        (ALLOCATION_DIAGNOSTIC_CODE_SET.has(input.code) || isSafeDiagnosticCode(input.code))
         ? input.code
         : "unknown";
   }

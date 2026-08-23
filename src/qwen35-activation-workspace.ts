@@ -16,9 +16,9 @@ const LOGITS_TILE_ROWS = 1_024;
 const MATHEMATICAL_VOCABULARY_TILE_COUNT = Math.ceil(
   QWEN35_VOCABULARY_SIZE / LOGITS_TILE_ROWS,
 );
-// The scheduler must coalesce physical shard dispatches into one winner per
-// mathematical tile before using these 256 final-reduction candidate slots.
-const TOP_K_CANDIDATE_CAPACITY = 256;
+// The generic staged path uses 243 slots. Resident Q6 scoring uses more,
+// smaller ranges so the GPU has enough parallel work during vocabulary scan.
+const TOP_K_CANDIDATE_CAPACITY = 2_048;
 const SCALAR_BYTES = 4;
 
 export type Qwen35ActivationResourceKind =
@@ -36,6 +36,7 @@ export type Qwen35ActivationResourceKind =
   | "ffn-gate"
   | "ffn-up"
   | "ffn-product"
+  | "packed-gemv-input-f16"
   | "logits-tile"
   | "top-k-scores"
   | "top-k-indices"
@@ -43,7 +44,7 @@ export type Qwen35ActivationResourceKind =
 
 export interface Qwen35ActivationResourcePlan {
   readonly kind: Qwen35ActivationResourceKind;
-  readonly scalarType: "f32" | "u32";
+  readonly scalarType: "f16" | "f32" | "u32";
   readonly elementCount: number;
   readonly bytes: bigint;
   readonly usage: number;
@@ -58,7 +59,7 @@ export interface Qwen35ActivationWorkspacePlan {
   /** Shape arithmetic only; physical weight views may require more dispatches. */
   readonly mathematicalVocabularyTileCount: number;
   /** One candidate per mathematical tile after physical dispatch coalescing. */
-  readonly topKCandidateCapacity: 256;
+  readonly topKCandidateCapacity: 2_048;
   /** Final top-1 writes a vocabulary id or this no-selection u32 sentinel. */
   readonly selectedTokenInvalidSentinel: 0xffff_ffff;
   readonly deltanetParameterLiveness: Qwen35DeltaNetParameterLiveness;
@@ -122,7 +123,7 @@ export interface CreateQwen35ActivationWorkspaceOptions {
 function resource(
   kind: Qwen35ActivationResourceKind,
   elementCount: number,
-  scalarType: "f32" | "u32" = "f32",
+  scalarType: "f16" | "f32" | "u32" = "f32",
 ): Qwen35ActivationResourcePlan {
   // Only the final vocabulary id crosses to CPU; intermediate candidates stay
   // GPU-resident even when no valid finite score survives reduction.
@@ -131,7 +132,7 @@ function resource(
     kind,
     scalarType,
     elementCount,
-    bytes: BigInt(elementCount * SCALAR_BYTES),
+    bytes: BigInt(elementCount * (scalarType === "f16" ? 2 : SCALAR_BYTES)),
     usage: readback ? STORAGE_CLEAR_AND_READBACK : STORAGE_AND_CLEAR,
   });
 }
@@ -193,6 +194,7 @@ const ACTIVATION_PLAN: Qwen35ActivationWorkspacePlan = (() => {
     resource("ffn-gate", 9_216),
     resource("ffn-up", 9_216),
     resource("ffn-product", 9_216),
+    resource("packed-gemv-input-f16", 9_216, "f16"),
     resource("logits-tile", LOGITS_TILE_ROWS),
     resource("top-k-scores", TOP_K_CANDIDATE_CAPACITY),
     resource("top-k-indices", TOP_K_CANDIDATE_CAPACITY, "u32"),

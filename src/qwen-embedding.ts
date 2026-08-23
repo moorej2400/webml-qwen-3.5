@@ -1,5 +1,17 @@
 import { GgmlType, type GgmlType as GgmlTypeValue } from "./gguf.js";
 import {
+  BROWSER_Q3_K_BLOCK_BYTES,
+  BROWSER_Q3_FUSED_K_BLOCK_BYTES,
+  BROWSER_Q4_K_BLOCK_BYTES,
+  BROWSER_Q5_K_BLOCK_BYTES,
+  BROWSER_Q6_K_BLOCK_BYTES,
+  dequantizeBrowserQ3KBlock,
+  dequantizeBrowserQ3KFusedBlock,
+  dequantizeBrowserQ4KBlock,
+  dequantizeBrowserQ5KBlock,
+  dequantizeBrowserQ6KBlock,
+} from "./browser-quant.js";
+import {
   packedWeightDecoder,
   type GemvLayout,
 } from "./mixed-gemv.js";
@@ -46,10 +58,28 @@ const PACKED_LAYOUTS: readonly PackedLayout[] = Object.freeze([
     bytesPerBlock: 112,
   }),
   Object.freeze({
+    ggmlType: GgmlType.Q3_K,
+    storageType: "q3-k-nibble-148",
+    valuesPerBlock: 256,
+    bytesPerBlock: BROWSER_Q3_K_BLOCK_BYTES,
+  }),
+  Object.freeze({
+    ggmlType: GgmlType.Q3_K,
+    storageType: "q3-k-fused-f32-192",
+    valuesPerBlock: 256,
+    bytesPerBlock: BROWSER_Q3_FUSED_K_BLOCK_BYTES,
+  }),
+  Object.freeze({
     ggmlType: GgmlType.Q4_K,
     storageType: "q4-k-144",
     valuesPerBlock: 256,
     bytesPerBlock: 144,
+  }),
+  Object.freeze({
+    ggmlType: GgmlType.Q4_K,
+    storageType: "q4-k-fused-f32-192",
+    valuesPerBlock: 256,
+    bytesPerBlock: BROWSER_Q4_K_BLOCK_BYTES,
   }),
   Object.freeze({
     ggmlType: GgmlType.Q5_K,
@@ -58,10 +88,22 @@ const PACKED_LAYOUTS: readonly PackedLayout[] = Object.freeze([
     bytesPerBlock: 176,
   }),
   Object.freeze({
+    ggmlType: GgmlType.Q5_K,
+    storageType: "q5-k-fused-f32-224",
+    valuesPerBlock: 256,
+    bytesPerBlock: BROWSER_Q5_K_BLOCK_BYTES,
+  }),
+  Object.freeze({
     ggmlType: GgmlType.Q6_K,
     storageType: "q6-k-212",
     valuesPerBlock: 256,
     bytesPerBlock: 212,
+  }),
+  Object.freeze({
+    ggmlType: GgmlType.Q6_K,
+    storageType: "q6-k-fused-f32-256",
+    valuesPerBlock: 256,
+    bytesPerBlock: BROWSER_Q6_K_BLOCK_BYTES,
   }),
 ]);
 
@@ -83,12 +125,22 @@ function blockValues(storageType: GemvLayout, bytes: Uint8Array): Float32Array {
       return dequantizeQ8_0Block(unpackWebGpuQ8_0Block(bytes));
     case "q3-k-112":
       return dequantizeQ3KBlock(unpackWebGpuQ3KBlock(bytes));
+    case "q3-k-nibble-148":
+      return dequantizeBrowserQ3KBlock(bytes);
+    case "q3-k-fused-f32-192":
+      return dequantizeBrowserQ3KFusedBlock(bytes);
     case "q4-k-144":
       return dequantizeQ4KBlock(unpackWebGpuQ4KBlock(bytes));
+    case "q4-k-fused-f32-192":
+      return dequantizeBrowserQ4KBlock(bytes);
     case "q5-k-176":
       return dequantizeQ5KBlock(unpackWebGpuQ5KBlock(bytes));
+    case "q5-k-fused-f32-224":
+      return dequantizeBrowserQ5KBlock(bytes);
     case "q6-k-212":
       return dequantizeQ6KBlock(unpackWebGpuQ6KBlock(bytes));
+    case "q6-k-fused-f32-256":
+      return dequantizeBrowserQ6KBlock(bytes);
   }
 }
 

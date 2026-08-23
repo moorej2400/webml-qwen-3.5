@@ -1,3 +1,5 @@
+import { SAFE_DIAGNOSTIC_CODE_PATTERN } from "../../src/diagnostics.js";
+
 /**
  * The local-agent response contains no reusable secret. Each document obtains
  * a one-use WSS ticket from the same local HTTPS origin immediately before it
@@ -28,7 +30,7 @@ export const createBrowserAgentSource = (): string => `(() => {
     "error_scope", "allocation_conflict", "gpu_ambiguous_scopes",
     "state_metadata", "state_progress", "unknown"
   ]);
-  const SAFE_DIAGNOSTIC_CODE = /^[a-z][a-z0-9-]{0,63}$/;
+  const SAFE_DIAGNOSTIC_CODE = new RegExp(${JSON.stringify(SAFE_DIAGNOSTIC_CODE_PATTERN)});
   const safeId = (prefix) => prefix + "_" + crypto.randomUUID().replaceAll("-", "");
   const durable = (storage, key, prefix) => {
     let value = storage.getItem(key);
@@ -50,6 +52,8 @@ export const createBrowserAgentSource = (): string => `(() => {
   let identifiedSocket;
   let tabClaimed = false;
   let tabCollision = false;
+  let reloadScheduled = false;
+  let activeLoadCommandId;
   const records = new Map();
   const outbox = new Map();
   let highestAcknowledged = 0;
@@ -135,6 +139,16 @@ export const createBrowserAgentSource = (): string => `(() => {
       !Number.isSafeInteger(message.expectedSeq) ||
       message.expectedSeq < 1
     ) throw new Error("control_sync_invalid");
+    if (message.expectedSeq === 1 && sequence > 0) {
+      // A local server restart has no sequence state for this still-live
+      // document. Discard only transport history. Command records must remain
+      // available so a retry with the same ID cannot duplicate model work.
+      outbox.clear();
+      highestAcknowledged = 0;
+      sequence = 0;
+      announceReady();
+      return;
+    }
     const acknowledgedSeq = message.expectedSeq - 1;
     if (acknowledgedSeq < highestAcknowledged) {
       throw new Error("control_sync_regression");
@@ -178,6 +192,21 @@ export const createBrowserAgentSource = (): string => `(() => {
       return;
     }
     transition(commandId, record.state, record.reason, record.result);
+  };
+  const cancelServerSettledCommand = (command) => {
+    const handlers = globalThis.__QWEN_LOCAL_CONTROL__;
+    if (!handlers || typeof handlers !== "object") return;
+    const handlerName = command.command === "runPrompt"
+      ? "cancelPrompt"
+      : command.command === "load" ||
+          command.command === "dispose" ||
+          command.command === "warmReload"
+        ? "dispose"
+        : undefined;
+    if (handlerName === undefined) return;
+    const handler = handlers[handlerName];
+    if (typeof handler !== "function") return;
+    void Promise.resolve().then(() => handler()).catch(() => {});
   };
   const transition = (commandId, state, reason, result) => {
     const previous = records.get(commandId);
@@ -297,6 +326,156 @@ export const createBrowserAgentSource = (): string => `(() => {
       retireAfterEachWrite: value.retireAfterEachWrite
     };
   };
+  const safeRuntimeMetrics = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const nonnegativeInteger = (entry) =>
+      Number.isSafeInteger(entry) && entry >= 0;
+    const nonnegativeNumber = (entry) =>
+      typeof entry === "number" && Number.isFinite(entry) && entry >= 0;
+    const nullableNumber = (entry) => entry === null || nonnegativeNumber(entry);
+    const safePerformance = (candidate) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+      const counters = [
+        "diskReadBytes",
+        "gpuUploadBytes",
+        "dispatchCount",
+        "queueSubmissionCount",
+        "queueRetirementCount",
+        "gpuReadbackCount"
+      ];
+      const output = {};
+      for (const counter of counters) {
+        if (!nonnegativeInteger(candidate[counter])) return undefined;
+        output[counter] = candidate[counter];
+      }
+      return output;
+    };
+    if (
+      !nonnegativeInteger(value.contextTokens) ||
+      !nonnegativeInteger(value.trackedCpuBytes) ||
+      !nonnegativeInteger(value.trackedGpuBytes) ||
+      !nonnegativeInteger(value.peakTrackedGpuBytes) ||
+      value.trackedGpuBytes > value.peakTrackedGpuBytes ||
+      !nonnegativeInteger(value.prefillTokens) ||
+      !nonnegativeNumber(value.prefillDurationMilliseconds) ||
+      !nullableNumber(value.prefillTokensPerSecond) ||
+      !nonnegativeInteger(value.generatedTokens) ||
+      !nonnegativeInteger(value.targetStepCount) ||
+      value.targetStepCount > value.generatedTokens ||
+      !nonnegativeNumber(value.targetStepDurationMilliseconds) ||
+      !nullableNumber(value.targetStepsPerSecond) ||
+      !nonnegativeNumber(value.generationDurationMilliseconds) ||
+      !nullableNumber(value.generatedTokensPerSecond) ||
+      !nullableNumber(value.timeToFirstTokenMilliseconds) ||
+      !nonnegativeInteger(value.decodedTextCodeUnits) ||
+      !nonnegativeInteger(value.referenceTokenCount) ||
+      !nonnegativeInteger(value.referenceTokenMismatchCount) ||
+      value.referenceTokenMismatchCount > value.referenceTokenCount ||
+      !(
+        value.referenceFirstMismatchIndex === undefined ||
+        (nonnegativeInteger(value.referenceFirstMismatchIndex) &&
+          value.referenceFirstMismatchIndex < value.referenceTokenCount &&
+          nonnegativeInteger(value.referenceExpectedTokenId) &&
+          nonnegativeInteger(value.referenceObservedTokenId))
+      ) ||
+      !nonnegativeInteger(value.performanceSnapshotCount) ||
+      value.performanceSnapshotCount > 2
+    ) return undefined;
+    const performance = value.performance === undefined
+      ? undefined
+      : safePerformance(value.performance);
+    if (value.performance !== undefined && performance === undefined) return undefined;
+    return {
+      contextTokens: value.contextTokens,
+      trackedCpuBytes: value.trackedCpuBytes,
+      trackedGpuBytes: value.trackedGpuBytes,
+      peakTrackedGpuBytes: value.peakTrackedGpuBytes,
+      prefillTokens: value.prefillTokens,
+      prefillDurationMilliseconds: value.prefillDurationMilliseconds,
+      prefillTokensPerSecond: value.prefillTokensPerSecond,
+      generatedTokens: value.generatedTokens,
+      targetStepCount: value.targetStepCount,
+      targetStepDurationMilliseconds: value.targetStepDurationMilliseconds,
+      targetStepsPerSecond: value.targetStepsPerSecond,
+      generationDurationMilliseconds: value.generationDurationMilliseconds,
+      generatedTokensPerSecond: value.generatedTokensPerSecond,
+      timeToFirstTokenMilliseconds: value.timeToFirstTokenMilliseconds,
+      decodedTextCodeUnits: value.decodedTextCodeUnits,
+      referenceTokenCount: value.referenceTokenCount,
+      referenceTokenMismatchCount: value.referenceTokenMismatchCount,
+      ...(value.referenceFirstMismatchIndex === undefined ? {} : {
+        referenceFirstMismatchIndex: value.referenceFirstMismatchIndex,
+        referenceExpectedTokenId: value.referenceExpectedTokenId,
+        referenceObservedTokenId: value.referenceObservedTokenId
+      }),
+      performanceSnapshotCount: value.performanceSnapshotCount,
+      ...(performance === undefined ? {} : { performance })
+    };
+  };
+  const sendRuntimeMetrics = (metrics) => {
+    const commonMemory = {
+      cpuBytes: metrics.trackedCpuBytes,
+      gpuBytes: metrics.trackedGpuBytes,
+      peakBytes: metrics.peakTrackedGpuBytes
+    };
+    // Correctness and decode counters are the terminal record. Send them first
+    // so outbox pressure cannot preserve a duplicate rate event while dropping
+    // the oracle result.
+    const events = [{
+      category: "generation",
+      name: "generation_completed",
+      metrics: {
+        durationMs: metrics.generationDurationMilliseconds,
+        count: metrics.generatedTokens,
+        targetStepCount: metrics.targetStepCount,
+        targetStepDurationMs: metrics.targetStepDurationMilliseconds,
+        ...(metrics.generatedTokensPerSecond === null ? {} : {
+          emittedTokensPerSecond: metrics.generatedTokensPerSecond
+        }),
+        ...(metrics.timeToFirstTokenMilliseconds === null ? {} : {
+          ttftMs: metrics.timeToFirstTokenMilliseconds
+        }),
+        ...(metrics.targetStepsPerSecond === null ? {} : {
+          tokensPerSecond: metrics.targetStepsPerSecond
+        }),
+        contextTokens: metrics.contextTokens,
+        decodedTextCodeUnits: metrics.decodedTextCodeUnits,
+        referenceTokenCount: metrics.referenceTokenCount,
+        referenceTokenMismatchCount: metrics.referenceTokenMismatchCount,
+        ...(metrics.referenceFirstMismatchIndex === undefined ? {} : {
+          referenceFirstMismatchIndex: metrics.referenceFirstMismatchIndex,
+          referenceExpectedTokenId: metrics.referenceExpectedTokenId,
+          referenceObservedTokenId: metrics.referenceObservedTokenId
+        }),
+        performanceSnapshotCount: metrics.performanceSnapshotCount,
+        ...(metrics.performance === undefined ? {} : metrics.performance),
+        ...commonMemory
+      }
+    }, {
+      category: "prefill",
+      name: "prefill_completed",
+      metrics: {
+        durationMs: metrics.prefillDurationMilliseconds,
+        prefillTokens: metrics.prefillTokens,
+        ...(metrics.prefillTokensPerSecond === null ? {} : {
+          prefillTokensPerSecond: metrics.prefillTokensPerSecond
+        }),
+        ...commonMemory
+      }
+    }];
+    for (const event of events) {
+      // Preserve one outbox position for the command terminal transition.
+      if (outbox.size >= OUTBOX_LIMIT - 1) return;
+      try {
+        send({
+          type: "telemetry",
+          event: { ...event, timestampMs: Date.now() }
+        });
+      } catch {
+        return;
+      }
+    }
+  };
   const shouldSendLoadEvent = (event) => {
     const previous = lastLoadTelemetry;
     if (!previous || previous.phase !== event.phase) return true;
@@ -314,7 +493,33 @@ export const createBrowserAgentSource = (): string => `(() => {
     }
     transition(message.commandId, "accepted");
     transition(message.commandId, "started");
+    if (message.command === "load" && activeLoadCommandId !== undefined) {
+      transition(message.commandId, "failed", "load_in_progress");
+      return;
+    }
+    const ownsLoad = message.command === "load";
+    if (ownsLoad) activeLoadCommandId = message.commandId;
     if (message.command === "warmReload") {
+      if (reloadScheduled) {
+        transition(message.commandId, "failed", "reload_in_progress");
+        return;
+      }
+      reloadScheduled = true;
+      const handlers = globalThis.__QWEN_LOCAL_CONTROL__;
+      if (!handlers || typeof handlers.dispose !== "function") {
+        reloadScheduled = false;
+        transition(message.commandId, "failed", "handler_unavailable");
+        return;
+      }
+      try {
+        // Retire GPU ownership before navigation. Safari can keep the old
+        // document alive long enough for a replacement load to overlap it.
+        await handlers.dispose();
+      } catch {
+        reloadScheduled = false;
+        transition(message.commandId, "failed", "handler_failed");
+        return;
+      }
       setTimeout(() => location.reload(), 0);
       return;
     }
@@ -382,6 +587,9 @@ export const createBrowserAgentSource = (): string => `(() => {
       );
     } finally {
       if (activePrompt === promptRecord) activePrompt = undefined;
+      if (ownsLoad && activeLoadCommandId === message.commandId) {
+        activeLoadCommandId = undefined;
+      }
     }
   };
   const identifyIfRuntimeReady = (candidate) => {
@@ -398,6 +606,9 @@ export const createBrowserAgentSource = (): string => `(() => {
     for (const [, frame] of [...outbox].sort(([left], [right]) => left - right)) {
       sendFrame(frame);
     }
+    announceReady();
+  };
+  const announceReady = () => {
     send({ type: "ready" });
     // The first local journal record joins server-derived socket metadata to
     // durable browser IDs even when the runtime has not produced metrics yet.
@@ -428,6 +639,7 @@ export const createBrowserAgentSource = (): string => `(() => {
         let message;
         try { message = JSON.parse(event.data); } catch { return; }
         if (message.schemaVersion !== VERSION) return;
+        if (candidate !== socket || identifiedSocket !== candidate) return;
         if (message.type === "eventAck") {
           try { acknowledge(message); } catch { candidate.close(1008, "protocol_error"); }
           return;
@@ -448,12 +660,14 @@ export const createBrowserAgentSource = (): string => `(() => {
               if (TERMINAL_STATES.has(command.state)) {
                 // A server terminal settles both conflicting terminal state
                 // and work that is still running locally.
+                const wasTerminal = TERMINAL_STATES.has(local.state);
                 records.set(command.commandId, {
                   state: command.state,
                   reason: command.reason,
                   result: command.result,
                   settledByServer: true
                 });
+                if (!wasTerminal) cancelServerSettledCommand(command);
                 continue;
               }
               if (local.state !== command.state) resendState(command.commandId, local);
@@ -553,6 +767,10 @@ export const createBrowserAgentSource = (): string => `(() => {
         }
       });
     } catch {}
+  });
+  addEventListener("qwen-local-runtime-metrics", ({ detail }) => {
+    const metrics = safeRuntimeMetrics(detail);
+    if (metrics) sendRuntimeMetrics(metrics);
   });
   addEventListener("pagehide", () => send({
     type: "telemetry",

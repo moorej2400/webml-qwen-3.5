@@ -81,7 +81,7 @@ async function packageFixture(parent: string): Promise<{
     version: 1 as const,
     packageKind: "language" as const,
     source,
-    runtime: { abi: "qwen35-webgpu-v1" },
+    runtime: { abi: "qwen35-webgpu-v2" },
     tokenizer,
     tensorLayout: [{
       name: "output_norm.weight",

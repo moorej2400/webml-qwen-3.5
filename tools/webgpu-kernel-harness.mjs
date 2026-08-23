@@ -2,14 +2,21 @@ import {
   LANGUAGE_GEMV_KERNELS,
   gemvCpu,
   planGemvDispatch,
-} from "../dist/src/mixed-gemv.js";
+} from "../dist/src/mixed-gemv.js?v=41";
 import {
   repackNativeQ4K,
   repackNativeQ5K,
   repackNativeQ6K,
   repackNativeQ8_0,
-} from "../dist/src/mixed-quant.js";
-import { repackNativeQ3K } from "../dist/src/q3k.js";
+} from "../dist/src/mixed-quant.js?v=41";
+import { repackNativeQ3K } from "../dist/src/q3k.js?v=41";
+import {
+  repackNativeQ3KBrowser,
+  repackNativeQ3KFusedBrowser,
+  repackNativeQ4KBrowser,
+  repackNativeQ5KBrowser,
+  repackNativeQ6KBrowser,
+} from "../dist/src/browser-quant.js?v=41";
 import {
   QWEN_PRIMITIVE_KERNELS,
   attentionOutputGateCpu,
@@ -20,46 +27,46 @@ import {
   rmsNormCpu,
   siluCpu,
   stableTiledTopK,
-} from "../dist/src/qwen-primitives.js";
+} from "../dist/src/qwen-primitives.js?v=41";
 import {
   PACKED_EMBEDDING_KERNELS,
   embeddingCpu,
   planPackedEmbeddingRow,
-} from "../dist/src/qwen-embedding.js";
-import { QWEN35_HYBRID_KERNELS } from "../dist/src/hybrid-kernels.js";
+} from "../dist/src/qwen-embedding.js?v=41";
+import { QWEN35_HYBRID_KERNELS } from "../dist/src/hybrid-kernels.js?v=41";
 import {
   assembleQwen35StagedFinalTokenCommand,
   assembleQwen35StagedLogitsTileGpuCommands,
-} from "../dist/src/qwen35-logits-dispatch.js";
+} from "../dist/src/qwen35-logits-dispatch.js?v=41";
 import {
   QWEN35_VISION_FOUNDATION_KERNELS,
   visionAddLearnedPositionCpu,
   visionApply2dRopeCpu,
   visionPatchConv3dCpu,
   visionPrepare2dRopeCpu,
-} from "../dist/src/qwen35-vision-foundation-kernels.js";
+} from "../dist/src/qwen35-vision-foundation-kernels.js?v=41";
 import {
   QWEN35_VISION_LAYER_KERNELS,
   visionLayerNormCpu,
   visionLinearBf16Cpu,
   visionOnlineAttentionCpu,
   visionTanhGeluCpu,
-} from "../dist/src/qwen35-vision-layer-kernels.js";
+} from "../dist/src/qwen35-vision-layer-kernels.js?v=41";
 import {
   QWEN35_VISION_MERGER_KERNELS,
   visionExactGeluCpu,
-} from "../dist/src/qwen35-vision-merger-kernels.js";
+} from "../dist/src/qwen35-vision-merger-kernels.js?v=41";
 import {
   packFloat16PairCpu,
   qwen35OnlineAttentionHeadCpu,
   splitQwen35QueryGateProjection,
   unpackFloat16PairCpu,
-} from "../dist/src/full-attention.js";
+} from "../dist/src/full-attention.js?v=41";
 import {
   deltaNetRecurrentHeadStepCpu,
   qwen35DeltaNetParametersCpu,
-} from "../dist/src/gated-deltanet.js";
-import { validateParity } from "./webgpu-parity.mjs";
+} from "../dist/src/gated-deltanet.js?v=41";
+import { validateParity } from "./webgpu-parity.mjs?v=39";
 
 function deterministicBytes(length, seed) {
   let state = seed >>> 0;
@@ -74,6 +81,63 @@ function setHalf(bytes, offset, bits = 0x3c00) {
   new DataView(bytes.buffer, bytes.byteOffset).setUint16(offset, bits, true);
 }
 
+function activationBytesForKernel(kernel, activation) {
+  if (
+    kernel.layout === "q5-k-fused-f32-224" &&
+    kernel.profile === "mobile-f16-subgroup"
+  ) {
+    const packed = new Uint32Array(activation.length / 2);
+    for (let block = 0; block < activation.length / 256; block += 1) {
+      const blockBase = block * 256;
+      for (let half = 0; half < 2; half += 1) {
+        for (let lane = 0; lane < 32; lane += 1) {
+          const destination = block * 128 + half * 64 + lane;
+          const source = blockBase + half * 128 + lane;
+          packed[destination] = packFloat16PairCpu(
+            activation[source], activation[source + 32],
+          );
+          packed[destination + 32] = packFloat16PairCpu(
+            activation[source + 64], activation[source + 96],
+          );
+        }
+      }
+    }
+    return new Uint8Array(packed.buffer);
+  }
+  if (kernel.profile === "mobile-f16-subgroup" && [
+    "q3-k-112", "q3-k-nibble-148", "q4-k-144", "q5-k-176", "q6-k-212",
+  ].includes(kernel.layout)) {
+    const packed = new Uint32Array(activation.length / 2);
+    for (let word = 0; word < packed.length; word += 1) {
+      packed[word] = packFloat16PairCpu(
+        activation[word * 2],
+        activation[word * 2 + 1],
+      );
+    }
+    return new Uint8Array(packed.buffer);
+  }
+
+  return new Uint8Array(activation.buffer);
+}
+
+function cpuActivationForKernel(kernel, activation) {
+  const usesPackedHalf = kernel.profile === "mobile-f16-subgroup" && [
+    "q8-0-36",
+    "q3-k-112",
+    "q3-k-nibble-148",
+    "q4-k-144",
+    "q5-k-176",
+    "q6-k-212",
+    "q3-k-fused-f32-192",
+    "q5-k-fused-f32-224",
+  ].includes(kernel.layout);
+  if (!usesPackedHalf) return activation;
+  return Float32Array.from(activation, (value) => {
+    const packed = packFloat16PairCpu(value, 0);
+    return unpackFloat16PairCpu(packed)[0];
+  });
+}
+
 function packedFixture(layout, rowIndex, blockIndex) {
   if (layout === "f32") {
     const values = Float32Array.of(
@@ -84,10 +148,18 @@ function packedFixture(layout, rowIndex, blockIndex) {
   const nativeBytes = {
     "q8-0-36": 34,
     "q3-k-112": 110,
+    "q3-k-nibble-148": 110,
+    "q3-k-fused-f32-192": 110,
     "q4-k-144": 144,
+    "q4-k-fused-f32-192": 144,
     "q5-k-176": 176,
+    "q5-k-fused-f32-224": 176,
     "q6-k-212": 210,
+    "q6-k-fused-f32-256": 210,
   }[layout];
+  if (nativeBytes === undefined) {
+    throw new Error(`Unsupported packed fixture layout: ${String(layout)}`);
+  }
   const seed =
     nativeBytes * 101 + (rowIndex + 1) * 1009 + (blockIndex + 1) * 917;
   const native = deterministicBytes(nativeBytes, seed);
@@ -99,18 +171,32 @@ function packedFixture(layout, rowIndex, blockIndex) {
     setHalf(native, 108);
     return repackNativeQ3K(native);
   }
-  if (layout === "q4-k-144") {
-    setHalf(native, 0);
-    setHalf(native, 2, 0x3800);
-    return repackNativeQ4K(native);
+  if (layout === "q3-k-nibble-148") {
+    setHalf(native, 108);
+    return repackNativeQ3KBrowser(native);
   }
-  if (layout === "q5-k-176") {
+  if (layout === "q3-k-fused-f32-192") {
+    setHalf(native, 108);
+    return repackNativeQ3KFusedBrowser(native);
+  }
+  if (layout === "q4-k-144" || layout === "q4-k-fused-f32-192") {
     setHalf(native, 0);
     setHalf(native, 2, 0x3800);
-    return repackNativeQ5K(native);
+    return layout === "q4-k-144"
+      ? repackNativeQ4K(native)
+      : repackNativeQ4KBrowser(native);
+  }
+  if (layout === "q5-k-176" || layout === "q5-k-fused-f32-224") {
+    setHalf(native, 0);
+    setHalf(native, 2, 0x3800);
+    return layout === "q5-k-176"
+      ? repackNativeQ5K(native)
+      : repackNativeQ5KBrowser(native);
   }
   setHalf(native, 208);
-  return repackNativeQ6K(native);
+  return layout === "q6-k-212"
+    ? repackNativeQ6K(native)
+    : repackNativeQ6KBrowser(native);
 }
 
 function storageBuffer(device, bytes, usage) {
@@ -139,7 +225,9 @@ async function runKernel(device, kernel) {
     );
   }
 
-  const rows = 3;
+  // Force a 2D dispatch for every current kernel family. This also covers
+  // fused kernels whose workgroups own multiple output rows.
+  const rows = kernel.abi.rowsPerWorkgroup * 2 + 1;
   const blocksPerRow = 2;
   const columns = kernel.abi.valuesPerBlock * blocksPerRow;
   const packedByteOffset = 32;
@@ -159,23 +247,42 @@ async function runKernel(device, kernel) {
     { length: columns },
     (_, index) => ((index * 17 + 3) % 29 - 14) / 16,
   );
-  const expected = gemvCpu(kernel.layout, packed, activation, {
+  const expected = gemvCpu(
+    kernel.layout,
+    packed,
+    cpuActivationForKernel(kernel, activation),
+    {
     rows,
     columns,
     packedByteOffset,
-  });
+    },
+  );
   if (new Set(expected).size !== rows) {
     throw new Error(`${kernel.id}: row fixtures did not produce distinct output`);
   }
   const outputRowOffset = 2;
-  const plan = planGemvDispatch({
+  const genericPlan = planGemvDispatch({
     layout: kernel.layout,
+    profile: kernel.profile,
     localRows: rows,
     columns,
     packedByteOffset,
     outputRowOffset,
     maxWorkgroupsPerDimension: 2,
   });
+  // A layout can have both a portable reference kernel and a specialized
+  // mobile kernel. The runtime planner selects its production specialization
+  // by layout, but this harness must dispatch the exact kernel under test.
+  const kernelDispatchRows = Math.ceil(rows / kernel.abi.rowsPerWorkgroup);
+  const kernelWorkgroupX = Math.min(kernelDispatchRows, 2);
+  const plan = {
+    ...genericPlan,
+    workgroups: {
+      x: kernelWorkgroupX,
+      y: Math.ceil(kernelDispatchRows / kernelWorkgroupX),
+      z: 1,
+    },
+  };
   if (plan.workgroups.x !== 2 || plan.workgroups.y !== 2) {
     throw new Error(`${kernel.id}: harness did not force a 2D dispatch`);
   }
@@ -195,7 +302,7 @@ async function runKernel(device, kernel) {
   );
   const inputs = storageBuffer(
     device,
-    new Uint8Array(activation.buffer),
+    activationBytesForKernel(kernel, activation),
     GPUBufferUsage.STORAGE,
   );
   const initialOutput = new Float32Array(outputSlots).fill(sentinel);
@@ -249,7 +356,14 @@ async function runKernel(device, kernel) {
   for (const buffer of [weights, inputs, output, uniforms, readback]) {
     buffer.destroy();
   }
-  validateParity(kernel.id, expectedOutput, actual);
+  validateParity(
+    kernel.id,
+    expectedOutput,
+    actual,
+    // These optimized kernels intentionally multiply in FP16. Keep their
+    // synthetic stress tolerance separate from the exact portable oracle.
+    kernel.profile === "mobile-f16-subgroup" ? 2e-2 : 2e-4,
+  );
   return {
     id: kernel.id,
     blocksPerRow,
@@ -258,6 +372,118 @@ async function runKernel(device, kernel) {
     expected: Array.from(expectedOutput),
     actual: Array.from(actual),
   };
+}
+
+async function benchmarkProductionGemv(
+  device,
+  { layout, rows, columns, iterations = 30 },
+) {
+  const kernel = LANGUAGE_GEMV_KERNELS.find((candidate) =>
+    candidate.layout === layout &&
+    candidate.profile === "mobile-f16-subgroup"
+  );
+  if (!kernel) throw new Error(`production ${layout} benchmark kernel is unavailable`);
+  const blocksPerRow = columns / kernel.abi.valuesPerBlock;
+  const weightBytes = rows * blocksPerRow * kernel.abi.bytesPerBlock;
+  const plan = planGemvDispatch({
+    layout: kernel.layout,
+    profile: kernel.profile,
+    localRows: rows,
+    columns,
+  });
+  const module = device.createShaderModule({ label: `${kernel.id}-benchmark`, code: kernel.source });
+  const pipeline = await device.createComputePipelineAsync({
+    layout: "auto",
+    compute: { module, entryPoint: "packed_gemv" },
+  });
+  const weights = device.createBuffer({ size: weightBytes, usage: GPUBufferUsage.STORAGE });
+  const activationValues = Float32Array.from(
+    { length: columns }, (_, index) => ((index % 31) - 15) / 32,
+  );
+  const activation = storageBuffer(
+    device,
+    activationBytesForKernel(kernel, activationValues),
+    GPUBufferUsage.STORAGE,
+  );
+  const output = device.createBuffer({
+    size: rows * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const readback = device.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const uniforms = storageBuffer(
+    device,
+    new Uint8Array(Uint32Array.of(rows, columns, blocksPerRow, 0, 0).buffer),
+    GPUBufferUsage.UNIFORM,
+  );
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: weights } },
+      { binding: 1, resource: { buffer: activation } },
+      { binding: 2, resource: { buffer: output } },
+      { binding: 3, resource: { buffer: uniforms } },
+    ],
+  });
+  const submit = async (iterations) => {
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    for (let iteration = 0; iteration < iterations; iteration += 1) {
+      pass.dispatchWorkgroups(plan.workgroups.x, plan.workgroups.y, 1);
+    }
+    pass.end();
+    encoder.copyBufferToBuffer(output, 0, readback, 0, 4);
+    const started = performance.now();
+    device.queue.submit([encoder.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    new Uint32Array(readback.getMappedRange())[0];
+    readback.unmap();
+    return performance.now() - started;
+  };
+  await submit(Math.min(3, iterations));
+  const durationMs = await submit(iterations);
+  for (const buffer of [weights, activation, output, uniforms, readback]) {
+    buffer.destroy();
+  }
+  return {
+    id: `qwen35-production-${layout}${
+      rows > 100_000 ? "-vocabulary" : ""
+    }-gemv-benchmark`,
+    status: "executed",
+    rows,
+    columns,
+    weightBytes,
+    iterations,
+    durationMs,
+    millisecondsPerDispatch: durationMs / iterations,
+    effectiveWeightGigabytesPerSecond:
+      (weightBytes * iterations) / durationMs / 1_000_000,
+  };
+}
+
+async function benchmarkProductionGemvs(device) {
+  const specifications = [
+    { layout: "q3-k-fused-f32-192", rows: 9_216, columns: 2_560 },
+    { layout: "q4-k-fused-f32-192", rows: 2_560, columns: 4_096 },
+    { layout: "q5-k-fused-f32-224", rows: 2_560, columns: 9_216 },
+    { layout: "q6-k-fused-f32-256", rows: 8_192, columns: 2_560 },
+    {
+      layout: "q6-k-fused-f32-256",
+      rows: 248_320,
+      columns: 2_560,
+      iterations: 3,
+    },
+    { layout: "q8-0-36", rows: 2_560, columns: 4_096 },
+  ];
+  const results = [];
+  for (const specification of specifications) {
+    results.push(await benchmarkProductionGemv(device, specification));
+  }
+  return results;
 }
 
 async function createPipeline(device, kernel) {
@@ -468,6 +694,85 @@ async function runVectorPrimitive(device, kernel) {
   };
 }
 
+async function runResidualRmsPrimitive(device, kernel) {
+  const input = Float32Array.of(3, -4, 0.5, -2);
+  const residual = Float32Array.of(-1, 2, 3, -4);
+  const weight = Float32Array.of(1, 0.75, 1.25, 0.5);
+  const combined = residualAddCpu(input, residual);
+  const normalized = rmsNormCpu(combined, weight, Math.fround(1e-6));
+  const residualOutput = outputFixture(combined);
+  const normalizedOutput = outputFixture(normalized);
+  const residualBuffer = storageBuffer(device, floatBytes(residual), GPUBufferUsage.STORAGE);
+  const weightBuffer = storageBuffer(device, floatBytes(weight), GPUBufferUsage.STORAGE);
+  const residualOutputBuffer = storageBuffer(
+    device,
+    floatBytes(residualOutput.initial),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const normalizedOutputBuffer = storageBuffer(
+    device,
+    floatBytes(new Float32Array(normalizedOutput.initial).map((value, index) =>
+      index >= normalizedOutput.outputRowOffset &&
+        index < normalizedOutput.outputRowOffset + input.length
+        ? input[index - normalizedOutput.outputRowOffset]
+        : value
+    )),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  );
+  const uniformBuffer = storageBuffer(
+    device,
+    paramsBytes(16, [
+      ["setUint32", 0, input.length],
+      ["setUint32", 4, input.length],
+      ["setFloat32", 8, Math.fround(1e-6)],
+    ]),
+    GPUBufferUsage.UNIFORM,
+  );
+  const outputOffset = residualOutput.outputRowOffset * 4;
+  const outputSize = residualOutput.expected.byteLength - outputOffset;
+  const [residualBytes, normalizedBytes] = await dispatchAndRead(
+    device,
+    kernel,
+    [
+      {
+        binding: 0,
+        resource: {
+          buffer: normalizedOutputBuffer,
+          offset: outputOffset,
+          size: outputSize,
+        },
+      },
+      { binding: 1, resource: { buffer: residualBuffer } },
+      { binding: 2, resource: { buffer: weightBuffer } },
+      {
+        binding: 3,
+        resource: { buffer: residualOutputBuffer, offset: outputOffset, size: outputSize },
+      },
+      { binding: 4, resource: { buffer: uniformBuffer } },
+    ],
+    [
+      { buffer: residualOutputBuffer, byteLength: residualOutput.expected.byteLength },
+      { buffer: normalizedOutputBuffer, byteLength: normalizedOutput.expected.byteLength },
+    ],
+    { x: 1, y: 1, z: 1 },
+  );
+  validateParity(
+    `${kernel.id}-residual`,
+    residualOutput.expected,
+    new Float32Array(residualBytes),
+  );
+  validateParity(
+    `${kernel.id}-normalized`,
+    normalizedOutput.expected,
+    new Float32Array(normalizedBytes),
+  );
+  return {
+    id: kernel.id,
+    status: "executed",
+    outputRowOffset: residualOutput.outputRowOffset,
+  };
+}
+
 async function runMropePrimitive(device, kernel) {
   const input = Float32Array.from(
     { length: 256 },
@@ -638,6 +943,9 @@ async function runTopKPrimitive(device, kernel) {
 }
 
 async function runPrimitive(device, kernel) {
+  if (kernel.operation === "residual-rms-norm") {
+    return runResidualRmsPrimitive(device, kernel);
+  }
   if (kernel.operation === "partial-mrope") {
     return runMropePrimitive(device, kernel);
   }
@@ -1275,7 +1583,7 @@ function normalizeDeltaHead(values, offset, query) {
   );
 }
 
-async function runDeltaNetRecurrent(device, kernel) {
+async function runDeltaNetRecurrent(device, kernel, fusedGatedNorm = false) {
   const qkv = new Float32Array(8192);
   for (let qkHead = 0; qkHead < 16; qkHead += 1) {
     for (let lane = 0; lane < 128; lane += 1) {
@@ -1333,7 +1641,39 @@ async function runDeltaNetRecurrent(device, kernel) {
       valueHead * 128,
     );
   }
-  const output = outputFixture(expectedValues);
+  const z = Float32Array.from(
+    { length: 4096 },
+    (_, index) => ((index * 5) % 13 - 6) / 5,
+  );
+  const normWeight = Float32Array.from(
+    { length: 128 },
+    (_, lane) => 0.75 + (lane % 7) / 10,
+  );
+  const outputValues = fusedGatedNorm
+    ? new Float32Array(expectedValues.length)
+    : expectedValues;
+  if (fusedGatedNorm) {
+    for (let head = 0; head < 32; head += 1) {
+      const base = head * 128;
+      let sum = Math.fround(0);
+      for (let lane = 0; lane < 128; lane += 1) {
+        const value = expectedValues[base + lane];
+        sum = Math.fround(sum + Math.fround(value * value));
+      }
+      const inverseRms = Math.fround(
+        1 / Math.sqrt(Math.fround(Math.fround(sum / 128) + Math.fround(1e-6))),
+      );
+      for (let lane = 0; lane < 128; lane += 1) {
+        const index = base + lane;
+        outputValues[index] = Math.fround(
+          Math.fround(
+            Math.fround(expectedValues[index] * inverseRms) * normWeight[lane],
+          ) * siluCpu(z[index]),
+        );
+      }
+    }
+  }
+  const output = outputFixture(outputValues);
   const qkvBuffer = storageBuffer(device, floatBytes(qkv), GPUBufferUsage.STORAGE);
   const betaBuffer = storageBuffer(
     device,
@@ -1355,23 +1695,47 @@ async function runDeltaNetRecurrent(device, kernel) {
     floatBytes(output.initial),
     GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   );
+  const zBuffer = storageBuffer(device, floatBytes(z), GPUBufferUsage.STORAGE);
+  const normWeightBuffer = storageBuffer(
+    device,
+    floatBytes(normWeight),
+    GPUBufferUsage.STORAGE,
+  );
+  const bindings = fusedGatedNorm
+    ? [
+        { binding: 0, resource: { buffer: qkvBuffer } },
+        { binding: 1, resource: { buffer: betaBuffer } },
+        { binding: 2, resource: { buffer: decayBuffer } },
+        { binding: 3, resource: { buffer: stateBuffer } },
+        { binding: 4, resource: { buffer: zBuffer } },
+        { binding: 5, resource: { buffer: normWeightBuffer } },
+        {
+          binding: 6,
+          resource: {
+            buffer: outputBuffer,
+            offset: output.outputRowOffset * 4,
+            size: output.expected.byteLength - output.outputRowOffset * 4,
+          },
+        },
+      ]
+    : [
+        { binding: 0, resource: { buffer: qkvBuffer } },
+        { binding: 1, resource: { buffer: betaBuffer } },
+        { binding: 2, resource: { buffer: decayBuffer } },
+        { binding: 3, resource: { buffer: stateBuffer } },
+        {
+          binding: 4,
+          resource: {
+            buffer: outputBuffer,
+            offset: output.outputRowOffset * 4,
+            size: output.expected.byteLength - output.outputRowOffset * 4,
+          },
+        },
+      ];
   const [actualOutputBytes, actualStateBytes] = await dispatchAndRead(
     device,
     kernel,
-    [
-      { binding: 0, resource: { buffer: qkvBuffer } },
-      { binding: 1, resource: { buffer: betaBuffer } },
-      { binding: 2, resource: { buffer: decayBuffer } },
-      { binding: 3, resource: { buffer: stateBuffer } },
-      {
-        binding: 4,
-        resource: {
-          buffer: outputBuffer,
-          offset: output.outputRowOffset * 4,
-          size: output.expected.byteLength - output.outputRowOffset * 4,
-        },
-      },
-    ],
+    bindings,
     [
       { buffer: outputBuffer, byteLength: output.expected.byteLength },
       { buffer: stateBuffer, byteLength: expectedState.byteLength },
@@ -1483,6 +1847,8 @@ async function runHybridKernel(device, kernel) {
       return runDeltaNetRecurrent(device, kernel);
     case "deltanet-gated-norm":
       return runDeltaNetGatedNorm(device, kernel);
+    case "deltanet-recurrent-gated-norm":
+      return runDeltaNetRecurrent(device, kernel, true);
     default:
       throw new Error("No hybrid kernel fixture");
   }
@@ -1629,16 +1995,21 @@ async function runStagedLogitsGpuSelection(device) {
     maxUniformBufferBindingSize: 65_536,
     maxComputeWorkgroupsPerDimension: 65_535,
   };
-  const tileCount = 243;
+  // Eight complete tiles cross the production four-tile staging cadence
+  // without turning a deterministic parity check into a full 248K-vocabulary
+  // benchmark. The production planner intentionally accepts a partial tile
+  // only at the model's real vocabulary tail, so a synthetic early tail would
+  // test an invalid state rather than the runtime contract.
+  const tileCount = 8;
   const tileRows = 1_024;
-  const rowBytes = 2_120;
+  const rowBytes = 2_560;
   const blocksPerRow = 10;
   const packed = new Uint8Array(rowBytes * tileRows);
   for (let rowIndex = 0; rowIndex < tileRows; rowIndex += 1) {
     for (let blockIndex = 0; blockIndex < blocksPerRow; blockIndex += 1) {
       packed.set(
-        packedFixture("q6-k-212", rowIndex, blockIndex),
-        rowIndex * rowBytes + blockIndex * 212,
+        packedFixture("q6-k-fused-f32-256", rowIndex, blockIndex),
+        rowIndex * rowBytes + blockIndex * 256,
       );
     }
   }
@@ -1646,7 +2017,7 @@ async function runStagedLogitsGpuSelection(device) {
     { length: 2_560 },
     (_, index) => Math.fround(((index * 17 + 3) % 29 - 14) / 16),
   );
-  const expectedScores = gemvCpu("q6-k-212", packed, normalizedHidden, {
+  const expectedScores = gemvCpu("q6-k-fused-f32-256", packed, normalizedHidden, {
     rows: tileRows,
     columns: 2_560,
     packedByteOffset: 0,
@@ -1675,7 +2046,14 @@ async function runStagedLogitsGpuSelection(device) {
     packed,
     GPUBufferUsage.STORAGE,
   );
-  const candidateWords = new Uint32Array(256 * 2).fill(0xffff_ffff);
+  // The production final kernel reduces the fixed 243 candidate slots. Pad
+  // inactive fixture slots with negative infinity so the same reducer remains
+  // valid while the harness runs only its bounded representative tile set.
+  const candidateWords = new Uint32Array(256 * 2);
+  for (let slot = 0; slot < 256; slot += 1) {
+    candidateWords[slot * 2] = f32Bits(Number.NEGATIVE_INFINITY);
+    candidateWords[slot * 2 + 1] = 0xffff_ffff;
+  }
   const candidateBuffer = storageBuffer(
     device,
     uintBytes(candidateWords),
@@ -1695,10 +2073,10 @@ async function runStagedLogitsGpuSelection(device) {
   const tileCommands = [];
   for (let tileIndex = 0; tileIndex < tileCount; tileIndex += 1) {
     const firstRow = tileIndex * tileRows;
-    const rowCount = Math.min(tileRows, 248_070 - firstRow);
+    const rowCount = tileRows;
     const tile = {
       tensorName: "token_embd.weight",
-      storageType: "q6-k-212",
+      storageType: "q6-k-fused-f32-256",
       firstRow,
       rowCount,
       rowBytes,
@@ -1845,43 +2223,78 @@ async function runStagedLogitsGpuSelection(device) {
   };
 }
 
-export async function runWebGpuKernelHarness() {
+export async function runWebGpuKernelHarness({ onProgress = () => {} } = {}) {
   if (!navigator.gpu) {
     throw new Error("WebGPU is not available in this browser");
   }
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error("WebGPU did not provide an adapter");
-  const device = await adapter.requestDevice();
-  const results = [];
+  // Keep the dev harness on the production contract. A default device leaves
+  // optional WGSL extensions disabled, which made the optimized kernels look
+  // invalid even on an adapter that supports the features.
+  const requiredFeatures = ["shader-f16", "subgroups"];
+  const missingFeatures = requiredFeatures.filter(
+    (feature) => !adapter.features.has(feature),
+  );
+  if (missingFeatures.length > 0) {
+    throw new Error(
+      `This WebGPU adapter does not meet the Qwen runtime requirement: ${missingFeatures.join(", ")}`,
+    );
+  }
+  const device = await adapter.requestDevice({ requiredFeatures });
+  const results = [{
+    id: "qwen35-wgsl-language-features",
+    packed4x8IntegerDotProduct:
+      navigator.gpu.wgslLanguageFeatures?.has(
+        "packed_4x8_integer_dot_product",
+      ) === true,
+    subgroups: navigator.gpu.wgslLanguageFeatures?.has("subgroups") === true,
+    adapterSubgroups: adapter.features.has("subgroups"),
+    subgroupLimits: [adapter.limits.minSubgroupSize, adapter.limits.maxSubgroupSize],
+  }];
   for (const kernel of LANGUAGE_GEMV_KERNELS) {
+    onProgress(kernel.id);
     results.push(await runKernel(device, kernel));
   }
   for (const kernel of QWEN_PRIMITIVE_KERNELS) {
+    onProgress(kernel.id);
     results.push(await runPrimitive(device, kernel));
   }
   for (const kernel of PACKED_EMBEDDING_KERNELS) {
+    onProgress(kernel.id);
     results.push(await runEmbedding(device, kernel));
   }
   for (const kernel of QWEN35_HYBRID_KERNELS) {
+    onProgress(kernel.id);
     results.push(await runHybridKernel(device, kernel));
   }
   for (const kernel of QWEN35_VISION_FOUNDATION_KERNELS) {
+    onProgress(kernel.id);
     results.push(await runVisionFoundationKernel(device, kernel));
   }
   for (const kernel of QWEN35_VISION_LAYER_KERNELS) {
+    onProgress(kernel.id);
     results.push(await runVisionLayerKernel(device, kernel));
   }
   for (const kernel of QWEN35_VISION_MERGER_KERNELS) {
+    onProgress(kernel.id);
     results.push(await runVisionMergerKernel(device, kernel));
   }
+  onProgress("qwen35-staged-logits-gpu-selection");
   results.push(await runStagedLogitsGpuSelection(device));
+  onProgress("qwen35-production-gemv-benchmarks");
+  results.push(...await benchmarkProductionGemvs(device));
   device.destroy();
   return results;
 }
 
 const output = document.querySelector("#results");
 try {
-  const results = await runWebGpuKernelHarness();
+  const results = await runWebGpuKernelHarness({
+    onProgress: (kernel) => {
+      output.textContent = JSON.stringify({ status: "running", kernel }, null, 2);
+    },
+  });
   output.textContent = JSON.stringify({ status: "pass", results }, null, 2);
   document.documentElement.dataset.status = "pass";
 } catch (error) {

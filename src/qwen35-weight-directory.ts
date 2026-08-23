@@ -98,9 +98,14 @@ const PACKED_LAYOUTS = new Map<string, {
   ["f32", { valuesPerBlock: 1, bytesPerBlock: 4 }],
   ["q8-0-36", { valuesPerBlock: 32, bytesPerBlock: 36 }],
   ["q3-k-112", { valuesPerBlock: 256, bytesPerBlock: 112 }],
+  ["q3-k-nibble-148", { valuesPerBlock: 256, bytesPerBlock: 148 }],
+  ["q3-k-fused-f32-192", { valuesPerBlock: 256, bytesPerBlock: 192 }],
   ["q4-k-144", { valuesPerBlock: 256, bytesPerBlock: 144 }],
+  ["q4-k-fused-f32-192", { valuesPerBlock: 256, bytesPerBlock: 192 }],
   ["q5-k-176", { valuesPerBlock: 256, bytesPerBlock: 176 }],
+  ["q5-k-fused-f32-224", { valuesPerBlock: 256, bytesPerBlock: 224 }],
   ["q6-k-212", { valuesPerBlock: 256, bytesPerBlock: 212 }],
+  ["q6-k-fused-f32-256", { valuesPerBlock: 256, bytesPerBlock: 256 }],
 ]);
 
 function safePositiveInteger(value: number, label: string): number {

@@ -217,6 +217,7 @@ test("defines typed WGSL ABIs, dispatches, and phase-profile registry entries", 
     [
       "rms-norm",
       "residual-add",
+      "residual-rms-norm",
       "silu",
       "swiglu",
       "attention-output-gate",
@@ -233,7 +234,11 @@ test("defines typed WGSL ABIs, dispatches, and phase-profile registry entries", 
   }
   assert.match(
     QWEN_PRIMITIVE_KERNELS.find((kernel) => kernel.operation === "rms-norm")!.source,
-    /sum.*f32/,
+    /var<workgroup> partials.*256/,
+  );
+  assert.match(
+    QWEN_PRIMITIVE_KERNELS.find((kernel) => kernel.operation === "rms-norm")!.source,
+    /workgroupBarrier\(\)/,
   );
   const mropeKernel = QWEN_PRIMITIVE_KERNELS.find(
     (kernel) => kernel.operation === "partial-mrope",
@@ -261,6 +266,14 @@ test("defines typed WGSL ABIs, dispatches, and phase-profile registry entries", 
   assert.deepEqual(
     planPrimitiveDispatch({ operation: "residual-add", elementCount: 257 }).workgroups,
     { x: 2, y: 1, z: 1 },
+  );
+  assert.deepEqual(
+    planPrimitiveDispatch({ operation: "rms-norm", elementCount: 5_120, width: 2_560 }).workgroups,
+    { x: 2, y: 1, z: 1 },
+  );
+  assert.throws(
+    () => planPrimitiveDispatch({ operation: "rms-norm", elementCount: 2_561, width: 2_560 }),
+    /width/i,
   );
   assert.throws(
     () => planPrimitiveDispatch({ operation: "qk-rms-norm", elementCount: 3, headDimension: 2 }),

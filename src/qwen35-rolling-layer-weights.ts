@@ -1,5 +1,6 @@
 import {
   ALLOCATION_DIAGNOSTIC_CODES,
+  RuntimeDiagnosticError,
   allocationDiagnosticError,
   diagnosticError,
 } from "./diagnostics.js";
@@ -23,19 +24,13 @@ import {
 import type { Qwen35WeightWriteQueue } from "./qwen35-weight-upload.js";
 
 const MODEL_LAYER_COUNT = 32;
-/**
- * Streams every transformer layer in program order.
- *
- * Keeping the other 16 layers resident recreated the measured 954,821,632-byte
- * permanent upload boundary; after tied-table exclusion, only the final output
- * norm may remain permanently resident.
- */
+/** The model order used by both full rolling and measured partial residency. */
 export const QWEN35_ROLLING_LAYER_ORDER = Object.freeze(
   Array.from({ length: MODEL_LAYER_COUNT }, (_, layer) => layer),
 );
 
-const ROLLING_LAYER_SET = new Set<number>(QWEN35_ROLLING_LAYER_ORDER);
 const MAX_READ_CHUNK_BYTES = 32 * 1024 * 1024;
+const MAX_UPLOAD_WINDOW_BYTES = 64 * 1024 * 1024;
 
 export interface Qwen35RollingLayerResidency {
   readonly layer: number;
@@ -127,6 +122,52 @@ function layerFromTensorName(name: string): number | null {
   return Number.isSafeInteger(layer) ? layer : null;
 }
 
+/**
+ * A partial-residency experiment may stream a suffix of the static program.
+ * Require model order here so an accidental reordering cannot change recurrent
+ * execution or make two owners claim the same transformer layer.
+ */
+function normalizedStreamedLayers(
+  streamedLayers: readonly number[] | undefined,
+): readonly number[] {
+  const selected = streamedLayers ?? QWEN35_ROLLING_LAYER_ORDER;
+  if (
+    selected.some((layer, index) =>
+      !Number.isSafeInteger(layer) ||
+      layer < 0 ||
+      layer >= MODEL_LAYER_COUNT ||
+      (index > 0 && selected[index - 1]! >= layer))
+  ) {
+    throw diagnosticError(
+      "rolling-layer-configuration-invalid",
+      "Streamed layers must be an ordered unique Qwen3.5 layer subset",
+    );
+  }
+  return Object.freeze([...selected]);
+}
+
+/**
+ * Turns the local hybrid experiment's resident-prefix count into the exact
+ * streamed suffix. Keeping this mapping beside the layer-order invariant makes
+ * loaders and ownership code use one validated partition.
+ */
+export function qwen35HybridStreamedLayers(
+  residentLayerCount: number | undefined,
+): readonly number[] {
+  if (
+    !Number.isSafeInteger(residentLayerCount) ||
+    residentLayerCount === undefined ||
+    residentLayerCount < 1 ||
+    residentLayerCount >= MODEL_LAYER_COUNT
+  ) {
+    throw diagnosticError(
+      "model-hybrid-resident-layer-count-invalid",
+      "Hybrid residency requires between one and thirty-one resident layers",
+    );
+  }
+  return QWEN35_ROLLING_LAYER_ORDER.slice(residentLayerCount);
+}
+
 function cloneSegment(segment: Qwen35PackageSegment): Qwen35PackageSegment {
   return Object.freeze({ ...segment });
 }
@@ -167,19 +208,25 @@ export function hasQwen35RollingLayerSet(
   ).every((layer) => layers.has(layer));
 }
 
-/** Splits the fixed rolling policy without changing package tensor order or bytes. */
+/**
+ * Splits any ordered transformer-layer subset without changing tensor order or
+ * bytes. Layers outside the subset remain owned by the permanent directory.
+ */
 export function planQwen35RollingLayerResidency(
   packageDirectory: Qwen35PackageDirectory,
+  streamedLayers?: readonly number[],
 ): Qwen35RollingLayerResidencyPlan {
+  const selectedLayers = normalizedStreamedLayers(streamedLayers);
+  const streamedLayerSet = new Set<number>(selectedLayers);
   const byLayer = new Map<number, Qwen35PackageTensor[]>();
   for (const tensor of packageDirectory.tensors) {
     const layer = layerFromTensorName(tensor.name);
-    if (layer === null || !ROLLING_LAYER_SET.has(layer)) continue;
+    if (layer === null || !streamedLayerSet.has(layer)) continue;
     const tensors = byLayer.get(layer) ?? [];
     tensors.push(tensor);
     byLayer.set(layer, tensors);
   }
-  const layers = QWEN35_ROLLING_LAYER_ORDER.map((layer) => {
+  const layers = selectedLayers.map((layer) => {
     const tensors = byLayer.get(layer);
     if (tensors === undefined || tensors.length === 0) {
       throw diagnosticError(
@@ -198,7 +245,7 @@ export function planQwen35RollingLayerResidency(
     packageDirectory,
     packageDirectory.tensors.filter((tensor) => {
       const layer = layerFromTensorName(tensor.name);
-      return layer === null || !ROLLING_LAYER_SET.has(layer);
+      return layer === null || !streamedLayerSet.has(layer);
     }),
   );
   const streamedBytes = layers.reduce(
@@ -210,7 +257,7 @@ export function planQwen35RollingLayerResidency(
     0n,
   );
   return Object.freeze({
-    streamedLayers: QWEN35_ROLLING_LAYER_ORDER,
+    streamedLayers: selectedLayers,
     streamedBytes,
     permanentBytes: qwen35TensorWeightBytes(permanentDirectory),
     maxLayerBytes,
@@ -222,12 +269,18 @@ export function planQwen35RollingLayerResidency(
 /** Applies tied-table and rolling-layer exclusions in their ownership order. */
 export function qwen35PermanentWeightPackage(
   packageDirectory: Qwen35PackageDirectory,
+  streamedLayers?: readonly number[],
+  tiedEmbeddingResidency: "streamed" | "resident" = "streamed",
 ): Qwen35PackageDirectory {
-  const withoutTied = hasQwen35DiskBackedTiedEmbedding(packageDirectory)
+  // Hybrid decode keeps the tied table resident because streaming it costs a
+  // complete 526 MB vocabulary scan for every token, independent of layer I/O.
+  const withoutTied =
+    tiedEmbeddingResidency === "streamed" &&
+      hasQwen35DiskBackedTiedEmbedding(packageDirectory)
     ? planQwen35TiedEmbeddingResidency(packageDirectory).permanentDirectory
     : packageDirectory;
   return hasQwen35RollingLayerSet(withoutTied)
-    ? planQwen35RollingLayerResidency(withoutTied).permanentDirectory
+    ? planQwen35RollingLayerResidency(withoutTied, streamedLayers).permanentDirectory
     : withoutTied;
 }
 
@@ -292,13 +345,18 @@ export async function createQwen35RollingLayerStore(input: {
   readonly rangeReader: Qwen35PackedRangeReader;
   readonly uploadLaneBytes: number;
   readonly readChunkBytes: number;
+  /** Omitted keeps the known all-layer rolling fallback. */
+  readonly streamedLayers?: readonly number[];
 }): Promise<Qwen35RollingLayerStore> {
-  const plan = planQwen35RollingLayerResidency(input.packageDirectory);
+  const plan = planQwen35RollingLayerResidency(
+    input.packageDirectory,
+    input.streamedLayers,
+  );
   validateCache(input.packageDirectory, input.cached);
   const uploadLaneBytes = positiveInteger(input.uploadLaneBytes, "Upload lane bytes");
   const readChunkBytes = positiveInteger(input.readChunkBytes, "Read chunk bytes");
   if (
-    uploadLaneBytes > MAX_READ_CHUNK_BYTES ||
+    uploadLaneBytes > MAX_UPLOAD_WINDOW_BYTES ||
     readChunkBytes > MAX_READ_CHUNK_BYTES ||
     typeof input.rangeReader?.read !== "function"
   ) {
@@ -318,8 +376,15 @@ export async function createQwen35RollingLayerStore(input: {
   let failedLayers = 0;
   let operationTail: Promise<void> = Promise.resolve();
   let disposePromise: Promise<void> | null = null;
+  const uploadWindow = { outstandingBytes: 0 };
   const controllers = new Set<AbortController>();
   const operations = new Set<Promise<unknown>>();
+
+  const retireUploadWindow = async (): Promise<void> => {
+    if (uploadWindow.outstandingBytes === 0) return;
+    await input.queue.onSubmittedWorkDone();
+    uploadWindow.outstandingBytes = 0;
+  };
 
   const schedule = <T>(
     externalSignal: AbortSignal,
@@ -441,23 +506,7 @@ export async function createQwen35RollingLayerStore(input: {
     layer: Qwen35RollingLayerResidency,
     directory: Qwen35WeightDirectory,
     signal: AbortSignal,
-    onUnsafeCleanup: () => void,
   ): Promise<void> => {
-    let queuedBytes = 0;
-    let queueDirty = false;
-    const retire = async (): Promise<void> => {
-      if (!queueDirty) return;
-      try {
-        await input.queue.onSubmittedWorkDone();
-      } catch (error) {
-        // Accepted queue writes keep their destinations live until retirement.
-        // A failed fence makes device reuse unsafe even if a later fence works.
-        onUnsafeCleanup();
-        throw error;
-      }
-      queueDirty = false;
-      queuedBytes = 0;
-    };
     for (const tensor of layer.directory.tensors) {
       const weight = findWeight(directory, tensor.name);
       for (const view of weight.physicalRows) {
@@ -466,6 +515,7 @@ export async function createQwen35RollingLayerStore(input: {
           signal.throwIfAborted();
           const byteLength = Math.min(
             readChunkBytes,
+            uploadLaneBytes,
             view.byteLength - localOffset,
           );
           const bytes = await readRange(
@@ -475,6 +525,15 @@ export async function createQwen35RollingLayerStore(input: {
             signal,
           );
           signal.throwIfAborted();
+          if (
+            uploadWindow.outstandingBytes > 0 &&
+            uploadWindow.outstandingBytes + bytes.byteLength > uploadLaneBytes
+          ) {
+            // GPUQueue.writeBuffer copies into queue-owned staging. Retire the
+            // bounded copy window before accepting another lane of bytes.
+            await retireUploadWindow();
+            signal.throwIfAborted();
+          }
           try {
             input.queue.writeBuffer(
               view.buffer,
@@ -489,14 +548,11 @@ export async function createQwen35RollingLayerStore(input: {
               "A rolling layer GPU upload failed",
             );
           }
-          queueDirty = true;
-          queuedBytes += bytes.byteLength;
+          uploadWindow.outstandingBytes += bytes.byteLength;
           localOffset += byteLength;
-          if (queuedBytes >= uploadLaneBytes) await retire();
         }
       }
     }
-    await retire();
   };
 
   const withLayer = <T>(request: {
@@ -530,7 +586,7 @@ export async function createQwen35RollingLayerStore(input: {
     let primaryError: unknown;
     let result: T | undefined;
     let unsafeCleanup = false;
-    let phase: "allocate" | "upload" | "execute" = "allocate";
+    let phase: "allocate" | "upload" | "execute" | "retire" = "allocate";
     try {
       const layerArena: Qwen35WeightArena = {
         allocate: (allocationRequest) => input.arena.allocate({
@@ -547,9 +603,10 @@ export async function createQwen35RollingLayerStore(input: {
       currentGpuBytes = safeNumber(directory.allocatedBytes, "Layer GPU bytes");
       peakGpuBytes = Math.max(peakGpuBytes, currentGpuBytes);
       phase = "upload";
-      await uploadLayer(layer, directory, signal, () => {
-        unsafeCleanup = true;
-      });
+      // GPUQueue.writeBuffer snapshots its CPU source synchronously. Queue order
+      // keeps these writes before layer dispatch; the ownership fence below is
+      // the only completion wait needed before buffer destruction.
+      await uploadLayer(layer, directory, signal);
       signal.throwIfAborted();
       phase = "execute";
       result = await request.execute(directory.view, Object.freeze({
@@ -564,8 +621,13 @@ export async function createQwen35RollingLayerStore(input: {
     // The callback may have submitted work that reads every staged tensor.
     // Fence even when upload already retired, then release ledger ownership.
     if (directory !== null) {
+      // Preserve an execution failure as the primary classification. When the
+      // callback succeeded, a failed ownership fence is a retirement failure:
+      // the store must be poisoned because buffer lifetime is now uncertain.
+      if (primaryError === undefined) phase = "retire";
       try {
         await input.queue.onSubmittedWorkDone();
+        uploadWindow.outstandingBytes = 0;
       } catch (error) {
         unsafeCleanup = true;
         primaryError ??= error;
@@ -598,6 +660,11 @@ export async function createQwen35RollingLayerStore(input: {
       }
       const code = (primaryError as { readonly code?: unknown }).code;
       if (code === "rolling-layer-range-read-failed") throw primaryError;
+      // Preserve only runtime-owned diagnostic codes. Arbitrary callback errors
+      // remain wrapped so browser/compiler text cannot cross the control boundary.
+      if (phase === "execute" && primaryError instanceof RuntimeDiagnosticError) {
+        throw primaryError;
+      }
       if (
         phase === "allocate" &&
         typeof code === "string" &&
@@ -609,11 +676,15 @@ export async function createQwen35RollingLayerStore(input: {
       throw diagnosticError(
         phase === "execute"
           ? "rolling-layer-execution-failed"
+          : phase === "retire"
+            ? "rolling-layer-retirement-failed"
           : phase === "upload"
             ? "rolling-layer-upload-failed"
             : "rolling-layer-allocation-failed",
         phase === "execute"
           ? "Rolling layer execution failed"
+          : phase === "retire"
+            ? "Rolling layer retirement failed"
           : phase === "upload"
             ? "Rolling layer upload failed"
             : "Rolling layer allocation failed",
@@ -637,7 +708,7 @@ export async function createQwen35RollingLayerStore(input: {
   };
 
   return Object.freeze({
-    streamedLayers: QWEN35_ROLLING_LAYER_ORDER,
+    streamedLayers: plan.streamedLayers,
     get poisoned(): boolean { return poisoned; },
     withLayer,
     cancel,
@@ -670,6 +741,8 @@ export async function executeQwen35RollingLayerSequence<
     readonly invocation: TInvocation;
     readonly weights: Qwen35WeightDirectoryView;
     readonly mutation: Qwen35RollingLayerMutation;
+    /** True only while bindings reference buffers destroyed after this callback. */
+    readonly transientWeights: boolean;
   }) => Promise<void> | void;
   readonly poison: () => void;
 }): Promise<void> {
@@ -703,6 +776,7 @@ export async function executeQwen35RollingLayerSequence<
           execute: (weights, layerMutation) => input.execute({
             invocation,
             weights,
+            transientWeights: true,
             mutation: Object.freeze({
               markStateMutation(): void {
                 tokenMutated = true;
@@ -715,6 +789,7 @@ export async function executeQwen35RollingLayerSequence<
         await input.execute({
           invocation,
           weights: input.permanentWeights,
+          transientWeights: false,
           mutation: Object.freeze({
             markStateMutation(): void { tokenMutated = true; },
           }),

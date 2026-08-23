@@ -72,6 +72,8 @@ interface StoredCommand {
     documentId: string;
     startedAtMs: number;
     disconnectedAtMs?: number;
+    replacementDocumentId?: string;
+    replacementReadyAtMs?: number;
   };
   timer?: number | NodeJS.Timeout;
   retireAtMs?: number;
@@ -211,6 +213,7 @@ export class ControlPlane {
     const expectedSeq = this.#sequences.acquire(identity.documentId);
     this.#connections.set(connectionId, connection);
     this.#connectionByTab.set(key, connectionId);
+    this.#terminalCommandsForReplacementDocument(identity);
     for (const disconnect of this.#disconnects) {
       if (
         disconnect.identity.deviceId === identity.deviceId &&
@@ -268,6 +271,7 @@ export class ControlPlane {
         stored.tracker.snapshot().state === "started"
       ) {
         stored.reloadProof.disconnectedAtMs = this.#clock.now();
+        this.#tryCompleteReload(stored);
       }
     }
     const disconnectRecord: DisconnectRecord = {
@@ -519,17 +523,31 @@ export class ControlPlane {
   #completeReplacementReload(message: Extract<PhoneToServerMessage, { type: "ready" }>): void {
     for (const stored of this.#commands.values()) {
       const snapshot = stored.tracker.snapshot();
+      const proof = stored.reloadProof;
       if (
         isReload(snapshot.command) &&
         snapshot.state === "started" &&
         tabKey(stored.target) === tabKey(message) &&
-        stored.reloadProof?.disconnectedAtMs !== undefined &&
-        stored.reloadProof.documentId !== message.documentId
+        proof !== undefined &&
+        proof.documentId !== message.documentId
       ) {
-        stored.tracker.transition("completed", this.#clock.now());
-        this.#retireTerminal(stored);
+        proof.replacementDocumentId = message.documentId;
+        proof.replacementReadyAtMs = this.#clock.now();
+        this.#tryCompleteReload(stored);
       }
     }
+  }
+
+  /** Reload proof is order-independent because WebSocket close can lag ready. */
+  #tryCompleteReload(stored: StoredCommand): void {
+    const proof = stored.reloadProof;
+    if (
+      proof?.disconnectedAtMs === undefined ||
+      proof.replacementDocumentId === undefined ||
+      stored.tracker.snapshot().state !== "started"
+    ) return;
+    stored.tracker.transition("completed", this.#clock.now());
+    this.#retireTerminal(stored);
   }
 
   getCommand(commandId: string): CommandSnapshot | undefined {
@@ -656,6 +674,30 @@ export class ControlPlane {
       documentId: stored.originDocumentId,
       expiresAtMs,
     });
+  }
+
+  #terminalCommandsForReplacementDocument(identity: PhoneIdentity): void {
+    for (const stored of this.#commands.values()) {
+      const snapshot = stored.tracker.snapshot();
+      if (
+        isTerminal(snapshot.state) ||
+        isReload(stored.message.command) ||
+        tabKey(stored.target) !== tabKey(identity) ||
+        stored.originDocumentId === undefined ||
+        stored.originDocumentId === identity.documentId
+      ) {
+        continue;
+      }
+      // A same-tab replacement cannot finish work in the old JavaScript realm.
+      // Terminal ownership prevents the replacement from accidentally retrying
+      // a prompt or continuing a model load that has already lost its GPU state.
+      stored.tracker.forceTerminal(
+        "timed_out",
+        this.#clock.now(),
+        "origin_document_replaced",
+      );
+      this.#retireTerminal(stored);
+    }
   }
 
   #armCommandDeadline(stored: StoredCommand): void {

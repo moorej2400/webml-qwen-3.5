@@ -54,3 +54,20 @@ reviewed and sanitized.
   browser rule.
 - Preserve the selected model, quantization, multimodal support, and context
   target unless the user explicitly changes those product requirements.
+
+## Lessons learned — local iPhone validation
+
+- Use Computer Use with the direct iPhone Mirroring app. Do not substitute
+  desktop screenshot automation for the physical Safari test.
+- Keep the local development server in a persistent session. Before opening
+  Safari, verify its listener and make an HTTP request to the Mac LAN address;
+  a loopback-only check is not enough.
+- Do not report an iPhone result until Safari or the local control telemetry
+  confirms the actual page outcome. Recheck the listener before changing
+  firewall or phone-network settings.
+- Select the target by OS, durable device ID, tab ID, and current document ID.
+  Never use the first connected device because stale or desktop tabs can appear
+  before the physical phone in the control snapshot.
+- The local control server serves `dev-dist`, not TypeScript source files. Run
+  `npm run build:dev` before every reload used for a benchmark; otherwise the
+  browser can execute an older runtime while the source tree looks current.

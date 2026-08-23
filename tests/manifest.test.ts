@@ -23,7 +23,7 @@ function validManifest(): ModelPackageManifest {
       size: "110",
       sha256: SHA_A,
     },
-    runtime: { abi: "qwen35-webgpu-v1" },
+    runtime: { abi: "qwen35-webgpu-v2" },
     tokenizer: {
       repository: "example/tokenizer",
       revision: "2".repeat(40),

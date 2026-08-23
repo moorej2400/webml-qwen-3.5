@@ -17,7 +17,9 @@ import {
   createQwen35GpuLedger,
   loadQwen35BrowserResources,
   isQwen35AppleMobileBrowser,
+  QWEN35_DEFAULT_HYBRID_RESIDENT_LAYERS,
   qwen35AllocatedWeightBytes,
+  resolveQwen35ResidencyPolicy,
   snapshotQwen35Manifest,
   type Qwen35DriverFactoryContext,
   type Qwen35ModelDevice,
@@ -47,6 +49,18 @@ test("detects iPad desktop-mode Safari from touch capability", () => {
   assert.equal(isQwen35AppleMobileBrowser(desktopModeIpad, 1), false);
 });
 
+test("uses full residency for Apple mobile when the measured ledger permits it", () => {
+  const directory = buildQwen35PackageDirectory(pinnedManifest());
+  assert.equal(
+    resolveQwen35ResidencyPolicy({}, directory, 1n, true),
+    "auto",
+  );
+});
+
+test("uses twelve layers only as the explicit hybrid experiment default", () => {
+  assert.equal(QWEN35_DEFAULT_HYBRID_RESIDENT_LAYERS, 12);
+});
+
 function borrowedDeviceDoesNotExposeOwnership(
   context: Qwen35DriverFactoryContext,
 ): void {
@@ -65,7 +79,7 @@ function completeDevice(): {
   let allocationCount = 0;
   let destroyCount = 0;
   const device = {
-    features: new Set(["shader-f16"]),
+    features: new Set(["shader-f16", "subgroups"]),
     limits: {
       maxBufferSize: 1 << 30,
       maxStorageBufferBindingSize: 1 << 30,
@@ -115,6 +129,11 @@ function completeDevice(): {
     destroyCount: () => destroyCount,
   };
 }
+
+test("ABI v2 does not require WebGPU subgroups", async () => {
+  const source = await import("../src/qwen35-model-loader.js");
+  assert.doesNotMatch(source.loadQwen35BrowserResources.toString(), /\["shader-f16", "subgroups"\]/u);
+});
 
 test("rejects a device missing executor methods before model allocation", () => {
   for (const method of [
@@ -291,7 +310,7 @@ function pinnedManifest(): ModelPackageManifest {
     format: "webml-qwen-package",
     version: 1,
     packageKind: "language",
-    runtime: { abi: "qwen35-webgpu-v1" },
+    runtime: { abi: "qwen35-webgpu-v2" },
     source: {
       repository: "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF",
       revision: "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
@@ -450,7 +469,7 @@ test("prewarms one lazy state page before weight and driver initialization", asy
 test("requires the exact pinned language and tokenizer source identities", () => {
   const identity = {
     packageKind: "language",
-    runtime: { abi: "qwen35-webgpu-v1" },
+    runtime: { abi: "qwen35-webgpu-v2" },
     source: {
       repository: "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF",
       revision: "4168f45a16a1290d65a4ec0fa312ae917a4c15d6",
@@ -592,7 +611,7 @@ test("snapshots trusted manifest fields before caller mutation can cross an awai
   assert.equal(Object.isFrozen(snapshot.tensorLayout[0]), true);
   assert.equal(modelCacheKey(snapshot), expectedManifestSha256);
   assert.equal(snapshot.source.revision, "4168f45a16a1290d65a4ec0fa312ae917a4c15d6");
-  assert.equal(snapshot.runtime.abi, "qwen35-webgpu-v1");
+  assert.equal(snapshot.runtime.abi, "qwen35-webgpu-v2");
 
   const directory = buildQwen35PackageDirectory(snapshot);
   assert.deepEqual(directory.shards[0], {
@@ -693,5 +712,27 @@ test("GPU cleanup preserves its first failure after every cleanup step settles",
     }),
     /first/,
   );
-  assert.deepEqual(events, ["driver", "queue", "state", "weight", "device", "ledger"]);
+  assert.deepEqual(events, ["driver", "queue", "device", "state", "weight", "ledger"]);
+});
+
+test("GPU cleanup destroys the device before buffers when queue retirement fails", async () => {
+  const events: string[] = [];
+  await assert.rejects(
+    cleanupQwen35GpuResources({
+      driver: { ...driver, async dispose() { events.push("driver"); } },
+      device: {
+        queue: {
+          async onSubmittedWorkDone() {
+            events.push("queue");
+            throw new Error("queue retirement failed");
+          },
+        },
+        destroy() { events.push("device"); },
+      },
+      hybridState: { dispose() { events.push("state"); } },
+      weightAllocations: [{ ...allocation, destroy() { events.push("weight"); } }],
+      ledger: { assertAllReleased() { events.push("ledger"); } },
+    }),
+  );
+  assert.deepEqual(events, ["driver", "queue", "device", "state", "weight", "ledger"]);
 });

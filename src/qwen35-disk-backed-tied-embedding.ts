@@ -15,11 +15,15 @@ import type { Qwen35WeightWriteQueue } from "./qwen35-weight-upload.js";
 const TIED_TENSOR_NAME = "token_embd.weight";
 const QWEN35_HIDDEN_SIZE = 2_560;
 const Q6_K_GGML_TYPE = 14;
-const Q6_K_STORAGE_TYPE = "q6-k-212";
+const Q6_K_STORAGE_TYPE = "q6-k-fused-f32-256";
 const Q6_K_BLOCK_ELEMENTS = 256;
-const Q6_K_BLOCK_BYTES = 212;
+const Q6_K_BLOCK_BYTES = 256;
 const GPU_STORAGE_AND_COPY_DST = 0x0080 | 0x0008;
-const OUTPUT_TILE_BUFFER_COUNT = 2;
+// Four 1,024-row Q6_K tiles add only about 8 MiB of scratch memory, but let
+// the GPU reduce four vocabulary tiles before the oldest staging buffer must
+// be fenced and reused. This keeps the fixed kernel ABI while halving the
+// submission and retirement cadence of the two-buffer schedule.
+export const QWEN35_STAGED_LOGITS_TILE_BUFFER_COUNT = 4;
 
 /** Distinguishes the exact Q6_K product tensor from small generic test fixtures. */
 export function hasQwen35DiskBackedTiedEmbedding(
@@ -434,7 +438,11 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
       alignment: 4,
       requiredShardQuantumBytes: BigInt(geometry.rowBytes),
     }));
-    for (let index = 0; index < OUTPUT_TILE_BUFFER_COUNT; index += 1) {
+    for (
+      let index = 0;
+      index < QWEN35_STAGED_LOGITS_TILE_BUFFER_COUNT;
+      index += 1
+    ) {
       allocations.push(await input.arena.allocate({
         id: `tied-embedding-output-tile-${index}`,
         category: "scratch",
@@ -498,6 +506,7 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
       await input.queue.onSubmittedWorkDone();
       queueDirty = false;
     } catch {
+      accepting = false;
       throw diagnosticError(
         "tied-embedding-queue-retirement-failed",
         "Disk-backed tied embedding queue retirement failed",
@@ -514,6 +523,7 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
       outputBufferBusy.fill(false);
       queueDirty = false;
     } catch {
+      accepting = false;
       throw diagnosticError(
         "tied-embedding-queue-retirement-failed",
         "Disk-backed tied embedding queue retirement failed",
@@ -528,6 +538,7 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
       outputBufferBusy.fill(false);
       queueDirty = false;
     } catch {
+      accepting = false;
       throw diagnosticError(
         "tied-embedding-queue-retirement-failed",
         "Disk-backed tied embedding queue retirement failed",
@@ -554,20 +565,27 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
         "Tied embedding logical range is invalid",
       );
     }
-    const result = new Uint8Array(byteLength);
-    let copied = 0;
+    const intersections = geometry.segments.flatMap((segment) => {
+      if (segment.tensorEnd <= tensorOffset || segment.tensorStart >= tensorEnd) {
+        return [];
+      }
+      return [{
+        segment,
+        start: Math.max(tensorOffset, segment.tensorStart),
+        end: Math.min(tensorEnd, segment.tensorEnd),
+      }];
+    });
     try {
-      for (const segment of geometry.segments) {
-        if (segment.tensorEnd <= tensorOffset) continue;
-        if (segment.tensorStart >= tensorEnd) break;
+      const readIntersection = async (
+        intersection: typeof intersections[number],
+      ): Promise<Uint8Array> => {
         signal.throwIfAborted();
-        const start = Math.max(tensorOffset, segment.tensorStart);
-        const end = Math.min(tensorEnd, segment.tensorEnd);
-        const rangeBytes = end - start;
-        const cached = input.cached.shards[segment.source.shardIndex]!;
+        const rangeBytes = intersection.end - intersection.start;
+        const cached = input.cached.shards[intersection.segment.source.shardIndex]!;
         const bytes = await input.rangeReader.read({
           storagePath: cached.storagePath,
-          offset: segment.shardOffset + start - segment.tensorStart,
+          offset: intersection.segment.shardOffset + intersection.start -
+            intersection.segment.tensorStart,
           byteLength: rangeBytes,
           signal,
         });
@@ -575,10 +593,31 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
         if (!(bytes instanceof Uint8Array) || bytes.byteLength !== rangeBytes) {
           throw new Error("range length mismatch");
         }
-        result.set(bytes, start - tensorOffset);
-        copied += rangeBytes;
+        return bytes;
+      };
+      const direct = intersections[0];
+      if (
+        intersections.length === 1 &&
+        direct !== undefined &&
+        direct.start === tensorOffset &&
+        direct.end === tensorEnd
+      ) {
+        const bytes = await readIntersection(direct);
+        diskReadBytes += byteLength;
+        maxDiskReadBytes = Math.max(maxDiskReadBytes, byteLength);
+        return bytes;
+      }
+      const result = new Uint8Array(byteLength);
+      let copied = 0;
+      for (const intersection of intersections) {
+        const bytes = await readIntersection(intersection);
+        result.set(bytes, intersection.start - tensorOffset);
+        copied += bytes.byteLength;
       }
       if (copied !== byteLength) throw new Error("range coverage mismatch");
+      diskReadBytes += byteLength;
+      maxDiskReadBytes = Math.max(maxDiskReadBytes, byteLength);
+      return result;
     } catch {
       if (signal.aborted) throw abortError();
       throw diagnosticError(
@@ -586,9 +625,6 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
         "Immutable tied embedding range read failed",
       );
     }
-    diskReadBytes += byteLength;
-    maxDiskReadBytes = Math.max(maxDiskReadBytes, byteLength);
-    return result;
   };
 
   const schedule = <T>(
@@ -725,7 +761,8 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
     for (let firstRow = 0; firstRow < decodableRows; firstRow += outputTileRows) {
       signal.throwIfAborted();
       const rowCount = Math.min(outputTileRows, decodableRows - firstRow);
-      const outputBufferIndex = (firstRow / outputTileRows) % OUTPUT_TILE_BUFFER_COUNT;
+      const outputBufferIndex =
+        (firstRow / outputTileRows) % QWEN35_STAGED_LOGITS_TILE_BUFFER_COUNT;
       await retireOutputBuffer(outputBufferIndex);
       const outputBuffer = outputBuffers[outputBufferIndex];
       if (outputBuffer === undefined) {
@@ -827,7 +864,8 @@ export async function createQwen35DiskBackedTiedEmbeddingStore(input: {
           "Tied embedding GPU candidate range is invalid",
         );
       }
-      const outputBufferIndex = candidateSlot % OUTPUT_TILE_BUFFER_COUNT;
+      const outputBufferIndex =
+        candidateSlot % QWEN35_STAGED_LOGITS_TILE_BUFFER_COUNT;
       if (candidateSlot > 0 && outputBufferIndex === 0) {
         try {
           await request.flush();

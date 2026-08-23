@@ -6,6 +6,7 @@ import {
   QWEN35_NO_SELECTED_TOKEN,
   planQwen35FinalTokenSelection,
   planQwen35LogitsTileWinner,
+  planQwen35PhysicalCandidateSelection,
   selectQwen35FiniteTileWinner,
   selectQwen35IndexedWinner,
 } from "../src/qwen35-logits-reduction.js";
@@ -64,6 +65,20 @@ test("plans exactly one candidate per mathematical tile and one final dispatch",
     uniformWords: [243, 0, 0, 0],
     workgroups: { x: 1, y: 1, z: 1 },
   });
+  assert.deepEqual(planQwen35PhysicalCandidateSelection({ candidateCount: 244 }), {
+    operation: "indexed-top-1",
+    uniformWords: [244, 0, 0, 0],
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+  assert.deepEqual(planQwen35PhysicalCandidateSelection({ candidateCount: 2_048 }), {
+    operation: "indexed-top-1",
+    uniformWords: [2_048, 0, 0, 0],
+    workgroups: { x: 1, y: 1, z: 1 },
+  });
+  assert.throws(
+    () => planQwen35PhysicalCandidateSelection({ candidateCount: 242 }),
+    /candidate/i,
+  );
   assert.throws(
     () => planQwen35LogitsTileWinner({
       vocabularyStart: 248_000,
@@ -128,6 +143,14 @@ test("defines separate tile and indexed reduction kernels with actual token ids"
   assert.match(final.source, /candidate_token_ids\[slot\]/);
   assert.match(final.source, /token >= 248070u/);
   assert.match(final.source, /selected_token\[0\] = 0xffffffffu/);
+  assert.match(
+    final.source,
+    /if \(lane == 0u\) \{ selected_token\[0\] = 0xffffffffu; \}/,
+  );
+  assert.match(
+    final.source,
+    /if \(lane == 0u\) \{ selected_token\[0\] = best_tokens\[0\]; \}/,
+  );
   assert.doesNotMatch(final.source, /arrayLength|248320/);
   assert.equal(Object.isFrozen(QWEN35_LOGITS_REDUCTION_KERNELS), true);
   assert.equal(Object.isFrozen(tile), true);

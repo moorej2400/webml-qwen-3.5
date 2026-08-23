@@ -7,9 +7,14 @@ import {
   probeDeviceProfile,
 } from "../src/device-profile.js";
 
+test("uses the physically validated 64 MiB upload window", () => {
+  assert.equal(DEFAULT_UPLOAD_LANE_BYTES, 64 * 1024 * 1024);
+});
+
 const MIB = 1024 * 1024;
 
 function adapterSurface(options?: {
+  readonly adapterFeatures?: readonly string[];
   readonly maxBufferSize?: number;
   readonly maxStorageBufferBindingSize?: number;
   readonly minStorageBufferOffsetAlignment?: number;
@@ -33,7 +38,7 @@ function adapterSurface(options?: {
       gpu: {
         async requestAdapter() {
           return {
-            features: new Set(["shader-f16", "timestamp-query"]),
+            features: new Set(options?.adapterFeatures ?? ["shader-f16", "timestamp-query"]),
             limits,
             async requestDevice(descriptor: {
               requiredFeatures?: readonly string[];
@@ -119,6 +124,27 @@ test("does not advertise an available but unrequested feature as enabled", async
   ]);
   assert.deepEqual(profile.facts.device.features, []);
   assert.equal(profile.facts.device.features.includes("timestamp-query"), false);
+});
+
+test("enables a supported optional feature without requiring its availability", async () => {
+  const supported = adapterSurface({
+    adapterFeatures: ["shader-f16", "subgroups"],
+  });
+  const enabled = await probeDeviceProfile(supported.surface, {
+    requiredFeatures: ["shader-f16"],
+    optionalFeatures: ["subgroups"],
+  });
+  assert.deepEqual(supported.requests, [{
+    requiredFeatures: ["shader-f16", "subgroups"],
+  }]);
+  assert.deepEqual(enabled.facts.device.features, ["shader-f16", "subgroups"]);
+
+  const unavailable = adapterSurface();
+  await probeDeviceProfile(unavailable.surface, {
+    requiredFeatures: ["shader-f16"],
+    optionalFeatures: ["subgroups"],
+  });
+  assert.deepEqual(unavailable.requests, [{ requiredFeatures: ["shader-f16"] }]);
 });
 
 test("reports the feature set returned by the device as enabled", async () => {

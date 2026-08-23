@@ -109,6 +109,8 @@ export function qwen35DeltaNetQkHead(valueHead: number): number {
   ) {
     throw new Error("DeltaNet value head is out of range");
   }
+  // GGML repeat semantics map 32 value heads onto the 16 Q/K heads as
+  // 0..15, 0..15. Adjacent-pair mapping changes the model computation.
   return valueHead % QK_HEAD_COUNT;
 }
 

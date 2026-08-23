@@ -6,7 +6,7 @@ async function loadKernelModule(): Promise<Record<string, unknown>> {
   return import("../src/hybrid-kernels.js").catch(() => ({}));
 }
 
-test("defines only the six model-specific hybrid decode kernels", async () => {
+test("defines the model-specific hybrid decode kernels", async () => {
   const module = await loadKernelModule();
   assert.ok(Array.isArray(module.QWEN35_HYBRID_KERNELS));
   const kernels = module.QWEN35_HYBRID_KERNELS as readonly {
@@ -29,6 +29,7 @@ test("defines only the six model-specific hybrid decode kernels", async () => {
       "deltanet-parameters",
       "deltanet-recurrent",
       "deltanet-gated-norm",
+      "deltanet-recurrent-gated-norm",
     ],
   );
   assert.equal(kernels.every(({ key }) => key.phase === "decode"), true);
@@ -59,13 +60,19 @@ test("uses cooperative workgroups for attention and recurrent reductions", async
   assert.match(online, /dot_partials/);
   assert.match(online, /workgroupBarrier\(\)/);
   const recurrent = sourceFor("deltanet-recurrent");
-  assert.match(recurrent, /@compute @workgroup_size\(128, 2, 1\)/);
+  assert.match(recurrent, /@compute @workgroup_size\(128\)/);
   assert.match(recurrent, /query_partials/);
   assert.match(recurrent, /key_partials/);
-  assert.match(recurrent, /delta_values/);
-  assert.match(recurrent, /key_group \* 64u/);
-  assert.match(recurrent, /local\.y/);
+  assert.doesNotMatch(recurrent, /delta_values/);
+  assert.doesNotMatch(recurrent, /key_group \* 64u/);
+  assert.doesNotMatch(recurrent, /local\.y/);
+  assert.match(recurrent, /decay\+memory/);
+  assert.match(recurrent, /update\+output/);
   assert.match(recurrent, /workgroupBarrier\(\)/);
+  const fused = sourceFor("deltanet-recurrent-gated-norm");
+  assert.match(fused, /norm_partials/);
+  assert.match(fused, /norm_weight_values/);
+  assert.match(fused, /silu\(z_values\[index\]\)/);
 });
 
 test("prepares interleaved Q/gate and writes the current packed K/V row", async () => {
@@ -148,7 +155,7 @@ test("encodes exact DeltaNet state order and head mapping in WGSL", async () => 
     /beta_values\[value_head\]\s*\*\s*\n\s*\(convolved_qkv\[4096u \+ value_head \* 128u \+ value_lane\] - memory\)/,
   );
   assert.match(recurrent, /state_values\[state_index\]\s*=\s*updated/);
-  assert.match(recurrent, /query_value\s*\*\s*state_values\[state_index\]/);
+  assert.match(recurrent, /query_value\s*\*\s*updated/);
   assert.match(recurrent, /0\.000001f/);
   assert.match(recurrent, /inverseSqrt\(128\.0f\)/);
   assert.doesNotMatch(recurrent, /\blet\s+target\b/);
@@ -156,6 +163,11 @@ test("encodes exact DeltaNet state order and head mapping in WGSL", async () => 
   const norm = byOperation.get("deltanet-gated-norm")!;
   assert.match(norm, /norm_weight_values\[lane\]/);
   assert.match(norm, /silu\(z_values\[index\]\)/);
+
+  const fused = byOperation.get("deltanet-recurrent-gated-norm")!;
+  assert.match(fused, /value_head\s*%\s*16u/);
+  assert.match(fused, /state_values\[state_index\]\s*=\s*updated/);
+  assert.match(fused, /norm_partials\[value_lane\]/);
 });
 
 test("registers every hybrid kernel through the existing explicit registry", async () => {
@@ -172,7 +184,7 @@ test("registers every hybrid kernel through the existing explicit registry", asy
     },
   });
 
-  assert.equal(registered.length, 6);
+  assert.equal(registered.length, 7);
   assert.deepEqual(registered, module.QWEN35_HYBRID_KERNELS);
 });
 
@@ -232,8 +244,9 @@ test("bounds every hybrid dispatch and online K/V read", async () => {
       plan({ operation: "deltanet-parameters", ...common }).workgroups.x,
       plan({ operation: "deltanet-recurrent", ...common }).workgroups.x,
       plan({ operation: "deltanet-gated-norm", ...common }).workgroups.x,
+      plan({ operation: "deltanet-recurrent-gated-norm", ...common }).workgroups.x,
     ],
-    [16, 16, 128, 1, 32, 32],
+    [16, 16, 128, 1, 32, 32, 32],
   );
 
   for (const input of [

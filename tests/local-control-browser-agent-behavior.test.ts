@@ -166,6 +166,15 @@ const createAgentHarness = () => {
         { detail },
       ));
     },
+    signalRuntimeMetricsEvent(detail: Record<string, unknown>) {
+      context.dispatchEvent(new (context.CustomEvent as new (
+        type: string,
+        init: { readonly detail: unknown },
+      ) => { type: string; detail: unknown })(
+        "qwen-local-runtime-metrics",
+        { detail },
+      ));
+    },
     runDelayedTimers() {
       for (const callback of delayedTimers.splice(0)) callback();
     },
@@ -179,6 +188,7 @@ test("generated agent connects automatically, replays, deduplicates, and reloads
   const harness = createAgentHarness();
   let generations = 0;
   harness.context.__QWEN_LOCAL_CONTROL__ = {
+    dispose() {},
     runPrompt() {
       generations += 1;
     },
@@ -264,6 +274,131 @@ test("generated agent connects automatically, replays, deduplicates, and reloads
   assert.equal(socket.closeReason, "protocol_error");
 });
 
+test("warm reload waits for runtime disposal before navigating", async () => {
+  const harness = createAgentHarness();
+  let releaseDispose: (() => void) | undefined;
+  const disposed = new Promise<void>((resolve) => {
+    releaseDispose = resolve;
+  });
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    async dispose() {
+      await disposed;
+    },
+  };
+  harness.signalRuntimeReady();
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  assert.ok(socket);
+  socket.emit("open");
+
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_reload_0123456789",
+    command: "warmReload",
+  });
+  await flush();
+  assert.equal(harness.reloads, 0);
+
+  releaseDispose!();
+  await flush();
+  assert.equal(harness.reloads, 1);
+});
+
+test("warm reload rejects a second navigation while the first disposal is pending", async () => {
+  const harness = createAgentHarness();
+  let releaseDispose: (() => void) | undefined;
+  const disposed = new Promise<void>((resolve) => {
+    releaseDispose = resolve;
+  });
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    async dispose() {
+      await disposed;
+    },
+  };
+  harness.signalRuntimeReady();
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  assert.ok(socket);
+  socket.emit("open");
+
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_reload_first_012345",
+    command: "warmReload",
+  });
+  await flush();
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_reload_second_01234",
+    command: "warmReload",
+  });
+  await flush();
+
+  const second = (socket.sent as Array<{
+    readonly commandId?: string;
+    readonly state?: string;
+    readonly reason?: string;
+  }>).filter((message) => message.commandId === "command_reload_second_01234").at(-1);
+  assert.deepEqual(
+    { state: second?.state, reason: second?.reason },
+    { state: "failed", reason: "reload_in_progress" },
+  );
+  assert.equal(harness.reloads, 0);
+
+  releaseDispose!();
+  await flush();
+  assert.equal(harness.reloads, 1);
+});
+
+test("generated agent ignores commands delivered by a stale socket", async () => {
+  const harness = createAgentHarness();
+  let generations = 0;
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    runPrompt() {
+      generations += 1;
+    },
+  };
+  harness.signalRuntimeReady();
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  const stale = FakeWebSocket.instances[0];
+  assert.ok(stale);
+  stale.emit("open");
+  stale.emit("close");
+  harness.runDelayedTimers();
+  await flush();
+  const replacement = FakeWebSocket.instances[1];
+  assert.ok(replacement);
+  replacement.emit("open");
+
+  stale.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_stale_0123456789",
+    command: "runPrompt",
+  });
+  await flush();
+
+  assert.equal(generations, 0);
+  assert.equal(
+    (replacement.sent as Array<{ readonly commandId?: string }>).some(
+      (message) => message.commandId === "command_stale_0123456789",
+    ),
+    false,
+  );
+});
+
 test("generated agent prevents overlapping reconnects and inherited handlers", async () => {
   const harness = createAgentHarness();
   let inheritedCalls = 0;
@@ -300,6 +435,86 @@ test("generated agent prevents overlapping reconnects and inherited handlers", a
     "failed",
   );
   assert.ok(ready.documentId);
+});
+
+test("generated agent resets only transport history after a local server restart", async () => {
+  const harness = createAgentHarness();
+  let stateReads = 0;
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    async getState() {
+      stateReads += 1;
+      return {};
+    },
+  };
+  harness.signalRuntimeReady();
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  assert.ok(socket);
+  socket.emit("open");
+  const initialReady = socket.sent.find((message) =>
+    (message as { readonly type?: string }).type === "ready"
+  ) as { readonly documentId: string; readonly eventSeq: number } | undefined;
+  assert.ok(initialReady);
+  const command = {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_state_0123456789",
+    command: "getState",
+  };
+  socket.emit("message", command);
+  await flush();
+  assert.equal(stateReads, 1);
+  const highestEventSeq = Math.max(...(socket.sent as Array<{
+    readonly eventSeq?: number;
+  }>).flatMap(({ eventSeq }) => eventSeq === undefined ? [] : [eventSeq]));
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "eventAck",
+    documentId: initialReady.documentId,
+    status: "accepted",
+    acknowledgedSeq: highestEventSeq,
+    expectedSeq: highestEventSeq + 1,
+  });
+  const beforeRestart = socket.sent.length;
+
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "sequenceSync",
+    documentId: initialReady.documentId,
+    expectedSeq: 1,
+  });
+
+  const afterRestart = socket.sent.slice(beforeRestart) as Array<{
+    readonly type?: string;
+    readonly eventSeq?: number;
+    readonly event?: { readonly name?: string };
+  }>;
+  assert.deepEqual(
+    afterRestart.map((message) => ({
+      type: message.type,
+      eventSeq: message.eventSeq,
+      eventName: message.event?.name,
+    })),
+    [
+      { type: "ready", eventSeq: 1, eventName: undefined },
+      { type: "telemetry", eventSeq: 2, eventName: "connected" },
+    ],
+  );
+  const beforeDuplicate = socket.sent.length;
+  socket.emit("message", command);
+  await flush();
+  assert.equal(stateReads, 1, "a server restart must not erase command deduplication");
+  assert.equal(
+    (socket.sent.slice(beforeDuplicate) as Array<{
+      readonly commandId?: string;
+      readonly state?: string;
+    }>).find(({ commandId }) => commandId === command.commandId)?.state,
+    "completed",
+  );
+  assert.equal(socket.closeCode, undefined);
 });
 
 test("generated agent does not identify or accept queued work before runtime handlers are ready", async () => {
@@ -481,6 +696,7 @@ test("reconcile settles a conflicting local terminal and reconnect does not repl
 test("server terminal settles an in-flight browser command and suppresses its late completion", async () => {
   const harness = createAgentHarness();
   let generations = 0;
+  let cancellations = 0;
   let finishPrompt!: () => void;
   const pendingPrompt = new Promise<void>((resolve) => {
     finishPrompt = resolve;
@@ -489,6 +705,10 @@ test("server terminal settles an in-flight browser command and suppresses its la
     runPrompt() {
       generations += 1;
       return pendingPrompt;
+    },
+    cancelPrompt() {
+      cancellations += 1;
+      finishPrompt();
     },
   };
   harness.signalRuntimeReady();
@@ -532,6 +752,7 @@ test("server terminal settles an in-flight browser command and suppresses its la
   });
   await flush();
   assert.equal(commandStates().length, beforeReconcile);
+  assert.equal(cancellations, 1);
 
   finishPrompt();
   await flush();
@@ -763,6 +984,52 @@ test("progress telemetry preserves terminal load telemetry and command capacity"
   );
 });
 
+test("generated agent gives one command exclusive ownership of an active load", async () => {
+  const harness = createAgentHarness();
+  let finishLoad!: () => void;
+  const loadPending = new Promise<void>((resolve) => { finishLoad = resolve; });
+  let loadCalls = 0;
+  harness.context.__QWEN_LOCAL_CONTROL__ = {
+    load() {
+      loadCalls += 1;
+      return loadPending;
+    },
+  };
+  harness.signalRuntimeReady();
+  harness.lifecycle.get("pageshow")?.[0]?.();
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  assert.ok(socket);
+  socket.emit("open");
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_load_first_012345",
+    command: "load",
+  });
+  await flush();
+  socket.emit("message", {
+    schemaVersion: 1,
+    type: "command",
+    commandId: "command_load_second_01234",
+    command: "load",
+  });
+  await flush();
+
+  const second = (socket.sent as Array<{
+    readonly commandId?: string;
+    readonly state?: string;
+    readonly reason?: string;
+  }>).filter((message) => message.commandId === "command_load_second_01234").at(-1);
+  assert.deepEqual(
+    { state: second?.state, reason: second?.reason },
+    { state: "failed", reason: "load_in_progress" },
+  );
+  assert.equal(loadCalls, 1);
+  finishLoad();
+  await flush();
+});
+
 test("upload diagnostics reach the socket with only fixed labels and bounded numeric fields", async () => {
   const harness = createAgentHarness();
   harness.context.__QWEN_LOCAL_CONTROL__ = { async getState() { return {}; } };
@@ -868,6 +1135,109 @@ test("upload diagnostics reach the socket with only fixed labels and bounded num
     sequences,
     Array.from({ length: sequences.length }, (_, index) => index + 1),
   );
+});
+
+test("runtime metrics reach the journal without prompt, output, or free-form detail", async () => {
+  const harness = createAgentHarness();
+  harness.context.__QWEN_LOCAL_CONTROL__ = { async getState() { return {}; } };
+  harness.signalRuntimeReady();
+  const pageshow = harness.lifecycle.get("pageshow")?.[0];
+  assert.ok(pageshow);
+  pageshow();
+  await flush();
+  const socket = FakeWebSocket.instances[0];
+  assert.ok(socket);
+  socket.emit("open");
+
+  harness.signalRuntimeMetricsEvent({
+    contextTokens: 16,
+    trackedCpuBytes: 100,
+    trackedGpuBytes: 200,
+    peakTrackedGpuBytes: 300,
+    prefillTokens: 6,
+    prefillDurationMilliseconds: 120,
+    prefillTokensPerSecond: 50,
+    generatedTokens: 3,
+    targetStepCount: 2,
+    targetStepDurationMilliseconds: 80,
+    targetStepsPerSecond: 25,
+    generationDurationMilliseconds: 200,
+    generatedTokensPerSecond: 15,
+    timeToFirstTokenMilliseconds: 35,
+    decodedTextCodeUnits: 19,
+    referenceTokenCount: 16,
+    referenceTokenMismatchCount: 0,
+    performanceSnapshotCount: 2,
+    performance: {
+      diskReadBytes: 400,
+      gpuUploadBytes: 400,
+      dispatchCount: 50,
+      queueSubmissionCount: 12,
+      queueRetirementCount: 12,
+      gpuReadbackCount: 1,
+    },
+    prompt: "private operator prompt",
+    output: "private model output",
+    stack: "private stack",
+    path: "/private/local/path",
+  });
+
+  const runtimeEvents = (socket.sent as Array<{
+    readonly event?: {
+      readonly category?: string;
+      readonly name?: string;
+      readonly timestampMs?: number;
+      readonly metrics?: Record<string, unknown>;
+    };
+  }>).flatMap((message) => message.event === undefined ? [] : [message.event])
+    .filter((event) => ["prefill_completed", "token_rate", "generation_completed"].includes(event.name ?? ""));
+  assert.deepEqual(
+    runtimeEvents.map((event) => ({ ...event, timestampMs: 0 })),
+    [
+      {
+        category: "generation",
+        name: "generation_completed",
+        timestampMs: 0,
+        metrics: {
+          durationMs: 200,
+          count: 3,
+          targetStepCount: 2,
+          targetStepDurationMs: 80,
+          emittedTokensPerSecond: 15,
+          ttftMs: 35,
+          tokensPerSecond: 25,
+          contextTokens: 16,
+          decodedTextCodeUnits: 19,
+          referenceTokenCount: 16,
+          referenceTokenMismatchCount: 0,
+          performanceSnapshotCount: 2,
+          cpuBytes: 100,
+          gpuBytes: 200,
+          peakBytes: 300,
+          diskReadBytes: 400,
+          gpuUploadBytes: 400,
+          dispatchCount: 50,
+          queueSubmissionCount: 12,
+          queueRetirementCount: 12,
+          gpuReadbackCount: 1,
+        },
+      },
+      {
+        category: "prefill",
+        name: "prefill_completed",
+        timestampMs: 0,
+        metrics: {
+          durationMs: 120,
+          prefillTokens: 6,
+          prefillTokensPerSecond: 50,
+          cpuBytes: 100,
+          gpuBytes: 200,
+          peakBytes: 300,
+        },
+      },
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(runtimeEvents), /private|prompt|output|stack|path/i);
 });
 
 test("upload diagnostic pressure preserves terminal load and command completion slots", async () => {

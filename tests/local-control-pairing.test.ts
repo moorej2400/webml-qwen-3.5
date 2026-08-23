@@ -45,10 +45,10 @@ test("development bootstrap uses the polished app without constructing a second 
   const controllerStart = source.indexOf("createTextRuntimeController({");
   const controllerEnd = source.indexOf("});", controllerStart);
   assert.ok(controllerStart >= 0 && controllerEnd > controllerStart);
-  assert.match(
+  assert.doesNotMatch(
     source.slice(controllerStart, controllerEnd),
-    /\bonText\b/,
-    "operator-generated text must remain visible in the polished phone page",
+    /\bonPromptStart\b|\bonText\b|appendOperatorMessage/,
+    "automated control traffic must not masquerade as a user conversation",
   );
   const controlIndex = source.indexOf("__QWEN_LOCAL_CONTROL__ =");
   const readyIndex = source.indexOf('"qwen-local-runtime-ready"');

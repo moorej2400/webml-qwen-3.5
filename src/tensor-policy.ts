@@ -19,15 +19,25 @@ export type WebGpuTensorStorageType =
   | "f32"
   | "q8-0-36"
   | "q3-k-112"
+  | "q3-k-nibble-148"
+  | "q3-k-fused-f32-192"
   | "q4-k-144"
+  | "q4-k-fused-f32-192"
   | "q5-k-176"
-  | "q6-k-212";
+  | "q5-k-fused-f32-224"
+  | "q6-k-212"
+  | "q6-k-fused-f32-256";
 
 export type WebGpuTensorTransform =
   | "copy"
   | "q8-0-34-to-36"
   | "q3-k-110-to-112"
-  | "q6-k-210-to-212";
+  | "q3-k-110-to-nibble-148"
+  | "q3-k-110-to-fused-f32-192"
+  | "q4-k-144-to-fused-f32-192"
+  | "q5-k-176-to-fused-f32-224"
+  | "q6-k-210-to-212"
+  | "q6-k-210-to-fused-f32-256";
 
 export interface WebGpuTensorLayoutPolicy {
   readonly ggmlType: GgmlType;
@@ -39,8 +49,10 @@ export interface WebGpuTensorLayoutPolicy {
 }
 
 /**
- * These six layouts cover the pinned language artifact. Native field orders
- * follow ggml; only blocks that would misalign u32 WGSL access gain padding.
+ * The production package uses exact value-preserving browser layouts selected
+ * from measured decode evidence. Q3 through Q6 precompute exact FP32 factors
+ * so their hot kernels avoid repeated metadata reconstruction; Q6 also enables
+ * fused GPU vocabulary selection. The source quantized values are unchanged.
  */
 export const WEBGPU_LANGUAGE_TENSOR_LAYOUTS: readonly WebGpuTensorLayoutPolicy[] =
   Object.freeze([
@@ -62,35 +74,35 @@ export const WEBGPU_LANGUAGE_TENSOR_LAYOUTS: readonly WebGpuTensorLayoutPolicy[]
     }),
     Object.freeze({
       ggmlType: GgmlType.Q3_K,
-      storageType: "q3-k-112",
+      storageType: "q3-k-fused-f32-192",
       blockElements: 256,
       sourceBlockBytes: 110,
-      outputBlockBytes: 112,
-      transform: "q3-k-110-to-112",
+      outputBlockBytes: 192,
+      transform: "q3-k-110-to-fused-f32-192",
     }),
     Object.freeze({
       ggmlType: GgmlType.Q4_K,
-      storageType: "q4-k-144",
+      storageType: "q4-k-fused-f32-192",
       blockElements: 256,
       sourceBlockBytes: 144,
-      outputBlockBytes: 144,
-      transform: "copy",
+      outputBlockBytes: 192,
+      transform: "q4-k-144-to-fused-f32-192",
     }),
     Object.freeze({
       ggmlType: GgmlType.Q5_K,
-      storageType: "q5-k-176",
+      storageType: "q5-k-fused-f32-224",
       blockElements: 256,
       sourceBlockBytes: 176,
-      outputBlockBytes: 176,
-      transform: "copy",
+      outputBlockBytes: 224,
+      transform: "q5-k-176-to-fused-f32-224",
     }),
     Object.freeze({
       ggmlType: GgmlType.Q6_K,
-      storageType: "q6-k-212",
+      storageType: "q6-k-fused-f32-256",
       blockElements: 256,
       sourceBlockBytes: 210,
-      outputBlockBytes: 212,
-      transform: "q6-k-210-to-212",
+      outputBlockBytes: 256,
+      transform: "q6-k-210-to-fused-f32-256",
     }),
   ]);
 

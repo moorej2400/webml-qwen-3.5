@@ -33,8 +33,8 @@ const limits: Qwen35ForwardDeviceLimits = {
 
 const storageTypes = new Map([
   [GgmlType.F32, "f32"],
-  [GgmlType.Q3_K, "q3-k-112"],
-  [GgmlType.Q6_K, "q6-k-212"],
+  [GgmlType.Q3_K, "q3-k-fused-f32-192"],
+  [GgmlType.Q6_K, "q6-k-fused-f32-256"],
 ] as const);
 
 function tensor(
@@ -99,8 +99,8 @@ function weightView(
 ): Qwen35TensorWeightView {
   const layout = {
     f32: { values: 1, bytes: 4 },
-    "q3-k-112": { values: 256, bytes: 112 },
-    "q6-k-212": { values: 256, bytes: 212 },
+    "q3-k-fused-f32-192": { values: 256, bytes: 192 },
+    "q6-k-fused-f32-256": { values: 256, bytes: 256 },
   }[entry.storageType];
   if (layout === undefined) throw new Error("unsupported fixture layout");
   const rowBytes = (entry.shape[0]! / layout.values) * layout.bytes;
@@ -227,7 +227,7 @@ type AssemblyFixture = ReturnType<typeof fixture> & {
 
 async function geometryPlanner(): Promise<(input: ReturnType<typeof fixture>) => {
   readonly layer: number;
-  readonly fixedUniformCount: 70;
+  readonly fixedUniformCount: 69;
   readonly physicalGemvPieceCount: number;
   readonly uniformCount: number;
 }> {
@@ -270,9 +270,9 @@ test("derives frozen exact full-attention uniform geometry before allocation", a
 
   assert.deepEqual(geometry, {
     layer: 3,
-    fixedUniformCount: 70,
-    physicalGemvPieceCount: 7,
-    uniformCount: 77,
+    fixedUniformCount: 69,
+    physicalGemvPieceCount: 5,
+    uniformCount: 74,
   });
   assert.equal(Object.isFrozen(geometry), true);
 });
@@ -283,7 +283,7 @@ test("assembles exact one-token full-attention stages and state bindings", async
 
   assert.equal(plan.layer, 3);
   assert.equal(plan.position, 5);
-  assert.equal(plan.uniformCount, 14);
+  assert.equal(plan.uniformCount, 11);
   assert.deepEqual(plan.commands.map(({ stage }) => stage), [
     "input-rms",
     "query-projection",
@@ -292,20 +292,26 @@ test("assembles exact one-token full-attention stages and state bindings", async
     "full-attention-prepare",
     "full-attention-online",
     "attention-output-projection",
-    "attention-residual",
     "post-attention-rms",
-    "ffn-gate-projection",
-    "ffn-up-projection",
     "swiglu",
     "ffn-down-projection",
     "mlp-residual",
   ]);
-  const prepare = plan.commands[4]!;
-  const online = plan.commands[5]!;
+  const prepare = plan.commands.find(({ stage }) => stage === "full-attention-prepare")!;
+  const online = plan.commands.find(({ stage }) => stage === "full-attention-online")!;
   assert.match(prepare.kernel.source, /pack2x16float/);
   assert.match(online.kernel.source, /running_maximum/);
   assert.deepEqual(prepare.uniformWords, [5, 8, 5, 2, 3, 0, 0, 0]);
   assert.deepEqual(online.uniformWords, [6, 0, 1, 0]);
+  assert.equal(
+    plan.commands.find(({ kernel }) =>
+      kernel.id.includes("swiglu"))?.stage,
+    "swiglu",
+  );
+  assert.doesNotMatch(
+    plan.commands.find(({ stage }) => stage === "swiglu")!.kernel.source,
+    /enable subgroups/,
+  );
   assert.equal(prepare.bindings[6]!.buffer,
     input.state.kind === "full-attention" ? input.state.key.shards[0]!.buffer : null);
   assert.equal(online.bindings[2]!.buffer,
@@ -366,15 +372,15 @@ test("keeps physical GEMV fragments ordered and reports dynamic uniforms", async
   const geometry = (await geometryPlanner())(splitBase);
   assert.deepEqual(geometry, {
     layer: 3,
-    fixedUniformCount: 70,
-    physicalGemvPieceCount: 8,
-    uniformCount: 78,
+    fixedUniformCount: 69,
+    physicalGemvPieceCount: 6,
+    uniformCount: 75,
   });
   assert.equal(Object.isFrozen(geometry), true);
   const plan = (await planner())({ ...splitBase, uniforms: uniforms(geometry.uniformCount) });
-  assert.equal(plan.uniformCount, 15);
-  assert.deepEqual(plan.commands.slice(0, 4).map(({ stage }) => stage), [
-    "input-rms", "query-projection", "query-projection", "key-projection",
+  assert.equal(plan.uniformCount, 12);
+  assert.deepEqual(plan.commands.slice(0, 5).map(({ stage }) => stage), [
+    "input-rms", "query-projection", "query-projection", "key-projection", "value-projection",
   ]);
 });
 
@@ -388,17 +394,18 @@ test("streams distinct K/V pages through one FP32 online-softmax carry", async (
     ({ stage }) => stage === "full-attention-online",
   );
 
-  assert.equal(result.uniformCount, 15);
+  assert.equal(result.uniformCount, 12);
   assert.equal(online.length, 2);
-  assert.deepEqual(result.commands[4]!.uniformWords, [1, 4, 5, 2, 3, 0, 0, 0]);
+  const prepare = result.commands.find(({ stage }) => stage === "full-attention-prepare")!;
+  assert.deepEqual(prepare.uniformWords, [1, 4, 5, 2, 3, 0, 0, 0]);
   assert.equal(
-    result.commands[4]!.bindings[6]!.buffer,
+    prepare.bindings[6]!.buffer,
     pagedState.kind === "full-attention"
       ? pagedState.key.shards[1]!.buffer
       : null,
   );
   assert.equal(
-    result.commands[4]!.bindings[7]!.buffer,
+    prepare.bindings[7]!.buffer,
     pagedState.kind === "full-attention"
       ? pagedState.value.shards[1]!.buffer
       : null,
@@ -480,7 +487,7 @@ test("rejects invalid context, state kind, invocation identity, and direct tenso
 
   const invalidWeights = valid.weights.tensors.map((item) =>
     item.name === "blk.3.attn_q_norm.weight"
-      ? Object.freeze({ ...item, ggmlType: GgmlType.Q3_K, storageType: "q3-k-112" as const })
+      ? Object.freeze({ ...item, ggmlType: GgmlType.Q3_K, storageType: "q3-k-fused-f32-192" as const })
       : item);
   assert.throws(
     () => plan({ ...valid, weights: weightDirectoryFromViews(invalidWeights) }),
@@ -491,9 +498,9 @@ test("rejects invalid context, state kind, invocation identity, and direct tenso
 test("rejects incomplete or aliased uniforms and activation-state overlap", async () => {
   const plan = await planner();
   const valid = await executableFixture();
-  assert.throws(() => plan({ ...valid, uniforms: uniforms(13) }), /uniform/i);
+  assert.throws(() => plan({ ...valid, uniforms: uniforms(10) }), /uniform/i);
   const uniformBuffer = {};
-  const overlappingUniforms = uniforms(14, uniformBuffer).map((slot, index) =>
+  const overlappingUniforms = uniforms(11, uniformBuffer).map((slot, index) =>
     index === 1 ? Object.freeze({ ...slot, offset: 0 }) : slot);
   assert.throws(() => plan({ ...valid, uniforms: overlappingUniforms }), /uniform|overlap|alias/i);
 

@@ -3,6 +3,7 @@ import type { KernelDefinition } from "./kernel-registry.js";
 export type QwenPrimitiveOperation =
   | "rms-norm"
   | "residual-add"
+  | "residual-rms-norm"
   | "silu"
   | "swiglu"
   | "attention-output-gate"
@@ -318,19 +319,64 @@ struct Params { element_count: u32, width: u32, epsilon: f32, pad: u32 }
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output_values: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
+var<workgroup> partials: array<f32, 256>;
 @compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
-  let index = invocation.x;
-  if (index >= params.element_count) { return; }
-  let base = (index / params.width) * params.width;
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let base = group.x * params.width;
   var sum: f32 = 0.0f;
-  for (var lane = 0u; lane < params.width; lane += 1u) {
+  for (var lane = local.x; lane < params.width; lane += 256u) {
     let value = input_values[base + lane];
     sum += value * value;
   }
-  let inverse_rms = inverseSqrt(sum / f32(params.width) + params.epsilon);
-  // GGUF conversion makes normal Qwen3.5 norm weights multiplicative.
-  output_values[index] = input_values[index] * inverse_rms * weights[index % params.width];
+  partials[local.x] = sum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) { partials[local.x] += partials[local.x + stride]; }
+    workgroupBarrier();
+  }
+  let inverse_rms = inverseSqrt(partials[0] / f32(params.width) + params.epsilon);
+  for (var lane = local.x; lane < params.width; lane += 256u) {
+    let index = base + lane;
+    // GGUF conversion makes normal Qwen3.5 norm weights multiplicative.
+    output_values[index] = input_values[index] * inverse_rms * weights[lane];
+  }
+}`;
+
+const RESIDUAL_RMS_NORM_WGSL = /* wgsl */ `
+struct Params { element_count: u32, width: u32, epsilon: f32, pad: u32 }
+@group(0) @binding(0) var<storage, read_write> normalized_values: array<f32>;
+@group(0) @binding(1) var<storage, read> residual_values: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> residual_output: array<f32>;
+@group(0) @binding(4) var<uniform> params: Params;
+var<workgroup> partials: array<f32, 256>;
+@compute @workgroup_size(256)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let base = group.x * params.width;
+  var sum = 0.0f;
+  for (var lane = local.x; lane < params.width; lane += 256u) {
+    let index = base + lane;
+    let combined = normalized_values[index] + residual_values[index];
+    residual_output[index] = combined;
+    sum += combined * combined;
+  }
+  partials[local.x] = sum;
+  workgroupBarrier();
+  for (var stride = 128u; stride > 0u; stride /= 2u) {
+    if (local.x < stride) { partials[local.x] += partials[local.x + stride]; }
+    workgroupBarrier();
+  }
+  let inverse_rms = inverseSqrt(partials[0] / f32(params.width) + params.epsilon);
+  for (var lane = local.x; lane < params.width; lane += 256u) {
+    let index = base + lane;
+    normalized_values[index] = residual_output[index] * inverse_rms * weights[lane];
+  }
 }`;
 
 const RESIDUAL_WGSL = /* wgsl */ `
@@ -535,6 +581,19 @@ export const QWEN_PRIMITIVE_KERNELS: readonly QwenPrimitiveKernel[] =
   Object.freeze([
     primitive("rms-norm", RMS_NORM_WGSL, 256, { input: 0, weight: 1, output: 2, uniforms: 3 }, 4),
     primitive("residual-add", RESIDUAL_WGSL, 256, { input: 0, residual: 1, output: 2, uniforms: 3 }, 4),
+    primitive(
+      "residual-rms-norm",
+      RESIDUAL_RMS_NORM_WGSL,
+      256,
+      {
+        inputOutput: 0,
+        residual: 1,
+        weight: 2,
+        residualOutput: 3,
+        uniforms: 4,
+      },
+      4,
+    ),
     primitive("silu", SILU_WGSL, 256, { input: 0, output: 1, uniforms: 2 }, 4),
     primitive("swiglu", SWIGLU_WGSL, 256, { gate: 0, up: 1, output: 2, uniforms: 3 }, 4),
     primitive("attention-output-gate", ATTENTION_GATE_WGSL, 256, { attention: 0, gate: 1, output: 2, uniforms: 3 }, 4),
@@ -606,6 +665,7 @@ export interface PrimitiveDispatchPlan {
 export function planPrimitiveDispatch(input: {
   readonly operation: QwenPrimitiveOperation;
   readonly elementCount: number;
+  readonly width?: number;
   readonly headDimension?: number;
   readonly rotaryDimension?: number;
 }): PrimitiveDispatchPlan {
@@ -632,6 +692,16 @@ export function planPrimitiveDispatch(input: {
       throw new Error("Q/K RMSNorm element count must contain complete heads");
     }
   }
+  if (
+    (input.operation === "rms-norm" ||
+      input.operation === "residual-rms-norm") &&
+    (input.width === undefined ||
+      !Number.isSafeInteger(input.width) ||
+      input.width < 1 ||
+      input.elementCount % input.width !== 0)
+  ) {
+    throw new Error("RMSNorm element count must contain complete width rows");
+  }
   if (input.operation === "partial-mrope") {
     if (
       input.headDimension === undefined ||
@@ -652,6 +722,9 @@ export function planPrimitiveDispatch(input: {
   const x =
     input.operation === "top-k-merge"
       ? 1
+      : input.operation === "rms-norm" ||
+          input.operation === "residual-rms-norm"
+        ? input.elementCount / input.width!
       : Math.ceil(input.elementCount / kernel.abi.workgroupSize);
   return Object.freeze({
     operation: input.operation,

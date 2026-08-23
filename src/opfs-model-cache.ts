@@ -678,6 +678,8 @@ function isSafeCachePath(path: string): boolean {
  * implementation exposes the current OPFS rename extension.
  */
 export class BrowserOpfsStorage implements ModelCacheStorage {
+  readonly #rangeFiles = new Map<string, Promise<File | null>>();
+
   private constructor(private readonly root: FileSystemDirectoryHandle) {}
 
   static async open(
@@ -693,6 +695,7 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
   }
 
   async openAtomicWriter(path: string): Promise<CacheAtomicWriter> {
+    this.#rangeFiles.delete(path);
     const { directory, name } = await this.parent(path, true);
     const handle = await directory.getFileHandle(name, { create: true });
     const stream = await handle.createWritable({ keepExistingData: false });
@@ -701,6 +704,7 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
       if (!settled) {
         settled = true;
         await stream.close();
+        this.#rangeFiles.delete(path);
       }
     };
     return {
@@ -760,15 +764,8 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
       throw new ModelCacheError("cache-range-invalid");
     }
     signal.throwIfAborted();
-    let handle: FileSystemFileHandle;
-    try {
-      const { directory, name } = await this.parent(path, false);
-      handle = await directory.getFileHandle(name);
-    } catch (error) {
-      if (isNotFound(error)) return null;
-      throw error;
-    }
-    const file = await handle.getFile();
+    const file = await this.#rangeFile(path);
+    if (file === null) return null;
     if (offset + byteLength > file.size) {
       throw new ModelCacheError("cache-range-invalid");
     }
@@ -799,7 +796,34 @@ export class BrowserOpfsStorage implements ModelCacheStorage {
     }
     const { directory, name } = await this.parent(destination, true);
     await movable.move(directory, name);
+    this.#rangeFiles.delete(source);
+    this.#rangeFiles.delete(destination);
     return true;
+  }
+
+  /** Immutable model blobs reuse one File snapshot across thousands of token reads. */
+  async #rangeFile(path: string): Promise<File | null> {
+    const cached = this.#rangeFiles.get(path);
+    if (cached !== undefined) return cached;
+    const pending = (async (): Promise<File | null> => {
+      try {
+        const { directory, name } = await this.parent(path, false);
+        const handle = await directory.getFileHandle(name);
+        return await handle.getFile();
+      } catch (error) {
+        if (isNotFound(error)) return null;
+        throw error;
+      }
+    })();
+    this.#rangeFiles.set(path, pending);
+    try {
+      const file = await pending;
+      if (file === null) this.#rangeFiles.delete(path);
+      return file;
+    } catch (error) {
+      this.#rangeFiles.delete(path);
+      throw error;
+    }
   }
 
   async list(

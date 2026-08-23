@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  QWEN35_CHAT_CONVERSATION_OPTIONS,
   startQwen35ChatApp,
   type Qwen35ChatAppHandle,
 } from "../src/chat-app.js";
@@ -30,11 +31,17 @@ class FakeElement {
   querySelector(): FakeElement | null { return new FakeElement(); }
 }
 
+test("the public chat spends its token budget on the answer", () => {
+  assert.deepEqual(QWEN35_CHAT_CONVERSATION_OPTIONS, { enableThinking: false });
+  assert.equal(Object.isFrozen(QWEN35_CHAT_CONVERSATION_OPTIONS), true);
+});
+
 async function withChatEnvironment(
   fetchImplementation: typeof fetch,
   run: (input: {
     readonly application: Qwen35ChatAppHandle;
     readonly element: (selector: string) => FakeElement;
+    readonly windowListeners: ReadonlyMap<string, readonly (() => void)[]>;
   }) => Promise<void>,
 ): Promise<void> {
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -48,6 +55,7 @@ async function withChatEnvironment(
     elements.set(selector, created);
     return created;
   };
+  const windowListeners = new Map<string, (() => void)[]>();
   const testDocument = {
     scripts: [],
     querySelector: (selector: string) => element(selector),
@@ -63,7 +71,11 @@ async function withChatEnvironment(
       expectedManifestSha256: "a".repeat(64),
       compiledTokenizerUrl: "https://example.invalid/tokenizer.bin",
     },
-    addEventListener() {},
+    addEventListener(type: string, listener: () => void) {
+      const listeners = windowListeners.get(type) ?? [];
+      listeners.push(listener);
+      windowListeners.set(type, listeners);
+    },
   };
   Object.defineProperty(globalThis, "document", {
     configurable: true,
@@ -83,7 +95,7 @@ async function withChatEnvironment(
       element("#qwen-app") as unknown as HTMLElement,
       { autoLoad: false },
     );
-    await run({ application, element });
+    await run({ application, element, windowListeners });
   } finally {
     for (const [name, descriptor] of [
       ["window", originalWindow],
@@ -115,6 +127,32 @@ test("manifest resolution failure publishes one sanitized failed load event", as
     }]);
     assert.equal(application.coordinator.state, "failed");
     assert.equal(element("[data-runtime-status]").textContent, "failed");
+    },
+  );
+});
+
+test("page exit aborts an active load without a storage pseudo-fence", async () => {
+  let fetchSignal: AbortSignal | undefined;
+  await withChatEnvironment(
+    (_input, init) => {
+      fetchSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        fetchSignal?.addEventListener("abort", () => {
+          reject(fetchSignal?.reason ?? new DOMException("cancelled", "AbortError"));
+        }, { once: true });
+      });
+    },
+    async ({ application, windowListeners }) => {
+      const loading = application.coordinator.load().catch((error: unknown) => error);
+      while (fetchSignal === undefined) await Promise.resolve();
+      const pagehide = windowListeners.get("pagehide")?.[0];
+      assert.ok(pagehide);
+      pagehide();
+
+      const error = await loading;
+      assert.equal(fetchSignal.aborted, true);
+      assert.equal((error as Error).name, "AbortError");
+      await application.coordinator.dispose();
     },
   );
 });

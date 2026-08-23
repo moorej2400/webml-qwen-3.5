@@ -21,10 +21,10 @@ function tensor(
   const storageTypes = new Map([
     [GgmlType.F32, "f32"],
     [GgmlType.Q8_0, "q8-0-36"],
-    [GgmlType.Q3_K, "q3-k-112"],
-    [GgmlType.Q4_K, "q4-k-144"],
-    [GgmlType.Q5_K, "q5-k-176"],
-    [GgmlType.Q6_K, "q6-k-212"],
+    [GgmlType.Q3_K, "q3-k-fused-f32-192"],
+    [GgmlType.Q4_K, "q4-k-fused-f32-192"],
+    [GgmlType.Q5_K, "q5-k-fused-f32-224"],
+    [GgmlType.Q6_K, "q6-k-fused-f32-256"],
   ] as const);
   return {
     name,
@@ -367,10 +367,10 @@ test("accepts all six manifest layouts without coupling shapes to quantization",
   const types = [
     [GgmlType.F32, "f32"],
     [GgmlType.Q8_0, "q8-0-36"],
-    [GgmlType.Q3_K, "q3-k-112"],
-    [GgmlType.Q4_K, "q4-k-144"],
-    [GgmlType.Q5_K, "q5-k-176"],
-    [GgmlType.Q6_K, "q6-k-212"],
+    [GgmlType.Q3_K, "q3-k-fused-f32-192"],
+    [GgmlType.Q4_K, "q4-k-fused-f32-192"],
+    [GgmlType.Q5_K, "q5-k-fused-f32-224"],
+    [GgmlType.Q6_K, "q6-k-fused-f32-256"],
   ] as const;
   const required = directory();
   for (const [ggmlType, storageType] of types) {
@@ -381,4 +381,21 @@ test("accepts all six manifest layouts without coupling shapes to quantization",
       buildQwen35Program({ config: QWEN35_4B_CONFIG, tensors: candidate }),
     );
   }
+});
+
+test("accepts compact portable layouts for Safari without WebGPU subgroups", () => {
+  const portableLayouts = new Map([
+    [GgmlType.Q3_K, "q3-k-112"],
+    [GgmlType.Q4_K, "q4-k-144"],
+    [GgmlType.Q5_K, "q5-k-176"],
+    [GgmlType.Q6_K, "q6-k-212"],
+  ] as const);
+  const candidate = directory().map((entry) => ({
+    ...entry,
+    storageType: portableLayouts.get(entry.ggmlType) ?? entry.storageType,
+  }));
+
+  assert.doesNotThrow(() =>
+    buildQwen35Program({ config: QWEN35_4B_CONFIG, tensors: candidate }),
+  );
 });

@@ -284,6 +284,7 @@ export function planQwen35FinalNormDispatch(
   const primitive = planPrimitiveDispatch({
     operation: "rms-norm",
     elementCount: HIDDEN,
+    width: HIDDEN,
   });
   if (primitive.workgroups.x > input.limits.maxComputeWorkgroupsPerDimension) {
     fail(

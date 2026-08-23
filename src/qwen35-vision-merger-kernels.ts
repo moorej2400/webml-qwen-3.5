@@ -122,7 +122,8 @@ function kernel(operation: string): { readonly id: string; readonly source: stri
 export function planQwen35VisionMergerDispatches(input: { readonly bootstrap: Qwen35VisionGpuStagedGroup; readonly workspace: Qwen35VisionMergerWorkspace; readonly patchCount: number; readonly limits: Qwen35ForwardDeviceLimits }): readonly Qwen35VisionMergerDispatchPlan[] {
   const bootstrap = assertAuthenticatedQwen35VisionGpuStagedGroup(input.bootstrap); const tokenCount = validCount(input.patchCount);
   if (bootstrap.layer !== "bootstrap" || input.workspace.uniforms.length !== 4) fail("vision-merger-invalid", "Vision merger input is invalid");
-  for (const limit of Object.values(input.limits)) if (!Number.isSafeInteger(limit) || limit < 1) fail("vision-merger-limits-invalid", "Vision merger limits are invalid");
+  // Capability flags share the planner profile but are not numeric WebGPU limits.
+  for (const limit of Object.values(input.limits)) if (typeof limit === "number" && (!Number.isSafeInteger(limit) || limit < 1)) fail("vision-merger-limits-invalid", "Vision merger limits are invalid");
   const seenUniforms = new Map<object, Set<number>>();
   for (const slot of input.workspace.uniforms) {
     const bound = uniform(0, slot, input.limits); const buffer = bound.buffer as object;

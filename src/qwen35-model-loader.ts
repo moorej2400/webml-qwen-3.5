@@ -49,7 +49,9 @@ import {
   type Qwen35DiskBackedTiedEmbeddingStore,
 } from "./qwen35-disk-backed-tied-embedding.js";
 import {
+  qwen35HybridStreamedLayers,
   qwen35PermanentWeightPackage,
+  QWEN35_ROLLING_LAYER_ORDER,
   type Qwen35RollingLayerStore,
 } from "./qwen35-rolling-layer-weights.js";
 import {
@@ -87,7 +89,8 @@ import type {
   RuntimeLoadEvent,
 } from "./qwen35-session.js";
 
-export const QWEN35_RUNTIME_ABI = "qwen35-webgpu-v1";
+export const QWEN35_RUNTIME_ABI = "qwen35-webgpu-v2";
+export const QWEN35_PORTABLE_RUNTIME_ABI = "qwen35-webgpu-v1";
 const TIED_INPUT_ROW_CAPACITY = 64;
 const TIED_OUTPUT_TILE_ROWS = 1_024;
 const QWEN35_DECODABLE_ROWS = 248_070;
@@ -242,8 +245,10 @@ export interface Qwen35BrowserLoadOptions extends LoadOptions {
   /** Local evidence run override; omitted builds keep the measured device default. */
   readonly uploadLaneBytes?: number;
   readonly uploadRetirementPolicy?: Qwen35UploadRetirementPolicy;
-  /** Resident weights are preferred on desktop; rolling remains the mobile fallback. */
+  /** Auto prefers full residency and uses rolling only when the measured ledger requires it. */
   readonly residencyPolicy?: Qwen35WeightResidencyPolicy;
+  /** Local-only resident-prefix experiment for the hybrid policy. */
+  readonly residentLayerCount?: number;
   readonly gpuLedgerLimitBytes?: bigint;
   /** Explicit local Chrome smoke-test opt-in; public deployments keep HTTPS pins. */
   readonly allowInsecureLocalhost?: boolean;
@@ -294,7 +299,8 @@ export function assertQwen35PackageIdentity(
 ): void {
   if (
     manifest.packageKind !== "language" ||
-    manifest.runtime.abi !== QWEN35_RUNTIME_ABI ||
+    (manifest.runtime.abi !== QWEN35_RUNTIME_ABI &&
+      manifest.runtime.abi !== QWEN35_PORTABLE_RUNTIME_ABI) ||
     !sameIdentity(manifest.source, PINNED_LANGUAGE_SOURCE) ||
     !sameIdentity(manifest.tokenizer, PINNED_TOKENIZER_SOURCE)
   ) {
@@ -589,6 +595,16 @@ export async function cleanupQwen35GpuResources(input: {
   readonly ledger: Pick<AllocationLedger, "assertAllReleased">;
 }): Promise<void> {
   let firstError: unknown;
+  let deviceDestroyAttempted = false;
+  const destroyDevice = (): void => {
+    if (deviceDestroyAttempted) return;
+    deviceDestroyAttempted = true;
+    try {
+      input.device.destroy();
+    } catch (error) {
+      firstError ??= error;
+    }
+  };
   if (input.vision !== undefined) {
     try {
       await input.vision.dispose();
@@ -624,6 +640,10 @@ export async function cleanupQwen35GpuResources(input: {
     await input.device.queue.onSubmittedWorkDone();
   } catch (error) {
     firstError ??= error;
+    // A rejected fence cannot prove that any later buffer destruction is
+    // disjoint from device work. Invalidate the device before releasing the
+    // remaining model-owned allocations, then surface the original failure.
+    destroyDevice();
   }
   try {
     input.hybridState?.dispose();
@@ -632,11 +652,7 @@ export async function cleanupQwen35GpuResources(input: {
   }
   const weightError = destroyReverse(input.weightAllocations);
   firstError ??= weightError;
-  try {
-    input.device.destroy();
-  } catch (error) {
-    firstError ??= error;
-  }
+  destroyDevice();
   try {
     input.ledger.assertAllReleased();
   } catch (error) {
@@ -649,12 +665,21 @@ export async function cleanupQwen35GpuResources(input: {
 
 export function qwen35AllocatedWeightBytes(
   packageDirectory: Qwen35PackageDirectory,
-  residencyPolicy: "rolling" | "resident" = "rolling",
+  residencyPolicy: "rolling" | "resident" | "hybrid" = "rolling",
+  residentLayerCount?: number,
 ): bigint {
+  if (residencyPolicy === "resident") {
+    return qwen35TensorWeightBytes(packageDirectory);
+  }
+  const streamedLayers = residencyPolicy === "rolling"
+    ? QWEN35_ROLLING_LAYER_ORDER
+    : qwen35HybridStreamedLayers(residentLayerCount);
   return qwen35TensorWeightBytes(
-    residencyPolicy === "resident"
-      ? packageDirectory
-      : qwen35PermanentWeightPackage(packageDirectory),
+    qwen35PermanentWeightPackage(
+      packageDirectory,
+      streamedLayers,
+      residencyPolicy === "hybrid" ? "resident" : "streamed",
+    ),
   );
 }
 
@@ -667,14 +692,26 @@ export function isQwen35AppleMobileBrowser(
       (/\bMobile\b/i.test(userAgent) || maxTouchPoints > 1));
 }
 
-function resolveQwen35ResidencyPolicy(
+/** Default prefix for an explicit local hybrid-residency experiment. */
+export const QWEN35_DEFAULT_HYBRID_RESIDENT_LAYERS = 12;
+
+export function resolveQwen35ResidencyPolicy(
   options: Qwen35BrowserLoadOptions,
   packageDirectory: Qwen35PackageDirectory,
   stateBytes: bigint,
+  appleMobile = isQwen35AppleMobileBrowser(),
 ): Qwen35WeightResidencyPolicy {
   const requested = options.residencyPolicy ?? "auto";
+  if (requested === "hybrid") {
+    // Validate the local tuning input before any device allocation or cache
+    // work so a malformed experiment cannot look like a Safari memory fault.
+    qwen35HybridStreamedLayers(options.residentLayerCount);
+    return requested;
+  }
   if (requested !== "auto") return requested;
-  if (isQwen35AppleMobileBrowser()) return "rolling";
+  // Mobile uses the same residency decision as desktop. Streaming a model
+  // suffix for every token is a recovery mode, not a viable decode default.
+  void appleMobile;
   const residentBytes = stateBytes + qwen35TensorWeightBytes(packageDirectory);
   if (
     options.gpuLedgerLimitBytes !== undefined &&
@@ -927,7 +964,11 @@ export async function loadQwen35BrowserResources(
       : { gpu: navigatorWithGpu.gpu }),
   };
   const profileOptions = {
+    // ABI v2 has portable kernels for every packed language layout. Safari
+    // does not expose WebGPU subgroups, so subgroup support is a kernel-profile
+    // choice and must never be a model-load requirement.
     requiredFeatures: ["shader-f16"],
+    optionalFeatures: ["subgroups"],
     ...(options.bufferShardPolicy === undefined
       ? {}
       : {
@@ -961,9 +1002,17 @@ export async function loadQwen35BrowserResources(
     packageDirectory,
     stateBytesBigInt,
   );
+  const residentLayerCount = residencyPolicy === "hybrid"
+    ? options.residentLayerCount ?? QWEN35_DEFAULT_HYBRID_RESIDENT_LAYERS
+    : undefined;
   const weightBytesBigInt = qwen35AllocatedWeightBytes(
     packageDirectory,
-    residencyPolicy === "rolling" ? "rolling" : "resident",
+    residencyPolicy === "rolling"
+      ? "rolling"
+      : residencyPolicy === "hybrid"
+        ? "hybrid"
+        : "resident",
+    residentLayerCount,
   );
   const stateBytes = Number(stateBytesBigInt);
   const weightBytes = Number(weightBytesBigInt);
@@ -1044,6 +1093,9 @@ export async function loadQwen35BrowserResources(
       uploadLaneBytes: options.uploadLaneBytes ?? profile.uploadLaneBytes,
       uploadRetirementPolicy: options.uploadRetirementPolicy ?? "window",
       residencyPolicy,
+      ...(residentLayerCount === undefined
+        ? {}
+        : { residentLayerCount }),
       signal,
       onWeightsAllocated: (completedBytes) => reportLoadEvent({
         phase: "weights_allocate",
@@ -1071,7 +1123,8 @@ export async function loadQwen35BrowserResources(
         if (
           tiedEmbedding === null &&
           stagedRollingLayers !== undefined &&
-          hasQwen35DiskBackedTiedEmbedding(packageDirectory)
+          hasQwen35DiskBackedTiedEmbedding(packageDirectory) &&
+          uploadedWeights.get("token_embd.weight") === undefined
         ) {
           tiedEmbedding = await createQwen35DiskBackedTiedEmbeddingStore({
             arena,

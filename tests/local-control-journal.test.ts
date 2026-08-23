@@ -103,7 +103,56 @@ test("telemetry uses a flat allowlist and omits private content", () => {
   assert.doesNotMatch(encoded, /private|secret|authorization|cookie|prompt|response|url|stack/i);
 });
 
-test("journal preserves only the allocation diagnostic enum and bounded numbers", () => {
+test("journal preserves bounded per-command performance counters", () => {
+  const sanitized = sanitizeTelemetryEvent({
+    schemaVersion: 1,
+    category: "generation",
+    name: "generation_completed",
+    timestampMs: 100,
+    metrics: {
+      durationMs: 12_625,
+      count: 8,
+      contextTokens: 23,
+      decodedTextCodeUnits: 19,
+      referenceTokenCount: 16,
+      referenceTokenMismatchCount: 1,
+      referenceFirstMismatchIndex: 0,
+      referenceExpectedTokenId: 5_793,
+      referenceObservedTokenId: 760,
+      performanceSnapshotCount: 2,
+      diskReadBytes: 11_596_081_000,
+      gpuUploadBytes: 11_596_081_000,
+      dispatchCount: 4_416,
+      queueSubmissionCount: 216,
+      queueRetirementCount: 192,
+      gpuReadbackCount: 8,
+      prompt: "private prompt",
+      response: "private response",
+    },
+  });
+
+  assert.deepEqual(sanitized.metrics, {
+    durationMs: 12_625,
+    count: 8,
+    contextTokens: 23,
+    decodedTextCodeUnits: 19,
+    referenceTokenCount: 16,
+    referenceTokenMismatchCount: 1,
+    referenceFirstMismatchIndex: 0,
+    referenceExpectedTokenId: 5_793,
+    referenceObservedTokenId: 760,
+    performanceSnapshotCount: 2,
+    diskReadBytes: 11_596_081_000,
+    gpuUploadBytes: 11_596_081_000,
+    dispatchCount: 4_416,
+    queueSubmissionCount: 216,
+    queueRetirementCount: 192,
+    gpuReadbackCount: 8,
+  });
+  assert.doesNotMatch(JSON.stringify(sanitized), /private|prompt|response/i);
+});
+
+test("journal preserves allocation diagnostic codes and bounded numbers", () => {
   for (const code of ALLOCATION_DIAGNOSTIC_CODES) {
     const sanitized = sanitizeTelemetryEvent({
       schemaVersion: 1,
@@ -130,6 +179,23 @@ test("journal preserves only the allocation diagnostic enum and bounded numbers"
       JSON.stringify(sanitized),
       /private|local|model\.gguf|message|stack|path|PrivateGpuError/i,
     );
+  }
+});
+
+test("journal preserves stable uppercase runtime diagnostic codes", () => {
+  for (const code of [
+    "KERNEL_COMPILE_FAILED",
+    "GPU_BUFFER_USAGE_INVALID",
+    "ALLOCATION_LIMIT_EXCEEDED",
+  ]) {
+    const sanitized = sanitizeTelemetryEvent({
+      schemaVersion: 1,
+      category: "error",
+      name: "runtime_error",
+      timestampMs: 100,
+      metrics: { code, message: "private detail" },
+    });
+    assert.deepEqual(sanitized.metrics, { code });
   }
 });
 

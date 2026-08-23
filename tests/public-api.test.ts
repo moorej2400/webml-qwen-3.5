@@ -12,11 +12,19 @@ test("exports mixed tensor conversion and GEMV APIs from the package entrypoint"
   assert.equal(typeof runtime.validateModelPackageManifest, "function");
   assert.equal(typeof runtime.repackNativeQ6K, "function");
   assert.equal(typeof runtime.planGemvDispatch, "function");
-  assert.equal(runtime.LANGUAGE_GEMV_KERNELS.length, 6);
+  assert.equal(runtime.LANGUAGE_GEMV_KERNELS.length, 21);
+  assert.equal(
+    new Set(runtime.LANGUAGE_GEMV_KERNELS.map(({ id }) => id)).size,
+    runtime.LANGUAGE_GEMV_KERNELS.length,
+  );
   assert.equal(typeof runtime.createQwen35HybridState, "function");
   assert.equal(typeof runtime.fullAttentionDecodeCpu, "function");
   assert.equal(typeof runtime.gatedDeltaNetDecodeCpu, "function");
-  assert.equal(runtime.QWEN35_HYBRID_KERNELS.length, 6);
+  assert.equal(runtime.QWEN35_HYBRID_KERNELS.length, 7);
+  assert.equal(
+    new Set(runtime.QWEN35_HYBRID_KERNELS.map(({ id }) => id)).size,
+    runtime.QWEN35_HYBRID_KERNELS.length,
+  );
   assert.equal(typeof runtime.Qwen35Tokenizer, "function");
   assert.equal(typeof runtime.loadPinnedQwen35Tokenizer, "function");
   assert.equal(typeof runtime.renderQwen35Chat, "function");

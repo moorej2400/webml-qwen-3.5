@@ -3,6 +3,18 @@ import test from "node:test";
 
 import { GgmlType } from "../src/gguf.js";
 import {
+  dequantizeBrowserQ3KBlock,
+  dequantizeBrowserQ3KFusedBlock,
+  dequantizeBrowserQ4KBlock,
+  dequantizeBrowserQ5KBlock,
+  dequantizeBrowserQ6KBlock,
+  repackNativeQ3KBrowser,
+  repackNativeQ3KFusedBrowser,
+  repackNativeQ4KBrowser,
+  repackNativeQ5KBrowser,
+  repackNativeQ6KBrowser,
+} from "../src/browser-quant.js";
+import {
   LANGUAGE_GEMV_KERNELS,
   gemvCpu,
   languageGemvRegistryDefinitions,
@@ -78,6 +90,18 @@ function packedFixture(layout: GemvLayout): {
         values: dequantizeQ3KBlock(unpackNativeQ3KBlock(bytes)),
       };
     }
+    case "q3-k-nibble-148": {
+      const bytes = native(110, 19);
+      setHalf(bytes, 108);
+      const packed = repackNativeQ3KBrowser(bytes);
+      return { packed, values: dequantizeBrowserQ3KBlock(packed) };
+    }
+    case "q3-k-fused-f32-192": {
+      const bytes = native(110, 19);
+      setHalf(bytes, 108);
+      const packed = repackNativeQ3KFusedBrowser(bytes);
+      return { packed, values: dequantizeBrowserQ3KFusedBlock(packed) };
+    }
     case "q4-k-144": {
       const bytes = native(144, 23);
       setHalf(bytes, 0);
@@ -86,6 +110,13 @@ function packedFixture(layout: GemvLayout): {
         packed: repackNativeQ4K(bytes),
         values: dequantizeQ4KBlock(unpackNativeQ4KBlock(bytes)),
       };
+    }
+    case "q4-k-fused-f32-192": {
+      const bytes = native(144, 23);
+      setHalf(bytes, 0);
+      setHalf(bytes, 2, 0x3800);
+      const packed = repackNativeQ4KBrowser(bytes);
+      return { packed, values: dequantizeBrowserQ4KBlock(packed) };
     }
     case "q5-k-176": {
       const bytes = native(176, 29);
@@ -96,6 +127,13 @@ function packedFixture(layout: GemvLayout): {
         values: dequantizeQ5KBlock(unpackNativeQ5KBlock(bytes)),
       };
     }
+    case "q5-k-fused-f32-224": {
+      const bytes = native(176, 29);
+      setHalf(bytes, 0);
+      setHalf(bytes, 2, 0x3800);
+      const packed = repackNativeQ5KBrowser(bytes);
+      return { packed, values: dequantizeBrowserQ5KBlock(packed) };
+    }
     case "q6-k-212": {
       const bytes = native(210, 31);
       setHalf(bytes, 208);
@@ -103,6 +141,12 @@ function packedFixture(layout: GemvLayout): {
         packed: repackNativeQ6K(bytes),
         values: dequantizeQ6KBlock(unpackNativeQ6KBlock(bytes)),
       };
+    }
+    case "q6-k-fused-f32-256": {
+      const bytes = native(210, 31);
+      setHalf(bytes, 208);
+      const packed = repackNativeQ6KBrowser(bytes);
+      return { packed, values: dequantizeBrowserQ6KBlock(packed) };
     }
   }
 }
@@ -120,25 +164,101 @@ test("defines one explicit direct-read kernel ABI for every language layout", ()
       { ggmlType: GgmlType.Q8_0, layout: "q8-0-36", phase: "shared", profile: "portable-f32" },
       { ggmlType: GgmlType.Q3_K, layout: "q3-k-112", phase: "shared", profile: "portable-f32" },
       { ggmlType: GgmlType.Q4_K, layout: "q4-k-144", phase: "shared", profile: "portable-f32" },
+      { ggmlType: GgmlType.Q3_K, layout: "q3-k-fused-f32-192", phase: "shared", profile: "portable-f32" },
       { ggmlType: GgmlType.Q5_K, layout: "q5-k-176", phase: "shared", profile: "portable-f32" },
+      { ggmlType: GgmlType.Q4_K, layout: "q4-k-fused-f32-192", phase: "shared", profile: "portable-f32" },
       { ggmlType: GgmlType.Q6_K, layout: "q6-k-212", phase: "shared", profile: "portable-f32" },
+      { ggmlType: GgmlType.Q3_K, layout: "q3-k-nibble-148", phase: "shared", profile: "portable-f32" },
+      { ggmlType: GgmlType.Q5_K, layout: "q5-k-fused-f32-224", phase: "shared", profile: "portable-f32" },
+      { ggmlType: GgmlType.Q6_K, layout: "q6-k-fused-f32-256", phase: "shared", profile: "portable-f32" },
+      { ggmlType: GgmlType.Q8_0, layout: "q8-0-36", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q3_K, layout: "q3-k-112", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q4_K, layout: "q4-k-144", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q5_K, layout: "q5-k-176", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q6_K, layout: "q6-k-212", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q3_K, layout: "q3-k-nibble-148", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q3_K, layout: "q3-k-fused-f32-192", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q4_K, layout: "q4-k-fused-f32-192", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q5_K, layout: "q5-k-fused-f32-224", phase: "shared", profile: "mobile-f16-subgroup" },
+      { ggmlType: GgmlType.Q6_K, layout: "q6-k-fused-f32-256", phase: "shared", profile: "mobile-f16-subgroup" },
     ],
   );
+  const compactFastLayouts: readonly GemvLayout[] = [
+    "q3-k-112", "q3-k-nibble-148", "q4-k-144", "q5-k-176", "q6-k-212",
+  ];
   for (const definition of LANGUAGE_GEMV_KERNELS) {
     assert.equal(definition.abi.layout, definition.layout);
     assert.equal(definition.abi.phase, definition.phase);
     assert.equal(definition.abi.profile, definition.profile);
-    assert.equal(definition.abi.workgroupSize, 64);
-    assert.match(definition.source, /@compute @workgroup_size\(64\)/);
-    assert.match(definition.source, /var<workgroup> partials/);
-    assert.match(definition.source, /workgroupBarrier\(\)/);
+    if (definition.profile === "mobile-f16-subgroup") {
+      assert.equal(
+        definition.abi.workgroupSize,
+        compactFastLayouts.includes(definition.layout) ||
+          definition.layout === "q8-0-36" ||
+          definition.layout === "q6-k-fused-f32-256" ||
+          definition.layout === "q5-k-fused-f32-224" ? 128 :
+          definition.layout === "q4-k-fused-f32-192" ||
+          definition.layout === "q3-k-fused-f32-192" ? 64 : 32,
+      );
+      assert.equal(
+        definition.abi.rowsPerWorkgroup,
+        definition.layout === "q8-0-36"
+          ? 16
+          : compactFastLayouts.includes(definition.layout) ? 16
+          : definition.layout === "q6-k-fused-f32-256" ? 8
+          : definition.layout === "q5-k-fused-f32-224" ? 4 :
+              definition.layout === "q3-k-fused-f32-192" ? 6 :
+              definition.layout === "q4-k-fused-f32-192" ? 2 : 1,
+      );
+      assert.match(definition.source, /enable f16/);
+      assert.match(definition.source, /enable subgroups/);
+      assert.match(definition.source, /subgroupAdd/);
+      assert.match(definition.source, /vec4<f16>/);
+      if (compactFastLayouts.includes(definition.layout) ||
+        definition.layout === "q8-0-36" ||
+        definition.layout === "q6-k-fused-f32-256" ||
+        definition.layout === "q5-k-fused-f32-224") {
+        assert.match(definition.source, /row_sums/);
+      }
+      assert.match(
+        definition.source,
+        compactFastLayouts.includes(definition.layout) ||
+          definition.layout === "q8-0-36" ||
+          definition.layout === "q6-k-fused-f32-256" ||
+          definition.layout === "q5-k-fused-f32-224"
+          ? /@compute @workgroup_size\(128\)/
+          : definition.layout === "q4-k-fused-f32-192" ||
+          definition.layout === "q3-k-fused-f32-192"
+          ? /@compute @workgroup_size\(64\)/
+          : /@compute @workgroup_size\(32\)/,
+      );
+    } else {
+      assert.equal(definition.abi.workgroupSize, 64);
+      assert.equal(definition.abi.rowsPerWorkgroup, 1);
+      assert.match(definition.source, /@compute @workgroup_size\(64\)/);
+      assert.match(definition.source, /var<workgroup> partials/);
+      assert.match(definition.source, /workgroupBarrier\(\)/);
+      assert.match(definition.source, /weight_value/);
+    }
     assert.match(definition.source, /array<u32>/);
     assert.match(definition.source, /local_rows\s*:\s*u32/);
     assert.match(definition.source, /output_row_offset\s*:\s*u32/);
     assert.match(definition.source, /packed_weights/);
-    assert.match(definition.source, /weight_value/);
     assert.doesNotMatch(definition.source, /array<f16>|mat(2|3|4)x/);
   }
+});
+
+test("vectorizes Q8 bytes across every subgroup lane", () => {
+  const kernel = LANGUAGE_GEMV_KERNELS.find((candidate) =>
+    candidate.layout === "q8-0-36" && candidate.profile === "mobile-f16-subgroup");
+  assert.ok(kernel !== undefined);
+  assert.match(kernel.source, /lane\s*\/\s*8u/);
+  assert.match(kernel.source, /lane\s*%\s*8u/);
+  assert.match(kernel.source, /block_group\s*\+=\s*4u/);
+  assert.equal(kernel.abi.rowsPerWorkgroup, 16);
+  assert.match(kernel.source, /workgroup_row\s*\*\s*16u/);
+  assert.match(kernel.source, /var row_sums:\s*array<f32,\s*4>/);
+  assert.match(kernel.source, /vec4<f16>/);
 });
 
 test("matches packed CPU GEMV for every layout without a float weight matrix", () => {
@@ -171,17 +291,23 @@ test("plans safe row-aware offsets and complete matrix shard coverage", () => {
     const rowBytes = BigInt(kernel.abi.bytesPerBlock * 2);
     const dispatch = planGemvDispatch({
       layout: kernel.layout,
+      profile: kernel.profile,
       localRows: 3,
       columns,
       packedByteOffset: 32,
       outputRowOffset: 7,
     });
-    assert.deepEqual(dispatch.workgroups, { x: 3, y: 1, z: 1 });
+    assert.deepEqual(dispatch.workgroups, {
+      x: Math.ceil(3 / kernel.abi.rowsPerWorkgroup),
+      y: 1,
+      z: 1,
+    });
     assert.equal(dispatch.uniforms.weightWordOffset, 8);
     assert.equal(dispatch.uniforms.outputRowOffset, 7);
 
     const shards = planMatrixShardDispatch({
       layout: kernel.layout,
+      profile: kernel.profile,
       rows: 4,
       columns,
       shards: [
@@ -191,6 +317,26 @@ test("plans safe row-aware offsets and complete matrix shard coverage", () => {
     });
     assert.deepEqual(shards.map((item) => item.uniforms.localRows), [1, 3]);
     assert.deepEqual(shards.map((item) => item.uniforms.outputRowOffset), [0, 1]);
+  }
+});
+
+test("portable fused layouts dispatch every output row", () => {
+  for (const layout of [
+    "q3-k-fused-f32-192",
+    "q4-k-fused-f32-192",
+    "q5-k-fused-f32-224",
+    "q6-k-fused-f32-256",
+  ] as const) {
+    assert.deepEqual(
+      planGemvDispatch({
+        layout,
+        profile: "portable-f32",
+        localRows: 17,
+        columns: 256,
+      }).workgroups,
+      { x: 17, y: 1, z: 1 },
+      layout,
+    );
   }
 });
 
@@ -211,8 +357,10 @@ test("guards two-dimensional row flattening before u32 arithmetic can wrap", () 
     const guard = kernel.source.indexOf(
       "if (group.y > (0xffffffffu - group.x) / grid.x)",
     );
-    const flatten = kernel.source.indexOf(
-      "let row = group.y * grid.x + group.x",
+    const flatten = Math.max(
+      kernel.source.indexOf("let row = group.y * grid.x + group.x"),
+      kernel.source.indexOf("let workgroup_row = group.y * grid.x + group.x"),
+      kernel.source.indexOf("let batch = group.y * grid.x + group.x"),
     );
     assert.ok(guard >= 0, `${kernel.layout} is missing the overflow guard`);
     assert.ok(

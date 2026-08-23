@@ -154,13 +154,18 @@ export interface Qwen35Program {
   readonly runnable: true;
 }
 
-const SUPPORTED_LAYOUTS = new Map<GgmlTypeValue, GemvLayout>([
-  [GgmlType.F32, "f32"],
-  [GgmlType.Q8_0, "q8-0-36"],
-  [GgmlType.Q3_K, "q3-k-112"],
-  [GgmlType.Q4_K, "q4-k-144"],
-  [GgmlType.Q5_K, "q5-k-176"],
-  [GgmlType.Q6_K, "q6-k-212"],
+// Both ABIs represent the same pinned GGML types. ABI v2 is also supported on
+// Safari through portable packed kernels; layout support is not tied to an
+// optional WebGPU subgroup feature.
+const SUPPORTED_LAYOUTS = new Map<GgmlTypeValue, ReadonlySet<GemvLayout>>([
+  [GgmlType.F32, new Set(["f32"])],
+  [GgmlType.Q8_0, new Set(["q8-0-36"])],
+  [GgmlType.Q3_K, new Set([
+    "q3-k-112", "q3-k-nibble-148", "q3-k-fused-f32-192",
+  ])],
+  [GgmlType.Q4_K, new Set(["q4-k-144", "q4-k-fused-f32-192"])],
+  [GgmlType.Q5_K, new Set(["q5-k-176", "q5-k-fused-f32-224"])],
+  [GgmlType.Q6_K, new Set(["q6-k-212", "q6-k-fused-f32-256"])],
 ]);
 
 function contract(name: string, ...shape: number[]): TensorContract {
@@ -238,8 +243,8 @@ function validateDirectory(
     if (actual.has(tensor.name)) {
       throw new Error(`Duplicate Qwen3.5 tensor ${tensor.name}`);
     }
-    const expectedLayout = SUPPORTED_LAYOUTS.get(tensor.ggmlType);
-    if (expectedLayout === undefined || expectedLayout !== tensor.storageType) {
+    const supportedLayouts = SUPPORTED_LAYOUTS.get(tensor.ggmlType);
+    if (supportedLayouts === undefined || !supportedLayouts.has(tensor.storageType)) {
       throw new Error(`Unsupported type/layout for Qwen3.5 tensor ${tensor.name}`);
     }
     const snapshot = Object.freeze({

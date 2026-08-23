@@ -11,12 +11,13 @@
     "test:converter": "node --import tsx --test tests/converter.test.ts tests/q3k.test.ts tests/qwen35-language-converter-tool.test.ts tests/qwen35-vision-converter-tool.test.ts tests/qwen35-vision-huggingface-staging-tool.test.ts",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.dev.json --noEmit",
     "build": "tsc",
+    "build:dev": "tsc --project tsconfig.dev.json",
     "build:public": "node tools/build-public.mjs --out-dir public-dist",
     "convert:qwen35-language": "node --import tsx tools/convert-qwen35-language.ts",
     "convert:qwen35-vision": "node --import tsx tools/convert-qwen35-vision.ts",
     "stage:qwen35-huggingface": "node --import tsx tools/stage-qwen35-huggingface.ts",
     "stage:qwen35-vision-huggingface": "node --import tsx tools/stage-qwen35-vision-huggingface.ts",
-    "control:dev": "npm run build:public && tsc --project tsconfig.dev.json && node dev-dist/dev/control/cli.js"
+    "control:dev": "npm run build:public && npm run build:dev && node dev-dist/dev/control/cli.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -71,7 +71,7 @@ test("plans the exact one-token Qwen3.5 activation widths without a vocabulary m
     plan.resources.map((resource) => [resource.kind, resource.elementCount]),
   );
 
-  assert.equal(plan.resourceCount, 18);
+  assert.equal(plan.resourceCount, 19);
   assert.equal(plan.vocabularySize, 248_320);
   assert.equal(plan.logitsTileRows, 1_024);
   assert.deepEqual(elements, {
@@ -89,12 +89,17 @@ test("plans the exact one-token Qwen3.5 activation widths without a vocabulary m
     "ffn-gate": 9_216,
     "ffn-up": 9_216,
     "ffn-product": 9_216,
+    "packed-gemv-input-f16": 9_216,
     "logits-tile": 1_024,
-    "top-k-scores": 256,
-    "top-k-indices": 256,
+    "top-k-scores": 2_048,
+    "top-k-indices": 2_048,
     "selected-token": 1,
   });
-  assert.equal(plan.totalBytes, 254_212n);
+  assert.equal(plan.totalBytes, 286_980n);
+  assert.equal(
+    plan.resources.find(({ kind }) => kind === "packed-gemv-input-f16")?.scalarType,
+    "f16",
+  );
   assert.ok(
     plan.resources.every(
       (resource) =>
@@ -113,7 +118,7 @@ test("keeps mathematical logits tiles separate from physical dispatch planning",
   assert.equal(plan.mathematicalVocabularyTileCount, 243);
   assert.equal("logitsTileCount" in plan, false);
   assert.equal("logitsDispatchCount" in plan, false);
-  assert.equal(plan.topKCandidateCapacity, 256);
+  assert.equal(plan.topKCandidateCapacity, 2_048);
   assert.equal(plan.selectedTokenInvalidSentinel, 0xffff_ffff);
   assert.ok(
     plan.topKCandidateCapacity >= plan.mathematicalVocabularyTileCount,
@@ -187,8 +192,8 @@ test("allocates bounded complete vectors and exposes stable non-owning binding v
   const first = workspace.get("ffn-gate");
   const second = workspace.get("ffn-gate");
 
-  assert.equal(workspace.resourceCount, 18);
-  assert.equal(arena.requests.length, 18);
+  assert.equal(workspace.resourceCount, 19);
+  assert.equal(arena.requests.length, 19);
   assert.equal(first, second);
   assert.equal(first.elementCount, 9_216);
   assert.equal(first.byteLength, 36_864);
@@ -210,7 +215,7 @@ test("allocates bounded complete vectors and exposes stable non-owning binding v
   await workspace.dispose();
   assert.deepEqual(
     arena.buffers.map((buffer) => buffer.destroyCount),
-    new Array(18).fill(1),
+    new Array(19).fill(1),
   );
 });
 
@@ -256,7 +261,7 @@ test("poisons a partially cleared workspace while keeping disposal available", a
   await assert.doesNotReject(workspace.dispose());
   assert.deepEqual(
     arena.buffers.map((buffer) => buffer.destroyCount),
-    new Array(18).fill(1),
+    new Array(19).fill(1),
   );
 });
 
@@ -321,7 +326,7 @@ test("disposal waits for an in-flight reset and remains idempotent", async () =>
 
   assert.deepEqual(
     arena.buffers.map((buffer) => buffer.destroyCount),
-    new Array(18).fill(0),
+    new Array(19).fill(0),
   );
   gate.resolve();
   await reset;
@@ -329,7 +334,7 @@ test("disposal waits for an in-flight reset and remains idempotent", async () =>
   await workspace.dispose();
   assert.deepEqual(
     arena.buffers.map((buffer) => buffer.destroyCount),
-    new Array(18).fill(1),
+    new Array(19).fill(1),
   );
   assert.throws(() => workspace.get("ffn-product"), /workspace is disposed/i);
 });
